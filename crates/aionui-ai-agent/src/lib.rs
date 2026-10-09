@@ -12,6 +12,7 @@ pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
 pub mod error;
 pub mod factory;
+pub mod generation;
 pub(crate) mod idle_scanner;
 pub mod manager;
 /// Neutral MCP resolution for the session-model port (claude/codex). Ported from

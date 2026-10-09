@@ -22,6 +22,7 @@ use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
+    pub generation_service: Arc<aionui_ai_agent::generation::GenerationService>,
     pub database: Database,
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
@@ -229,7 +230,11 @@ impl AppServices {
             machine_id,
         ));
 
+        let generation_service = Arc::new(aionui_ai_agent::generation::GenerationService::new(
+            runtime_base_url.clone(),
+        ));
         let factory = build_agent_factory(AgentFactoryDeps {
+            generation_service: Some(generation_service.clone()),
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
             encryption_key,
@@ -277,6 +282,7 @@ impl AppServices {
         });
 
         Ok(Self {
+            generation_service,
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,

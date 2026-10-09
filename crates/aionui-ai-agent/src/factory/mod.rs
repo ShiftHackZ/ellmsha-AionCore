@@ -4,7 +4,9 @@ mod acp;
 mod acp_launch_policy;
 pub(crate) mod aionrs;
 mod antigravity;
+mod codex_home;
 mod context;
+mod tencent_memory;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +27,7 @@ use crate::types::BuildTaskOptions;
 
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
+    pub generation_service: Option<Arc<crate::generation::GenerationService>>,
     pub skill_manager: Arc<AcpSkillManager>,
     pub provider_repo: Arc<dyn IProviderRepository>,
     pub encryption_key: [u8; 32],
@@ -74,7 +77,9 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
-    let context = options.context;
+    let mut context = options.context;
+    tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await;
+    codex_home::isolate_legacy_memory(&mut context, &deps.data_dir).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {

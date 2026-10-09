@@ -3945,9 +3945,12 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options(row, seed)
+                .await?;
+        self.include_managed_global_skills(&mut options).await;
+        Ok(options)
     }
 
     pub async fn build_task_options_for_runtime(
@@ -3957,9 +3960,25 @@ impl ConversationService {
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
         let seed = self.load_aionrs_permission_seed(row).await?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override, seed)
-            .await
+        let mut options =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .build_options_with_workspace_override(row, workspace_override, seed)
+                .await?;
+        self.include_managed_global_skills(&mut options).await;
+        Ok(options)
+    }
+
+    async fn include_managed_global_skills(&self, options: &mut BuildTaskOptions) {
+        for name in self.skill_resolver.managed_global_names().await {
+            if !options.context.skills.contains(&name) {
+                options.context.skills.push(name);
+            }
+        }
+        match &mut options.context.kind {
+            AgentSessionKind::Acp(ctx) => ctx.config.skills.clone_from(&options.context.skills),
+            AgentSessionKind::Antigravity(ctx) => ctx.config.skills.clone_from(&options.context.skills),
+            AgentSessionKind::Aionrs(ctx) => ctx.config.skills.clone_from(&options.context.skills),
+        }
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
@@ -4154,6 +4173,15 @@ impl ConversationService {
     async fn backfill_extra_inplace(&self, user_id: &str, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
         let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
+        if let Some(skills) = extra.get_mut("skills").and_then(serde_json::Value::as_array_mut) {
+            for name in self.skill_resolver.managed_global_names().await {
+                let value = serde_json::Value::String(name);
+                if !skills.contains(&value) {
+                    skills.push(value);
+                    mutated = true;
+                }
+            }
+        }
         mutated |= backfill_cron_job_id_alias(extra);
         if !mutated {
             return;

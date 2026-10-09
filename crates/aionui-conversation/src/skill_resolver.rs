@@ -22,6 +22,12 @@ pub trait SkillResolver: Send + Sync {
     /// available on this installation.
     async fn auto_inject_names(&self) -> Vec<String>;
 
+    /// App-managed global packs remain available in conversations created before
+    /// those packs were installed. User-selected optional skills stay snapshots.
+    async fn managed_global_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolve each skill name to its on-disk source directory, using the
     /// same search order as `materialize_skills_for_agent`.
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill>;
@@ -102,6 +108,21 @@ fn extract_skill_body(content: &str) -> String {
 
 #[async_trait]
 impl SkillResolver for ExtensionSkillResolver {
+    async fn managed_global_names(&self) -> Vec<String> {
+        self.auto_inject_names()
+            .await
+            .into_iter()
+            .filter(|name| {
+                self.paths
+                    .builtin_skills_dir
+                    .join("auto-inject")
+                    .join(name)
+                    .join(aionui_extension::skill_service::MANAGED_GLOBAL_SKILL_MARKER)
+                    .is_file()
+            })
+            .collect()
+    }
+
     async fn auto_inject_names(&self) -> Vec<String> {
         match aionui_extension::list_available_skills_with_repo(&self.paths, self.skill_repo.as_ref()).await {
             Ok(items) => {

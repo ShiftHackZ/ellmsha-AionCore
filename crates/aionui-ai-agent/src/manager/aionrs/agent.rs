@@ -104,6 +104,7 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    generation: crate::generation::GenerationTarget,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -135,6 +136,10 @@ impl Drop for AionrsAgentManager {
 }
 
 impl AionrsAgentManager {
+    pub(crate) fn generation_target(&self) -> crate::generation::GenerationTarget {
+        self.generation.clone()
+    }
+
     pub async fn new(
         conversation_id: String,
         workspace: String,
@@ -274,6 +279,10 @@ impl AionrsAgentManager {
 
         Ok(Self {
             runtime,
+            generation: crate::generation::GenerationTarget::Native {
+                provider: engine.provider().clone(),
+                model: config_extra.model.clone(),
+            },
             engine: Mutex::new(engine),
             slash_commands,
             mcp_managers: result.mcp_managers,

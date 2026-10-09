@@ -217,7 +217,32 @@ impl AgentInstance {
     }
 
     /// Send a user message to the agent.
-    pub async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+    pub async fn send_message(&self, mut data: SendMessageData) -> Result<(), AgentSendError> {
+        // The conversation has already persisted the user's original message.
+        // Only the transient provider input receives retrieved memory, covering
+        // ordinary, scheduled and conversation-backed delegated turns alike.
+        if let Some(memory) = crate::capability::tencent_memory::recall_from_env(self.workspace(), &data.content).await
+        {
+            if memory.status == "ready" {
+                tracing::info!(
+                    conversation_id = self.conversation_id(),
+                    status = memory.status,
+                    sources = memory.source_count,
+                    context_bytes = memory.text.len(),
+                    "TencentDB turn recall completed"
+                );
+            } else {
+                tracing::warn!(
+                    conversation_id = self.conversation_id(),
+                    status = memory.status,
+                    sources = memory.source_count,
+                    core_error = memory.core_error,
+                    search_error = memory.search_error,
+                    "TencentDB turn recall degraded; continuing with explicit memory status"
+                );
+            }
+            data.content = format!("{}\n\n{}", memory.text, data.content);
+        }
         self.as_task().send_message(data).await
     }
 

@@ -288,7 +288,8 @@ pub struct SkillListItem {
 
 /// List all available skills (built-in + user custom), deduplicated.
 ///
-/// User custom skills override built-in skills with the same name.
+/// User custom skills override built-in skills with the same name, except
+/// managed eLLMsha global packs whose installed workflow is authoritative.
 ///
 /// For built-in entries, the caller sees an absolute `location` pointing
 /// at `paths.builtin_skills_dir/.../SKILL.md` — the tree is populated
@@ -310,6 +311,7 @@ pub async fn list_available_skills(paths: &SkillPaths) -> Result<Vec<SkillListIt
     // This path-only fallback is retained for low-level tests and scans
     // the user skills directory directly.
     let mut custom_skills = list_user_skills_from_disk(paths).await?;
+    custom_skills.retain(|item| managed_global_skill_dir(paths, &item.name).is_none());
     for item in &custom_skills {
         builtin_skills.remove(&item.name);
     }
@@ -1399,7 +1401,16 @@ pub async fn link_workspace_skills(
         for skill in skills {
             let target = target_skills_dir.join(&skill.name);
             match tokio::fs::symlink_metadata(&target).await {
-                // Target already exists — leave it alone.
+                // Refresh only links managed by the global pack installer. A user's
+                // real directory is never replaced by an app-provided skill.
+                Ok(meta)
+                    if meta.file_type().is_symlink()
+                        && skill.source_path.join(MANAGED_GLOBAL_SKILL_MARKER).is_file()
+                        && tokio::fs::read_link(&target).await.ok().as_ref() != Some(&skill.source_path) =>
+                {
+                    tokio::fs::remove_file(&target).await?;
+                }
+                // Ordinary pre-existing skills keep their established precedence.
                 Ok(_) => continue,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -1487,6 +1498,9 @@ async fn resolve_skill_source_path_with_repo_for_user(
     user_id: &str,
     name: &str,
 ) -> Result<Option<PathBuf>, ExtensionError> {
+    if let Some(path) = managed_global_skill_dir(paths, name) {
+        return Ok(Some(path));
+    }
     if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
@@ -1639,19 +1653,37 @@ async fn list_skills_from_repo(
     user_id: &str,
 ) -> Result<Vec<SkillListItem>, ExtensionError> {
     let mut items = Vec::new();
-    for row in dedupe_user_visible_skill_rows(repo.list_for_user(user_id).await?) {
+    for row in dedupe_user_visible_skill_rows(paths, repo.list_for_user(user_id).await?) {
         let description = row.description.clone().unwrap_or_default();
         items.push(skill_row_to_list_item(paths, row, description));
     }
     Ok(items)
 }
 
-fn dedupe_user_visible_skill_rows(rows: Vec<SkillRow>) -> Vec<SkillRow> {
+/// Written only into validated, app-owned copies by the global-pack bootstrap.
+pub const MANAGED_GLOBAL_SKILL_MARKER: &str = ".ellmsha-global";
+
+fn managed_global_skill_dir(paths: &SkillPaths, name: &str) -> Option<PathBuf> {
+    validate_filename(name).ok()?;
+    let path = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
+    (path.join(MANAGED_GLOBAL_SKILL_MARKER).is_file() && path.join(SKILL_MANIFEST_FILE).is_file()).then_some(path)
+}
+
+fn dedupe_user_visible_skill_rows(paths: &SkillPaths, rows: Vec<SkillRow>) -> Vec<SkillRow> {
     let mut merged: Vec<SkillRow> = Vec::new();
 
     for row in rows {
         if let Some(index) = merged.iter().position(|existing| existing.name == row.name) {
-            if merged[index].user_id.is_none() && row.user_id.is_some() {
+            let managed_path = managed_global_skill_dir(paths, &row.name);
+            let managed = |entry: &SkillRow| {
+                entry.user_id.is_none()
+                    && entry.source == "builtin"
+                    && managed_path.as_deref() == Some(Path::new(&entry.path))
+            };
+            // Earlier Electron versions imported these global packs as user
+            // skills. Those stale copies must not remove auto-inject status or
+            // override the current memory-backed workflow body.
+            if managed(&row) || (!managed(&merged[index]) && merged[index].user_id.is_none() && row.user_id.is_some()) {
                 merged[index] = row;
             }
         } else {
@@ -3035,6 +3067,69 @@ mod tests {
         // sync must not ingest them as global rows or list them.
         assert!(skills.iter().all(|skill| skill.name != "scheduled-task"));
         assert!(repo.find_by_name_any("scheduled-task").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_global_pack_wins_over_legacy_user_copy_in_catalog_and_resolution() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_disk_builtin_paths(tmp.path());
+        let repo = make_test_skill_repo().await;
+        let auto_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
+        create_skill_in_dir(&auto_dir, "bmad-test", "Current TencentDB workflow");
+        let canonical = auto_dir.join("bmad-test");
+        tokio::fs::write(canonical.join(MANAGED_GLOBAL_SKILL_MARKER), "managed")
+            .await
+            .unwrap();
+        sync_builtin_skill_catalog_into_repo(&paths, &repo).await.unwrap();
+        create_skill_in_dir(tmp.path(), "bmad-test", "Stale imported workflow");
+        import_skill_with_repo(&paths, &repo, &tmp.path().join("bmad-test"))
+            .await
+            .unwrap();
+        let list = list_available_skills_with_repo(&paths, &repo).await.unwrap();
+        let found = list.iter().filter(|item| item.name == "bmad-test").collect::<Vec<_>>();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].source, SkillSource::Builtin);
+        assert_eq!(
+            found[0].relative_location.as_deref(),
+            Some("auto-inject/bmad-test/SKILL.md")
+        );
+        assert_eq!(found[0].description, "Current TencentDB workflow");
+        assert_eq!(
+            resolve_skill_source_path_with_repo_for_user(&paths, &repo, DEFAULT_USER_ID, "bmad-test")
+                .await
+                .unwrap(),
+            Some(canonical)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_global_links_refresh_but_real_user_directories_survive() {
+        let tmp = TempDir::new().unwrap();
+        let old = create_resolved_test_skill(&tmp.path().join("old"), "bmad-test");
+        let new = create_resolved_test_skill(&tmp.path().join("new"), "bmad-test");
+        std::fs::write(new.source_path.join(MANAGED_GLOBAL_SKILL_MARKER), "managed").unwrap();
+        let workspace = tmp.path().join("workspace");
+        link_workspace_skills(&workspace, &[".codex/skills"], &[old])
+            .await
+            .unwrap();
+        assert_eq!(
+            link_workspace_skills(&workspace, &[".codex/skills"], &[new.clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_link(workspace.join(".codex/skills/bmad-test")).unwrap(),
+            new.source_path
+        );
+        std::fs::create_dir_all(workspace.join(".claude/skills/bmad-test")).unwrap();
+        assert_eq!(
+            link_workspace_skills(&workspace, &[".claude/skills"], &[new])
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

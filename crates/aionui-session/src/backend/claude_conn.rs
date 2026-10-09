@@ -148,6 +148,22 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// serializer. stdio → `{command,args,env:{k:v}}`; http/sse → `{type,url,headers:{…}}`.
 pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     let mut args = Vec::new();
+    if config.generation_only {
+        args.extend(
+            [
+                "--tools",
+                "",
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--setting-sources",
+                "",
+                "--no-session-persistence",
+            ]
+            .map(str::to_owned),
+        );
+    }
 
     if let Some(preset) = config
         .init
@@ -341,7 +357,7 @@ impl BackendConnection for ClaudeConnection {
             env: config.spawn_env.clone(),
             cli_program: config.cli_program.clone(),
         };
-        let fresh = matches!(&spec, SessionSpec::Fresh { .. });
+        let fresh = !config.generation_only && matches!(&spec, SessionSpec::Fresh { .. });
         let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake, fresh).await;
         // #98/#101: ask claude for its discovery catalog (selectable models + slash
         // commands) up-front via `control_request{initialize}`. The response flows
@@ -6444,5 +6460,33 @@ mod tests {
             !spec.args.iter().any(|a| a == "--fork-session"),
             "a wake never replays the fork"
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_generation_tests {
+    use super::*;
+    #[test]
+    fn generation_claude_has_no_builtin_tools_or_external_mcp() {
+        let args = build_claude_init_args(&SessionConfig {
+            generation_only: true,
+            model: Some("selected-exact".into()),
+            ..Default::default()
+        });
+        for pair in [
+            ["--tools", ""],
+            ["--mcp-config", "{\"mcpServers\":{}}"],
+            ["--setting-sources", ""],
+            ["--model", "selected-exact"],
+        ] {
+            assert!(args.windows(2).any(|v| v[0] == pair[0] && v[1] == pair[1]));
+        }
+        for flag in [
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+        ] {
+            assert!(args.iter().any(|v| v == flag));
+        }
     }
 }

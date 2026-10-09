@@ -196,7 +196,10 @@ impl BackendConnection for CodexConnection {
         // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
-        if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
+        if !config.generation_only
+            && matches!(spec, SessionSpec::Fresh { .. })
+            && (config.model.is_some() || config.mode.is_some())
+        {
             let backend = Arc::new(backend);
             spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
             return Ok(backend);
@@ -457,10 +460,42 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // NB: `config.model` is intentionally NOT written here — see the doc comment
     // above. It is applied post-discovery by `reconcile_codex_model` (validated).
     if !config.init.mcp_servers.is_empty() {
-        params["config"] = json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers) });
+        let mut servers = build_codex_mcp_servers(&config.init.mcp_servers);
+        // eLLMsha's built-in durable memory is part of the authorized application
+        // workflow. Codex's MCP policy is separate from sandbox approvals: leaving
+        // it unset prompts even for scenario_list in the UI's Auto mode. Verified
+        // against codex 0.144 config.schema.json RawMcpServerConfig/AppToolApproval.
+        // Do not answer arbitrary MCP elicitations or grant other servers policy.
+        if sandbox != "read-only"
+            && let Some(memory) = servers.get_mut("ellmsha-tencentdb-memory")
+        {
+            memory["default_tools_approval_mode"] = json!("approve");
+        }
+        params["config"] = json!({ "mcp_servers": servers });
     }
     if let Some(preset) = &config.init.preset_context {
         params["baseInstructions"] = json!(preset);
+    }
+    if config.generation_only {
+        params["model"] = json!(config.model);
+        params["ephemeral"] = json!(true);
+        params["config"] = json!({
+            "project_doc_max_bytes": 0,
+            "include_environment_context": false,
+            "web_search": "disabled",
+            "skills": {"bundled": {"enabled": false}, "include_instructions": false},
+            "features": {
+                "shell_tool": false, "unified_exec": false, "plugins": false,
+                "apps": false, "browser_use": false, "in_app_browser": false,
+                "computer_use": false, "multi_agent": false, "collab": false,
+                "memories": false, "memory_tool": false, "js_repl": false,
+                "code_mode": false, "image_generation": false,
+                "hooks": false, "codex_hooks": false, "plugin_hooks": false,
+                "request_permissions_tool": false, "tool_search": false,
+                "token_budget": false, "current_time_reminder": false
+            },
+            "tools": {"experimental_request_user_input": {"enabled": false}}
+        });
     }
     HandshakeParams(params)
 }
@@ -704,7 +739,7 @@ pub struct CodexSessionBackend {
     /// wait — a Fork handshake pre-seeds NO binding, so without the poison the
     /// first Send would poll forever for a `thread/started` that never comes.
     /// A success needs no action (`thread/started` for the NEW thread binds it).
-    pending_fork: Arc<Mutex<Option<u64>>>,
+    pending_open: Arc<Mutex<Option<(u64, &'static str)>>>,
     /// The id of the in-flight turn (codex `turn/started.turn.id`), needed by
     /// `turn/interrupt{turnId}` and `turn/steer{expectedTurnId}` (optimistic
     /// concurrency token). Set on `turn/started`, cleared on terminal.
@@ -842,7 +877,7 @@ struct CodexReaderState {
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
-    pending_fork: Arc<Mutex<Option<u64>>>,
+    pending_open: Arc<Mutex<Option<(u64, &'static str)>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
@@ -875,7 +910,7 @@ fn start_codex_reader(
             state.pending_set,
             state.pending_resume,
             state.resume_poison,
-            state.pending_fork,
+            state.pending_open,
             state.discovered,
             state.stdin,
             state.turn_in_flight,
@@ -1004,7 +1039,7 @@ impl CodexSessionBackend {
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
-        let pending_fork = Arc::new(Mutex::new(None));
+        let pending_open = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
@@ -1028,7 +1063,7 @@ impl CodexSessionBackend {
             pending_set: pending_set.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
-            pending_fork: pending_fork.clone(),
+            pending_open: pending_open.clone(),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
@@ -1085,7 +1120,7 @@ impl CodexSessionBackend {
             pending_set,
             pending_resume,
             resume_poison,
-            pending_fork,
+            pending_open,
             discovered,
         }
     }
@@ -1142,7 +1177,11 @@ impl CodexSessionBackend {
             // dead-session error class, which clears the persisted anchor and lets
             // the conversation's auto-replay reopen Fresh.
             if let Some(poison) = self.resume_poison.lock().await.clone() {
-                return Err(BackendError::SessionNotFound(poison));
+                return Err(if poison.starts_with("codex thread/start failed:") {
+                    BackendError::SetupRejected(poison)
+                } else {
+                    BackendError::SessionNotFound(poison)
+                });
             }
             if let Some(tid) = self.thread_binding.lock().await.clone() {
                 return Ok(tid);
@@ -1199,7 +1238,7 @@ impl CodexSessionBackend {
                 // …) and poison the bound-thread wait — otherwise the first
                 // Send would poll for a binding that will never arrive.
                 let fork_id = self.next_rpc_id();
-                *self.pending_fork.lock().await = Some(fork_id);
+                *self.pending_open.lock().await = Some((fork_id, "thread/fork"));
                 self.write_frame(
                     thread_fork_params(&self.wake.config, parent_thread_id, last_turn_id)
                         .into_frame(fork_id, "thread/fork"),
@@ -1207,7 +1246,9 @@ impl CodexSessionBackend {
                 .await?;
             }
             HandshakeMode::Fresh => {
-                self.write_frame(thread_start_params(&self.wake.config).into_frame(self.next_rpc_id(), "thread/start"))
+                let start_id = self.next_rpc_id();
+                *self.pending_open.lock().await = Some((start_id, "thread/start"));
+                self.write_frame(thread_start_params(&self.wake.config).into_frame(start_id, "thread/start"))
                     .await?;
             }
         }
@@ -1319,7 +1360,7 @@ async fn reader_task(
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
-    pending_fork: Arc<Mutex<Option<u64>>>,
+    pending_open: Arc<Mutex<Option<(u64, &'static str)>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -1640,23 +1681,36 @@ async fn reader_task(
                             // dropping it is worse than failing (§G). A success
                             // needs nothing: `thread/started` for the NEW thread
                             // binds it via the notification handler above.
-                            let is_fork = {
-                                let mut pending = pending_fork.lock().await;
+                            let open_method = {
+                                let mut pending = pending_open.lock().await;
                                 match *pending {
-                                    Some(pfid) if pfid == rid => {
+                                    Some((pid, method)) if pid == rid => {
                                         *pending = None;
-                                        true
+                                        Some(method)
                                     }
-                                    _ => false,
+                                    _ => None,
                                 }
                             };
-                            if is_fork && let Some(msg) = error_message.as_deref() {
-                                tracing::warn!(
-                                    conversation_id = %session_id,
-                                    error = %msg,
-                                    "codex thread/fork rejected — poisoning bound-thread wait (no silent fallback)"
-                                );
-                                *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
+                            if let (Some(method), Some(msg)) = (open_method, error_message.as_deref()) {
+                                // A fresh-start config error may quote provider secrets.
+                                // Log only the RPC status and an allowlisted config key.
+                                let safe_message = if method == "thread/start" {
+                                    let key = msg
+                                        .lines()
+                                        .find_map(|line| line.strip_prefix("in `").and_then(|v| v.strip_suffix('`')))
+                                        .filter(|key| {
+                                            key.len() <= 100
+                                                && key.bytes().all(|c| {
+                                                    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-')
+                                                })
+                                        });
+                                    key.map(|key| format!("invalid configuration at {key}"))
+                                        .unwrap_or_else(|| "session initialization rejected".into())
+                                } else {
+                                    msg.to_owned()
+                                };
+                                tracing::warn!(conversation_id = %session_id, method, rpc_code = ?frame["error"]["code"].as_i64(), reason = %safe_message, "codex session opening rejected");
+                                *resume_poison.lock().await = Some(format!("codex {method} failed: {safe_message}"));
                                 continue;
                             }
                             let pending_send = pending_sends.lock().await.remove(&rid);
@@ -3540,7 +3594,7 @@ impl SessionBackend for CodexSessionBackend {
                 // All three turn-flavored routes run a REAL wire turn on the thread
                 // (turn/started → items → turn/completed; verified live 0.144.1, files
                 // above), so the existing reader/FSM lifecycle applies unchanged.
-                let (method, params) = match route {
+                let (method, mut params) = match route {
                     None => ("turn/start", json!({ "threadId": tid, "input": build_input(&content) })),
                     // /init → the bridge's canned AGENTS.md prompt as a normal turn
                     // (bridge: Op::UserInput{INIT_COMMAND_PROMPT}).
@@ -3555,6 +3609,12 @@ impl SessionBackend for CodexSessionBackend {
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
                 };
+                if self.wake.config.generation_only && method == "turn/start" {
+                    params["model"] = json!(self.wake.config.model);
+                    if let Some(schema) = &self.wake.config.generation_response_schema {
+                        params["outputSchema"] = schema.clone();
+                    }
+                }
                 let frame = json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -6948,6 +7008,41 @@ mod tests {
         assert!(bare["params"].get("baseInstructions").is_none());
     }
 
+    #[test]
+    fn builtin_memory_auto_policy_preserves_sandbox_and_other_tool_policies() {
+        let mut config = SessionConfig::default();
+        config.init.mcp_servers = ["ellmsha-tencentdb-memory", "user-server"]
+            .into_iter()
+            .map(|name| crate::backend::McpServerSpec {
+                name: name.into(),
+                transport: crate::backend::McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+            })
+            .collect();
+        let frame = thread_start_params(&config).into_frame(2, "thread/start");
+        assert_eq!(
+            frame["params"]["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]["default_tools_approval_mode"],
+            "approve"
+        );
+        assert!(
+            frame["params"]["config"]["mcp_servers"]["user-server"]
+                .get("default_tools_approval_mode")
+                .is_none()
+        );
+        assert_eq!(frame["params"]["approvalPolicy"], "on-request");
+        assert_eq!(frame["params"]["sandbox"], "workspace-write");
+        config.sandbox_mode = Some("read-only".into());
+        let frame = thread_resume_params(&config, "existing").into_frame(2, "thread/resume");
+        assert!(
+            frame["params"]["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]
+                .get("default_tools_approval_mode")
+                .is_none()
+        );
+    }
+
     /// G1-A: thread/start serializes SessionConfig.sandbox_mode data-driven —
     /// `None` keeps the safe `workspace-write` default; a resolved policy (e.g. a
     /// yolo agent → `danger-full-access`) rides the wire. The default path stays
@@ -8710,6 +8805,60 @@ mod tests {
             ),
             "a late subscriber's first event is the replayed binding, got {:?}",
             first.event
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_generation_tests {
+    use super::*;
+    #[test]
+    fn generation_codex_pins_exact_model_ephemeral_and_disables_integrations() {
+        let frame = thread_start_params(&SessionConfig {
+            model: Some("selected-exact".into()),
+            generation_only: true,
+            sandbox_mode: Some("read-only".into()),
+            approval_policy: Some("never".into()),
+            ..Default::default()
+        })
+        .into_frame(1, "thread/start");
+        let params = &frame["params"];
+        assert_eq!(params["model"], "selected-exact");
+        assert_eq!(params["ephemeral"], true);
+        assert_eq!(params["sandbox"], "read-only");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert!(params["config"].get("mcp_servers").is_none());
+        assert_eq!(params["config"]["skills"]["bundled"]["enabled"], false);
+        assert_eq!(
+            params["config"]["tools"]["experimental_request_user_input"]["enabled"],
+            false
+        );
+        for feature in [
+            "shell_tool",
+            "plugins",
+            "apps",
+            "multi_agent",
+            "memory_tool",
+            "browser_use",
+        ] {
+            assert_eq!(params["config"]["features"][feature], false);
+        }
+    }
+    #[tokio::test]
+    async fn generation_fresh_start_error_fails_fast_and_redacts_values() {
+        let tail = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"failed to load configuration: secret-provider-value\nin `tools.experimental_request_user_input`\n"}})).unwrap();
+        let fake = crate::testing::FakeAgentIo::new(Vec::new(), None).with_gated_tail([tail, vec![b'\n']].concat());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("memory-start-err", Box::new(fake)).await;
+        backend.run_handshake(HandshakeMode::Fresh).await.unwrap();
+        release();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let error = backend
+            .bound_thread_within(std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, BackendError::SetupRejected(message) if message.contains("tools.experimental_request_user_input") && !message.contains("secret-provider-value"))
         );
     }
 }

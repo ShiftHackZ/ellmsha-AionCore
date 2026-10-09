@@ -224,6 +224,10 @@ pub struct SessionInit {
 /// `SessionConfig: Eq` (verified — no `HashSet`/`BTreeSet`/`==` use).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionConfig {
+    /// Isolated stateless generation: no application MCP, skills, or tool workflow.
+    pub generation_only: bool,
+    /// Structured output for the generation-only Codex turn.
+    pub generation_response_schema: Option<serde_json::Value>,
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub mode: Option<String>,

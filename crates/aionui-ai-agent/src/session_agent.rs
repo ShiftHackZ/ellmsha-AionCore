@@ -320,6 +320,7 @@ fn session_content_blocks_to_json(content: &[ContentBlock]) -> Vec<serde_json::V
 
 /// One claude/codex session, presented as an `IAgentTask`.
 pub struct SessionAgentTask {
+    generation: std::sync::Mutex<Option<crate::generation::GenerationTarget>>,
     agent_type: AgentType,
     conversation_id: String,
     /// Owner Core user — every acp_session persistence write and catalog
@@ -352,6 +353,20 @@ pub struct SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    pub(crate) fn generation_target(&self) -> Result<crate::generation::GenerationTarget, AgentError> {
+        let mut target = self
+            .generation
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+            .ok_or_else(|| AgentError::bad_request("This session does not support memory generation"))?;
+        if let crate::generation::GenerationTarget::Cli { config, .. } = &mut target {
+            let (_, current, _, _) = self.effective_catalog();
+            config.model = self.runtime.model_override().or(current).or(config.model.clone());
+        }
+        Ok(target)
+    }
+
     /// Build a task around an already-opened `SessionBackend` and start the
     /// event-translation pump. `agent_type` is `AgentType::Acp` for claude/codex
     /// (they present as the ACP family to the rest of the app).
@@ -450,6 +465,7 @@ impl SessionAgentTask {
             broadcaster,
         );
         Arc::new(Self {
+            generation: std::sync::Mutex::new(None),
             agent_type,
             conversation_id,
             user_id,
@@ -1495,8 +1511,8 @@ pub async fn build_session_instance(
     };
 
     let connection: Box<dyn BackendConnection> = match backend_label {
-        "claude" => Box::new(ClaudeConnection::new(spawner)),
-        "codex" => Box::new(CodexConnection::new(spawner)),
+        "claude" => Box::new(ClaudeConnection::new(spawner.clone())),
+        "codex" => Box::new(CodexConnection::new(spawner.clone())),
         _ => return Ok(None),
     };
 
@@ -1706,6 +1722,7 @@ pub async fn build_session_instance(
         }
     }
 
+    let generation_config = session_config.clone();
     let backend = connection
         .open_session(spec, session_config)
         .await
@@ -1766,6 +1783,11 @@ pub async fn build_session_instance(
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
     );
+    *task.generation.lock().expect("generation mutex") = Some(crate::generation::GenerationTarget::Cli {
+        backend: backend_label.to_owned(),
+        config: Box::new(generation_config),
+        spawner,
+    });
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 

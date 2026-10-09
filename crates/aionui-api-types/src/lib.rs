@@ -131,7 +131,7 @@ pub use office::{
     PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
-pub use project::{AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+pub use project::{AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, MemoryProjectRequest, MemoryProjectContext};
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,

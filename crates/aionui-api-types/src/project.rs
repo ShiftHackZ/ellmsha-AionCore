@@ -64,3 +64,23 @@ pub struct AttachFolderRequest {
     #[serde(default)]
     pub display_name: Option<String>,
 }
+
+/// Private MCP project request, authenticated by the conversation capability.
+#[derive(Debug, Deserialize)]
+pub struct MemoryProjectRequest {
+    /// The conversation to which the bearer capability is bound.
+    pub conversation_id: String,
+}
+
+/// Current registered roots for project-scoped code indexing. No credentials.
+#[derive(Debug, Serialize)]
+pub struct MemoryProjectContext {
+    /// Stable application project identity; absent for legacy unbound chats.
+    pub project_id: Option<String>,
+    /// Human-readable project label.
+    pub name: String,
+    /// Primary workspace used by the existing shared memory/BMAD namespace.
+    pub workspace: String,
+    /// Canonical local paths of the current workspace and attached folders.
+    pub roots: Vec<String>,
+}

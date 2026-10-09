@@ -597,6 +597,9 @@ async fn session_server_to_mcp_server_config(
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
+    // ToolSearch only indexes deferred tools. Keep the built-in memory catalog
+    // discoverable there and avoid sending all 17 full schemas on every turn.
+    let deferred = Some(server.id == "ellmsha-tencentdb-memory");
     match &server.transport {
         SessionMcpTransport::Stdio { command, args, env } => {
             if command.is_empty() {
@@ -612,7 +615,7 @@ async fn session_server_to_mcp_server_config(
                 env: Some(env),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred,
                 startup_timeout_ms: None,
             })
         }
@@ -627,7 +630,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred,
                 startup_timeout_ms: None,
             })
         }
@@ -642,7 +645,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred,
                 startup_timeout_ms: None,
             })
         }
@@ -657,7 +660,7 @@ async fn session_server_to_mcp_server_config(
                 env: None,
                 url: Some(url.clone()),
                 headers: Some(headers.clone()),
-                deferred: Some(false),
+                deferred,
                 startup_timeout_ms: None,
             })
         }
@@ -1807,6 +1810,119 @@ mod tests {
         let overrides = AionrsBuildExtra::default();
         let result = resolve_mcp_servers(&overrides);
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_tencent_memory_is_discoverable_through_tool_search() {
+        use aion_agent::bootstrap::AgentBootstrap;
+        use aion_agent::output::null_sink::NullSink;
+        use aion_config::config::{CliArgs, Config};
+        use serde_json::json;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST")).respond_with(|request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("id").is_none() { return ResponseTemplate::new(202); }
+            let result = match body["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"memory-fixture","version":"1"}}),
+                "tools/list" => json!({"tools":[{"name":"tdai_wiki_ingest","description":"Store a source in project wiki","inputSchema":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}}]}),
+                "tools/call" => json!({"content":[{"type":"text","text":"fixture accepted"}],"isError":false}),
+                _ => json!({}),
+            };
+            ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        }).mount(&mock).await;
+
+        let mut snapshot = SessionMcpServer {
+            id: "ellmsha-tencentdb-memory".into(),
+            name: "ellmsha-tencentdb-memory".into(),
+            transport: SessionMcpTransport::StreamableHttp {
+                url: mock.uri(),
+                headers: HashMap::new(),
+            },
+        };
+        let memory = session_server_to_mcp_server_config(&snapshot, "user-1", "chat-1", test_broadcaster())
+            .await
+            .unwrap();
+        assert_eq!(memory.deferred, Some(true));
+        snapshot.id = "user-server-with-same-name".into();
+        let user_server = session_server_to_mcp_server_config(&snapshot, "user-1", "chat-1", test_broadcaster())
+            .await
+            .unwrap();
+        assert_eq!(
+            user_server.deferred,
+            Some(false),
+            "only the built-in ID opts into deferred discovery"
+        );
+        snapshot.id = "ellmsha-tencentdb-memory".into();
+        snapshot.transport = SessionMcpTransport::Stdio {
+            command: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let stdio = session_server_to_mcp_server_config(&snapshot, "user-1", "chat-1", test_broadcaster())
+            .await
+            .unwrap();
+        assert_eq!(
+            stdio.deferred,
+            Some(true),
+            "production stdio transport must also be discoverable"
+        );
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut config = Config::resolve(&CliArgs {
+            provider: Some("openai".into()),
+            api_key: Some("fixture".into()),
+            base_url: Some(mock.uri()),
+            model: Some("fixture".into()),
+            max_tokens: None,
+            max_turns: None,
+            max_tool_call_malformed_turns: None,
+            max_tool_call_failure_turns: None,
+            system_prompt: None,
+            profile: None,
+            auto_approve: true,
+            thinking: None,
+            thinking_budget: None,
+            project_dir: Some(workspace.path().into()),
+        })
+        .unwrap();
+        config.mcp.servers = HashMap::from([("ellmsha-tencentdb-memory".into(), memory)]);
+        config.session.enabled = false;
+        let mut result = AgentBootstrap::new(
+            config,
+            workspace.path().to_string_lossy().into_owned(),
+            Arc::new(NullSink),
+        )
+        .build()
+        .await
+        .unwrap();
+        assert!(
+            result.engine.tool_names().contains(&"tdai_wiki_ingest".into()),
+            "MCP tool must be registered"
+        );
+        let search = result
+            .engine
+            .registry_mut()
+            .get("ToolSearch")
+            .unwrap()
+            .execute(json!({"query":"tdai_wiki_ingest"}))
+            .await;
+        assert!(!search.is_error);
+        let matches: Value = serde_json::from_str(&search.content)
+            .expect("ToolSearch must return actual schemas, not a no-match message");
+        assert_eq!(matches[0]["name"], "tdai_wiki_ingest");
+        assert_eq!(matches[0]["parameters"]["properties"]["content"]["type"], "string");
+        assert_eq!(matches[0]["parameters"]["required"], json!(["content"]));
+        let call = result
+            .engine
+            .registry_mut()
+            .get("tdai_wiki_ingest")
+            .unwrap()
+            .execute(json!({"content":"fixture"}))
+            .await;
+        assert!(!call.is_error);
+        assert!(call.content.contains("fixture accepted"));
     }
 
     #[tokio::test]

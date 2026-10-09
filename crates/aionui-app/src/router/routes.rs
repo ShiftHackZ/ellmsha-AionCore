@@ -397,6 +397,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(super::memory_generation::routes(
+        services.generation_service.clone(),
+        services.worker_task_manager.clone(),
+        services.conversation_repo.clone(),
+        services.project_service.clone(),
+    ))
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));
