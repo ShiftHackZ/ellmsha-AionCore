@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+aionui-api-types.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
 sha2.workspace = true

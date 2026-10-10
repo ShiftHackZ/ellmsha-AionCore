@@ -30,7 +30,7 @@ impl ManagedCliError {
 }
 
 /// The npm top-level package for a CLI name.
-fn npm_package(name: &str) -> Option<&'static str> {
+pub(super) fn npm_package(name: &str) -> Option<&'static str> {
     match name {
         "claude" => Some("@anthropic-ai/claude-code"),
         "codex" => Some("@openai/codex"),
@@ -77,6 +77,14 @@ pub struct PreparedCli {
 /// native binary subtree under `out_root/cli/<name>/<version>/<target>/`.
 pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<PreparedCli, ManagedCliError> {
     let version = cli_version(name).ok_or_else(|| ManagedCliError::new(format!("unknown CLI {name}")))?;
+    prepare_managed_cli_version_to_root(name, version, out_root).await
+}
+
+pub async fn prepare_managed_cli_version_to_root(
+    name: &str,
+    version: &str,
+    out_root: &Path,
+) -> Result<PreparedCli, ManagedCliError> {
     let target =
         current_runtime_key().ok_or_else(|| ManagedCliError::new("unsupported platform for managed CLI prepare"))?;
     let package = npm_package(name).ok_or_else(|| ManagedCliError::new(format!("unknown CLI {name}")))?;

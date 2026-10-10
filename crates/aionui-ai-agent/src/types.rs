@@ -212,6 +212,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            managed_skill_roots: vec![],
             runtime_env: vec![
                 (AIONUI_USER_ID_ENV.into(), "old-user".into()),
                 (AIONUI_CONVERSATION_ID_ENV.into(), "old-conv".into()),

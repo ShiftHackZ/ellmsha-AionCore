@@ -105,6 +105,7 @@ pub(super) async fn build(
                 conversation_id: ctx.conversation_id.clone(),
                 user_id: ctx.user_id.clone(),
                 workspace: ctx.workspace.clone(),
+                managed_skill_roots: &ctx.managed_skill_roots,
                 config: &config,
                 metadata: &meta,
                 session_snapshot: build_context.session_snapshot.as_ref(),

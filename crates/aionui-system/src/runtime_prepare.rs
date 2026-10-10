@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload, RuntimeStatusPhase,
-    RuntimeStatusScope, WebSocketMessage,
+    CliRuntimeInfo, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
+    RuntimeStatusPhase, RuntimeStatusScope, SetCliRuntimeSelectionRequest, UpdateCliRuntimeRequest, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{
@@ -36,6 +36,39 @@ impl RuntimePrepareService {
     ) -> Result<EnsureNodeRuntimeResponse, SystemError> {
         self.ensure_node_runtime_with_user(Some(user_id.to_owned()), scope)
             .await
+    }
+
+    pub async fn cli_runtime_info(&self, name: &str) -> Result<CliRuntimeInfo, SystemError> {
+        aionui_runtime::cli_runtime_info(name, None)
+            .await
+            .map_err(|error| SystemError::BadRequest(error.to_string()))
+    }
+
+    pub async fn set_cli_runtime_selection(
+        &self,
+        name: &str,
+        request: SetCliRuntimeSelectionRequest,
+    ) -> Result<CliRuntimeInfo, SystemError> {
+        aionui_runtime::set_cli_runtime_selection(name, request.selection, request.custom_path.as_deref())
+            .await
+            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
+        self.cli_runtime_info(name).await
+    }
+
+    pub async fn update_cli_runtime(
+        &self,
+        name: &str,
+        request: UpdateCliRuntimeRequest,
+    ) -> Result<CliRuntimeInfo, SystemError> {
+        aionui_runtime::update_managed_cli(name, request.version.as_deref())
+            .await
+            .map_err(|error| SystemError::BadRequest(error.to_string()))
+    }
+
+    pub async fn rollback_cli_runtime(&self, name: &str) -> Result<CliRuntimeInfo, SystemError> {
+        aionui_runtime::rollback_managed_cli(name)
+            .await
+            .map_err(|error| SystemError::BadRequest(error.to_string()))
     }
 
     async fn ensure_node_runtime_with_user(

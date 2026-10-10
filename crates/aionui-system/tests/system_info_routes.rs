@@ -105,6 +105,44 @@ fn make_github_asset(name: &str, size: u64) -> serde_json::Value {
     })
 }
 
+#[tokio::test]
+async fn cli_runtime_routes_reject_unsupported_provider() {
+    let app = setup().await;
+    let resp = app
+        .oneshot(get_request("/api/system/cli-runtimes/gemini"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cli_runtime_selection_rejects_missing_custom_path() {
+    let app = setup().await;
+    let resp = app
+        .oneshot(json_request(
+            "PUT",
+            "/api/system/cli-runtimes/codex",
+            json!({ "selection": "custom", "custom_path": "/missing/codex" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn cli_runtime_update_rejects_invalid_exact_version() {
+    let app = setup().await;
+    let resp = app
+        .oneshot(json_request(
+            "POST",
+            "/api/system/cli-runtimes/codex/update",
+            json!({ "version": "not-semver" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ===========================================================================
 // GET /api/system/info
 // ===========================================================================

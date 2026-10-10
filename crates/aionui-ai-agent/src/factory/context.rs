@@ -10,6 +10,7 @@ pub(super) struct FactoryContext {
     pub user_id: String,
     pub workspace: String,
     pub is_custom_workspace: bool,
+    pub managed_skill_roots: Vec<String>,
     pub runtime_env: Vec<(String, String)>,
 }
 
@@ -20,6 +21,7 @@ impl FactoryContext {
             user_id: context.conversation.user_id.clone(),
             workspace: context.workspace.path.clone(),
             is_custom_workspace: context.workspace.is_custom,
+            managed_skill_roots: context.managed_skill_roots.clone(),
             runtime_env: context.runtime_env.clone(),
         })
     }
@@ -53,6 +55,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            managed_skill_roots: vec!["/tmp/managed-skills".into()],
             runtime_env: vec![("AIONUI_USER_ID".into(), "user-1".into())],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
@@ -70,5 +73,6 @@ mod tests {
             ctx.runtime_env,
             vec![("AIONUI_USER_ID".to_owned(), "user-1".to_owned())]
         );
+        assert_eq!(ctx.managed_skill_roots, vec!["/tmp/managed-skills"]);
     }
 }

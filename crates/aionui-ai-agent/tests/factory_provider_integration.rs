@@ -120,6 +120,7 @@ fn make_aionrs_options(
         },
         model,
         skills: vec![],
+        managed_skill_roots: vec![],
         runtime_env: vec![],
         team: None,
         kind: AgentSessionKind::Aionrs(Box::new(AionrsSessionBuildContext {

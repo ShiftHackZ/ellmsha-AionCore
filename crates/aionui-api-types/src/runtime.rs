@@ -73,6 +73,46 @@ pub struct EnsureNodeRuntimeResponse {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliRuntimeSelection {
+    Managed,
+    System,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CliRuntimeInfo {
+    pub name: String,
+    pub selection: CliRuntimeSelection,
+    pub selection_explicit: bool,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub bundled_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_managed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetCliRuntimeSelectionRequest {
+    pub selection: CliRuntimeSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateCliRuntimeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +171,12 @@ mod tests {
         assert_eq!(json["scope"]["kind"], "mcp");
         let parsed: EnsureNodeRuntimeRequest = serde_json::from_value(json).unwrap();
         assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn cli_runtime_selection_serializes_snake_case() {
+        assert_eq!(serde_json::to_value(CliRuntimeSelection::Managed).unwrap(), "managed");
+        assert_eq!(serde_json::to_value(CliRuntimeSelection::System).unwrap(), "system");
+        assert_eq!(serde_json::to_value(CliRuntimeSelection::Custom).unwrap(), "custom");
     }
 }

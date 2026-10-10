@@ -98,6 +98,7 @@ impl<'a> SessionContextBuilder<'a> {
             workspace,
             model,
             skills,
+            managed_skill_roots: Vec::new(),
             runtime_env: Vec::new(),
             team,
             kind,

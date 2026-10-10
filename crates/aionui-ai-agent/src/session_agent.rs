@@ -1208,6 +1208,9 @@ pub struct SessionBuildInputs<'a> {
     pub user_id: String,
     /// The resolved workspace path (`SessionConfig.cwd`).
     pub workspace: String,
+    /// App-owned skill directories advertised to direct Codex without writing
+    /// harness-managed files into the user's repository.
+    pub managed_skill_roots: &'a [String],
     /// The conversation's persisted build `extra` (mode/model/mcp/preset/skills).
     pub config: &'a AcpBuildExtra,
     /// The resolved catalog row. Used to normalize the persisted/requested mode
@@ -1399,6 +1402,7 @@ pub async fn build_antigravity_instance(
         conversation_id,
         user_id,
         workspace,
+        managed_skill_roots: _,
         config,
         metadata,
         session_snapshot,
@@ -1443,6 +1447,7 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
+        managed_skill_roots: Vec::new(),
         preset_context: config.preset_context.clone(),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
@@ -1511,6 +1516,7 @@ pub async fn build_session_instance(
         conversation_id,
         user_id,
         workspace,
+        managed_skill_roots,
         config,
         metadata,
         session_snapshot,
@@ -1560,28 +1566,21 @@ pub async fn build_session_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
+        managed_skill_roots: managed_skill_roots.to_vec(),
         preset_context: config.preset_context.clone(),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),
     };
 
+    let cli_program = resolve_session_cli_program(backend_label, metadata)
+        .map_err(|error| AgentError::bad_gateway(format!("{backend_label} runtime unavailable: {error}")))?;
     let mut session_config = SessionConfig {
         cwd: Some(workspace.clone()),
         model,
         mode,
         init,
-        // A user-selected launch path wins so the process uses the same binary
-        // that the registry health check accepted. Otherwise the packaged app
-        // resolves the bundled claude/codex binary and forwards its absolute
-        // path. Bundled-missing / dev falls back to a PATH lookup via
-        // `resolve_command_path` (NOT the bare name): on Windows, npm installs
-        // ship `claude.cmd`/`codex.cmd` shims which `CreateProcess` does not
-        // find from a bare name (#299 parity; Rust std runs `.cmd` via
-        // `cmd.exe` since the BatBadBut fix). `None` (nothing on PATH either)
-        // keeps the bare name so the spawn error stays diagnosable. Detection
-        // (cli_probe) stays PATH-only and is unaffected.
-        cli_program: resolve_session_cli_program(backend_label, metadata),
+        cli_program,
         ..Default::default()
     };
 
@@ -1785,19 +1784,26 @@ pub async fn build_session_instance(
 fn resolve_session_cli_program(
     backend_label: &str,
     metadata: &aionui_api_types::AgentMetadata,
-) -> Option<std::path::PathBuf> {
-    if metadata.has_command_override {
-        return metadata.resolved_command.clone().or_else(|| {
-            metadata
-                .command
-                .as_deref()
-                .map(str::trim)
-                .filter(|command| !command.is_empty())
-                .map(std::path::PathBuf::from)
-        });
-    }
+) -> Result<Option<std::path::PathBuf>, aionui_runtime::CliRuntimeError> {
+    let legacy_override = metadata
+        .has_command_override
+        .then(|| {
+            metadata.resolved_command.clone().or_else(|| {
+                metadata
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(std::path::PathBuf::from)
+            })
+        })
+        .flatten();
 
-    aionui_runtime::resolve_bundled_cli(backend_label).or_else(|| aionui_runtime::resolve_command_path(backend_label))
+    if aionui_runtime::cli_version(backend_label).is_some() {
+        return aionui_runtime::resolve_cli_runtime(backend_label, legacy_override.as_deref())
+            .map(|runtime| Some(runtime.path));
+    }
+    Ok(legacy_override.or_else(|| aionui_runtime::resolve_command_path(backend_label)))
 }
 
 /// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
@@ -4500,19 +4506,6 @@ mod build_mapping_tests {
             has_command_override: false,
             env_override_key_count: 0,
         }
-    }
-
-    #[test]
-    fn session_cli_program_prefers_explicit_command_override() {
-        let mut metadata = test_metadata(Some("claude"), None);
-        metadata.has_command_override = true;
-        metadata.command = Some("claude".into());
-        metadata.resolved_command = Some(std::path::PathBuf::from("/custom/claude"));
-
-        assert_eq!(
-            resolve_session_cli_program("claude", &metadata),
-            Some(std::path::PathBuf::from("/custom/claude"))
-        );
     }
 
     #[test]

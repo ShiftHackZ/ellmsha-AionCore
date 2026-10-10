@@ -1095,6 +1095,23 @@ impl ConversationService {
                 .filter(|backend| !backend.is_empty())
                 .map(str::to_owned)
         });
+        if assistant_snapshot.is_none()
+            && effective_backend.as_deref() == Some("codex")
+            && let Some(selected_model) = extra
+                .get("current_model_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        {
+            let binding_value = extra
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("codex");
+            if let Some(binding) = self.resolve_assistant_agent_binding(user_id, binding_value).await? {
+                self.validate_advertised_model(user_id, &binding.agent_id, selected_model)
+                    .await?;
+            }
+        }
 
         let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
             // Per-conversation temp workspaces live under
@@ -1262,6 +1279,7 @@ impl ConversationService {
             .map(PathBuf::from)
             .or_else(|| auto_provisioned_workspace.clone());
         if let Some(ws_path) = skill_link_workspace.as_ref()
+            && effective_backend.as_deref() != Some("codex")
             && !initial_skills.is_empty()
             && let Some(rel_dirs) = native_skills_dirs(
                 &self.agent_metadata_repo,
@@ -1759,6 +1777,10 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
             })?;
+        if let Some(selected_model) = model.as_deref() {
+            self.validate_advertised_model(user_id, &agent_binding.agent_id, selected_model)
+                .await?;
+        }
         let agent_type = parse_agent_type_from_metadata(&agent_binding.agent_type)?;
 
         Ok(Some(AssistantSnapshot {
@@ -1796,6 +1818,38 @@ impl ConversationService {
             },
             created_at: now_ms(),
         }))
+    }
+
+    async fn validate_advertised_model(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        selected_model: &str,
+    ) -> Result<(), ConversationError> {
+        let agent_row = self
+            .agent_metadata_repo
+            .get_for_user(user_id, agent_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
+        if agent_row.as_ref().and_then(|row| row.backend.as_deref()) == Some("codex") {
+            // Codex catalogs are runtime-versioned and refreshed only after
+            // app-server startup. The session's complete live model/list gate
+            // remains authoritative, so a stale persisted catalog must not
+            // prevent the session that refreshes it from being created.
+            return Ok(());
+        }
+        if agent_row
+            .as_ref()
+            .and_then(|row| model_is_advertised(row.available_models.as_deref(), selected_model))
+            == Some(false)
+        {
+            return Err(ConversationError::BadRequest {
+                reason: format!(
+                    "model `{selected_model}` is not available for agent `{agent_id}`; refresh the model catalog and choose an advertised model"
+                ),
+            });
+        }
+        Ok(())
     }
 
     async fn persist_assistant_preferences_from_snapshot(
@@ -2532,6 +2586,12 @@ impl ConversationService {
                 error = %ErrorChain(&err),
                 "Failed to delete acp_session row on conversation delete"
             );
+        }
+        if let Some(managed_skills) = managed_skills_root(&self.workspace_root, user_id, id)
+            && let Err(err) = tokio::fs::remove_dir_all(&managed_skills).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(conversation_id = %id, path = %managed_skills.display(), error = %err, "Failed to delete app-managed conversation skills");
         }
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
@@ -3459,7 +3519,7 @@ impl ConversationService {
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
-        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+        self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -3583,7 +3643,7 @@ impl ConversationService {
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
-        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+        self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -3915,7 +3975,7 @@ impl ConversationService {
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
-        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+        self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -4142,45 +4202,56 @@ impl ConversationService {
         Some(issue.token)
     }
 
-    /// Ensure native skill links exist in the runtime workspace. Auto
-    /// workspaces are constrained to AionUi's generated path; custom
-    /// workspaces were validated when the session context was built.
+    /// Ensure native skill links exist for the runtime. Codex-managed skills
+    /// live under the app workspace root and are registered through its extra
+    /// roots wire; other agents retain their native workspace directories.
     pub(crate) async fn ensure_workspace_skill_links(
         &self,
         row: &ConversationRow,
-        build_opts: &BuildTaskOptions,
+        build_opts: &mut BuildTaskOptions,
         plugin_snapshot: Option<&PluginRuntimeSnapshot>,
     ) {
-        let context = &build_opts.context;
-        let backend = context_backend_value(context);
+        let backend = context_backend_value(&build_opts.context);
+        let is_codex = backend.as_ref().and_then(serde_json::Value::as_str) == Some("codex");
 
-        let workspace = PathBuf::from(context.workspace.path.trim());
-        if !context.workspace.is_custom {
+        let runtime_workspace = PathBuf::from(build_opts.context.workspace.path.trim());
+        if !build_opts.context.workspace.is_custom {
             let expected_workspace = expected_auto_workspace_path(
                 &self.workspace_root,
                 &row.user_id,
                 &row.id,
-                &context.conversation.agent_type,
+                &build_opts.context.conversation.agent_type,
                 backend.as_ref(),
             );
 
-            if workspace != expected_workspace {
+            if runtime_workspace != expected_workspace {
                 return;
             }
         }
 
-        let skill_names = context_skill_names(context);
-
-        let Some(rel_dirs) = native_skills_dirs(
-            &self.agent_metadata_repo,
-            &context.conversation.user_id,
-            &context.conversation.agent_type,
-            backend.as_ref(),
-        )
-        .await
-        else {
-            return;
+        let skill_names = context_skill_names(&build_opts.context);
+        let (workspace, rel_dirs) = if is_codex {
+            let Some(root) = managed_skills_root(&self.workspace_root, &row.user_id, &row.id) else {
+                warn!(conversation_id = %row.id, "refusing unsafe app-managed skill path");
+                return;
+            };
+            let skills_root = root.join("skills");
+            build_opts.context.managed_skill_roots = vec![skills_root.to_string_lossy().into_owned()];
+            (root, vec!["skills".to_owned()])
+        } else {
+            let Some(rel_dirs) = native_skills_dirs(
+                &self.agent_metadata_repo,
+                &build_opts.context.conversation.user_id,
+                &build_opts.context.conversation.agent_type,
+                backend.as_ref(),
+            )
+            .await
+            else {
+                return;
+            };
+            (runtime_workspace, rel_dirs)
         };
+
         if rel_dirs.is_empty() {
             return;
         }
@@ -4204,7 +4275,7 @@ impl ConversationService {
 
         let resolved = self
             .skill_resolver
-            .resolve_skills_for_user(&context.conversation.user_id, &skill_names)
+            .resolve_skills_for_user(&build_opts.context.conversation.user_id, &skill_names)
             .await;
         if resolved.is_empty() {
             return;
@@ -4219,7 +4290,8 @@ impl ConversationService {
             conversation_id = %row.id,
             workspace = %workspace.display(),
             links = n,
-            "ensured skill symlinks in auto workspace"
+            managed_outside_repository = is_codex,
+            "ensured runtime skill links"
         );
     }
 
@@ -4485,6 +4557,44 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
         return s.clone();
     }
     agent_type.serde_name().to_owned()
+}
+
+fn model_is_advertised(raw_catalog: Option<&str>, model_id: &str) -> Option<bool> {
+    let catalog = serde_json::from_str::<serde_json::Value>(raw_catalog?).ok()?;
+    let entries = catalog
+        .get("available_models")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| catalog.as_array())?;
+    if entries.is_empty() {
+        return None;
+    }
+    Some(entries.iter().any(|entry| {
+        entry
+            .get("id")
+            .or_else(|| entry.get("model_id"))
+            .or_else(|| entry.get("modelId"))
+            .and_then(serde_json::Value::as_str)
+            == Some(model_id)
+    }))
+}
+
+pub(crate) fn managed_skills_root(workspace_root: &Path, user_id: &str, conversation_id: &str) -> Option<PathBuf> {
+    let user_dir = aionui_common::user_dir_name(user_id).ok()?;
+    if Path::new(conversation_id).components().count() != 1
+        || !matches!(
+            Path::new(conversation_id).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return None;
+    }
+    Some(
+        workspace_root
+            .join("managed-skills")
+            .join("users")
+            .join(user_dir)
+            .join(conversation_id),
+    )
 }
 
 fn expected_auto_workspace_path(

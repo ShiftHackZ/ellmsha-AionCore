@@ -7,11 +7,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, EnsureNodeRuntimeRequest,
-    EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
-    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    ApiResponse, CliRuntimeInfo, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest,
+    EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
+    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
+    SetCliRuntimeSelectionRequest, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult,
+    UpdateCliRuntimeRequest, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -91,6 +91,12 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
+        .route(
+            "/api/system/cli-runtimes/{name}",
+            get(get_cli_runtime).put(set_cli_runtime_selection),
+        )
+        .route("/api/system/cli-runtimes/{name}/update", post(update_cli_runtime))
+        .route("/api/system/cli-runtimes/{name}/rollback", post(rollback_cli_runtime))
         .route("/api/system/diagnostics/feedback-report", get(get_feedback_diagnostics))
         .with_state(state)
 }
@@ -315,5 +321,44 @@ async fn ensure_node_runtime(
         .runtime_prepare_service
         .ensure_node_runtime_for_user(&user.id, req.scope)
         .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn get_cli_runtime(
+    State(state): State<SystemRouterState>,
+    Path(name): Path<String>,
+) -> Result<Json<ApiResponse<CliRuntimeInfo>>, ApiError> {
+    let result = state.runtime_prepare_service.cli_runtime_info(&name).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn set_cli_runtime_selection(
+    State(state): State<SystemRouterState>,
+    Path(name): Path<String>,
+    body: Result<Json<SetCliRuntimeSelectionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CliRuntimeInfo>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let result = state
+        .runtime_prepare_service
+        .set_cli_runtime_selection(&name, request)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn update_cli_runtime(
+    State(state): State<SystemRouterState>,
+    Path(name): Path<String>,
+    body: Result<Json<UpdateCliRuntimeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CliRuntimeInfo>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let result = state.runtime_prepare_service.update_cli_runtime(&name, request).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn rollback_cli_runtime(
+    State(state): State<SystemRouterState>,
+    Path(name): Path<String>,
+) -> Result<Json<ApiResponse<CliRuntimeInfo>>, ApiError> {
+    let result = state.runtime_prepare_service.rollback_cli_runtime(&name).await?;
     Ok(Json(ApiResponse::ok(result)))
 }

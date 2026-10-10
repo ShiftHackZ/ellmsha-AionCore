@@ -477,6 +477,7 @@ mod tests {
                 use_model: None,
             },
             skills: vec![],
+            managed_skill_roots: vec![],
             runtime_env: vec![],
             team: None,
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {

@@ -199,14 +199,15 @@ pub struct SessionInit {
     /// Skill ids/names to surface to the agent on the first turn (acp/aionrs
     /// deliver these via the first prompt, not a `session/new` param).
     ///
-    /// NB: claude/codex direct-CLI backends intentionally do NOT consume this —
-    /// skills reach them as workspace symlinks (conversation service links the
-    /// resolved skills into the agent's `native_skills_dirs`, e.g.
-    /// `.claude/skills` / `.codex/skills`) and both CLIs discover them natively
-    /// (codex LIVE-verified 0.144.1: `skills/list` returns a `<cwd>/.codex/skills`
-    /// entry as scope=repo; see samples/codex-cli/0.144.1/_probe_workspace_skills.py).
+    /// NB: claude/codex direct-CLI backends intentionally do NOT consume this.
+    /// Claude discovers workspace links. Codex discovers user-owned repo skills
+    /// from `<cwd>/.codex/skills` and app-managed skills from
+    /// `managed_skill_roots`, so the harness never writes into the repository.
     /// The field is carried for the aionrs/acp first-prompt delivery path only.
     pub skills: Vec<String>,
+    /// App-owned skill roots registered with backends that support discovery
+    /// outside the user's repository (currently Codex `skills/extraRoots/set`).
+    pub managed_skill_roots: Vec<String>,
     /// Composed system prompt / preset context (the `compose_preset_context`
     /// output + aionrs `preset_rules`-merged prompt). Delivered first-message.
     pub preset_context: Option<String>,

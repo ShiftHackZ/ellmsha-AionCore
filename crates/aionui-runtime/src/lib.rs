@@ -15,7 +15,10 @@ mod shell_env;
 
 pub use agent_env::agent_process_env;
 pub use cache::init;
-pub use managed_cli::{CLAUDE_CLI_VERSION, CODEX_CLI_VERSION, cli_version, resolve_bundled_cli};
+pub use managed_cli::{
+    CLAUDE_CLI_VERSION, CODEX_CLI_VERSION, CliRuntimeError, ResolvedCliRuntime, cli_runtime_info, cli_version,
+    resolve_bundled_cli, resolve_cli_runtime, rollback_managed_cli, set_cli_runtime_selection, update_managed_cli,
+};
 pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,

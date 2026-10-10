@@ -152,8 +152,9 @@ pub use remote_agent::{
 };
 pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{
-    EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
-    RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
+    CliRuntimeInfo, CliRuntimeSelection, EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind,
+    RuntimeResourceKind, RuntimeStatusPayload, RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
+    SetCliRuntimeSelectionRequest, UpdateCliRuntimeRequest,
 };
 pub use shell::{
     CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig,

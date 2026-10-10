@@ -39,10 +39,10 @@ use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
-    SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    SaveRuntimeStateParams, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
 use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
@@ -50,7 +50,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::service::ConversationService;
+use crate::service::{ConversationService, managed_skills_root};
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
 
@@ -2360,6 +2360,76 @@ async fn create_rejects_assistant_with_unregistered_agent_metadata() {
             .contains("assistant agent `missing-agent` is not registered in agent_metadata"),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test]
+async fn create_allows_codex_models_missing_from_stale_persisted_catalog() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    let metadata_repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    metadata_repo
+        .apply_handshake(
+            "8e1acf31",
+            &UpdateAgentHandshakeParams {
+                available_models: Some(Some(
+                    r#"{"current_model_id":"gpt-5.6-sol","available_models":[{"id":"gpt-5.6-sol","label":"GPT-5.6 Sol"}]}"#,
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let conversation_repo = Arc::new(MockRepo::new());
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        Arc::new(MockTaskManager::new()),
+        conversation_repo.clone(),
+        metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
+    let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+    let preference_repo = Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
+    svc.with_assistant_definition_repo(definition_repo.clone());
+    svc.with_assistant_state_repo(state_repo.clone());
+    svc.with_assistant_preference_repo(preference_repo);
+
+    let direct_request: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "backend": "codex", "current_model_id": "gpt-6-sol" }
+    }))
+    .unwrap();
+    svc.create("user-1", direct_request).await.unwrap();
+    assert_eq!(conversation_repo.rows.lock().unwrap().len(), 1);
+
+    upsert_test_assistant_definition(&definition_repo, "asstdef-codex", "codex", "8e1acf31", "auto", "auto").await;
+    state_repo
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef-codex",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let request: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "assistant": {
+            "id": "codex",
+            "conversation_overrides": { "model": "gpt-6-sol" }
+        },
+        "extra": { "backend": "codex" }
+    }))
+    .unwrap();
+    svc.create("user-1", request).await.unwrap();
+    assert_eq!(conversation_repo.rows.lock().unwrap().len(), 2);
 }
 
 // ── Get tests ──────────────────────────────────────────────────────
@@ -7890,6 +7960,60 @@ async fn create_links_skills_into_custom_workspace_for_native_acp_agent() {
     assert_eq!(calls[0].workspace, workspace);
     assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
+async fn codex_managed_skills_stay_outside_custom_workspace() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let workspace_root = unique_test_workspace_path("codex-managed-root");
+    let custom_workspace = unique_test_workspace_path("codex-user-repo");
+    let repo = Arc::new(MockRepo::new());
+    let svc = ConversationService::new(
+        workspace_root.clone(),
+        Arc::new(MockBroadcaster::new()),
+        resolver,
+        Arc::new(MockTaskManager::new()),
+        repo.clone(),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": custom_workspace, "backend": "codex" },
+    }))
+    .unwrap();
+    let created = svc.create("user-1", req).await.unwrap();
+    assert!(!custom_workspace.join(".codex").exists());
+
+    let row = repo.get("user-1", &created.id).await.unwrap().unwrap();
+    let mut options = svc.build_task_options(&row).await.unwrap();
+    svc.ensure_workspace_skill_links(&row, &mut options, None).await;
+
+    assert!(!custom_workspace.join(".codex").exists());
+    assert_eq!(options.context.managed_skill_roots.len(), 1);
+    let managed_root = PathBuf::from(&options.context.managed_skill_roots[0]);
+    assert!(managed_root.starts_with(workspace_root.join("managed-skills")));
+    assert!(managed_root.join("cron").is_dir());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_ne!(calls[0].workspace, custom_workspace);
+    assert_eq!(calls[0].rel_dirs, vec!["skills"]);
+    drop(calls);
+
+    svc.delete("user-1", &created.id).await.unwrap();
+    assert!(!managed_root.exists());
+}
+
+#[test]
+fn managed_skill_cleanup_path_rejects_traversal_and_absolute_ids() {
+    let root = PathBuf::from("/app-data");
+    assert!(managed_skills_root(&root, "user-1", "../../outside").is_none());
+    assert!(managed_skills_root(&root, "user-1", "/tmp/outside").is_none());
+    assert_eq!(
+        managed_skills_root(&root, "user-1", "conversation-1"),
+        Some(root.join("managed-skills/users/user-1/conversation-1"))
+    );
 }
 
 #[tokio::test]

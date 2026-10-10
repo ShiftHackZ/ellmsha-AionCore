@@ -12,12 +12,20 @@ use std::path::{Path, PathBuf};
 use crate::managed_resources::{self, ManagedResourcesMode};
 
 mod prepare;
-pub use prepare::{ManagedCliError, PreparedCli, managed_cli_contract_for_export, prepare_managed_cli_to_root};
+mod runtime;
+pub use prepare::{
+    ManagedCliError, PreparedCli, managed_cli_contract_for_export, prepare_managed_cli_to_root,
+    prepare_managed_cli_version_to_root,
+};
+pub use runtime::{
+    CliRuntimeError, ResolvedCliRuntime, cli_runtime_info, resolve_cli_runtime, rollback_managed_cli,
+    set_cli_runtime_selection, update_managed_cli,
+};
 
 /// Pinned CLI versions — the single source of truth. Bumping a CLI = change the
 /// constant and rebuild (managed-resources is replaced wholesale on app update).
 pub const CLAUDE_CLI_VERSION: &str = "2.1.215";
-pub const CODEX_CLI_VERSION: &str = "0.144.6";
+pub const CODEX_CLI_VERSION: &str = "0.162.1";
 
 /// The pinned version for a supported CLI name, or `None` for unknown names.
 pub fn cli_version(name: &str) -> Option<&'static str> {
@@ -77,9 +85,7 @@ fn main_executable_in(name: &str, root: &Path) -> Option<PathBuf> {
 
 /// Resolve the absolute path to the bundled CLI binary for `name`.
 ///
-/// Returns `Some(path)` only in `Bundled` mode when the binary is present;
-/// otherwise `None` (dev / Download mode, or a missing bundle), signalling the
-/// caller to fall back to the bare command name resolved via PATH.
+/// Returns `Some(path)` only in `Bundled` mode when the binary is present.
 pub fn resolve_bundled_cli(name: &str) -> Option<PathBuf> {
     if !matches!(
         managed_resources::managed_resources_mode(),
@@ -95,19 +101,7 @@ pub fn resolve_bundled_cli(name: &str) -> Option<PathBuf> {
             return Some(exe);
         }
     }
-    // Bundled CLI is missing but we are in Bundled mode: the backend will spawn
-    // the bare command name resolved via PATH. Surface which concrete binary
-    // that resolves to (or `<none>` when PATH has no such command either) so the
-    // fallback is diagnosable in production logs (which run at info level).
-    let resolved = crate::resolve_command_path(name)
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<none>".to_owned());
-    tracing::warn!(
-        cli = name,
-        version,
-        resolved = %resolved,
-        "bundled cli missing in Bundled mode; falling back to PATH"
-    );
+    tracing::warn!(cli = name, version, "bundled cli missing in Bundled mode");
     None
 }
 

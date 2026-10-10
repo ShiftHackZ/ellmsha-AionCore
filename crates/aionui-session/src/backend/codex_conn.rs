@@ -59,6 +59,24 @@ impl CodexConnection {
     }
 }
 
+fn codex_app_server_args(config: &SessionConfig) -> Vec<String> {
+    let mut args = vec!["app-server".to_string()];
+    args.extend(config.extra_args.iter().cloned());
+    if !config.generation_only {
+        for value in [
+            r#"default_permissions="ellmsha-workspace-network""#,
+            r#"permissions.ellmsha-workspace-network.extends=":workspace""#,
+            "permissions.ellmsha-workspace-network.network.enabled=true",
+            r#"permissions.ellmsha-read-network.extends=":read-only""#,
+            "permissions.ellmsha-read-network.network.enabled=true",
+        ] {
+            args.push("--config".into());
+            args.push(value.into());
+        }
+    }
+    args
+}
+
 #[async_trait::async_trait]
 impl BackendConnection for CodexConnection {
     async fn open_session(
@@ -75,8 +93,7 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
-        let mut args = vec!["app-server".to_string()];
-        args.extend(config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&config);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
             // (dev → PATH). See SessionConfig.cli_program.
@@ -202,6 +219,9 @@ impl BackendConnection for CodexConnection {
             && matches!(spec, SessionSpec::Fresh { .. })
             && (config.model.is_some() || config.mode.is_some())
         {
+            backend
+                .model_reconcile_ready
+                .store(config.model.is_none(), Ordering::SeqCst);
             let backend = Arc::new(backend);
             spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
             return Ok(backend);
@@ -256,13 +276,12 @@ fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String
 /// Empty vec = never populated within the poll bound (cannot validate).
 async fn await_codex_catalog(
     backend: &CodexSessionBackend,
-    extract: impl Fn(&Discovered) -> Vec<String>,
+    extract: impl Fn(&Discovered) -> Option<Vec<String>>,
 ) -> Vec<String> {
     for _ in 0..CODEX_RECONCILE_POLLS {
         {
             let disc = backend.discovered.lock().unwrap_or_else(|e| e.into_inner());
-            let ids = extract(&disc);
-            if !ids.is_empty() {
+            if let Some(ids) = extract(&disc) {
                 return ids;
             }
         }
@@ -274,38 +293,37 @@ async fn await_codex_catalog(
 /// Apply `requested` model the ACP way: wait for `model/list` to fill the catalog, then
 ///   - if `requested` IS in the catalog → dispatch a `SetModel` (validated apply;
 ///     success converges via `thread/settings/updated`);
-///   - if `requested` is NOT in the catalog → DROP it (WARN) and clear the optimistic
-///     open-time `current_model` seed, so a stale frontend default (e.g. `gpt-5.5` the
-///     local codex lacks) never binds and poisons every turn with an opaque
-///     UNKNOWN_UPSTREAM_ERROR. Exact ACP contract (`session/new` carried no model; the
-///     model was applied only after `clear_invalid_desired_model` validated it against
-///     the session/new catalog), adapted to codex's `model/list`-after-`thread/start`
-///     ordering.
+///   - if `requested` is NOT in the catalog → reject setup before the first turn;
+///   - if the catalog never arrives → reject setup rather than silently substituting
+///     Codex's default model.
 async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
-    let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
+    let catalog = await_codex_catalog(backend, |d| {
+        d.models_complete
+            .then(|| d.models.iter().map(|m| m.id.clone()).collect())
+    })
+    .await;
 
     if catalog.is_empty() {
-        // Never learned the catalog → cannot validate. Leave codex on its launch
-        // default (the safe choice) rather than bind a possibly-invalid model.
         tracing::warn!(
             requested_model = %requested,
-            "codex model reconcile: model/list never populated; leaving thread on codex default \
-             (requested model NOT applied — cannot validate)"
+            "codex model reconcile: model/list never populated; rejecting requested model"
         );
+        *backend.resume_poison.lock().await = Some(format!(
+            "codex model catalog unavailable: cannot validate requested model `{requested}`"
+        ));
         return;
     }
 
     if !catalog.contains(&requested) {
-        // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
-        // optimistic open-time seed so SetMode can't later build a collaborationMode
-        // around a model codex rejected, and the UI intent doesn't outlive reality.
         tracing::warn!(
             requested_model = %requested,
             catalog = ?catalog,
-            "codex model reconcile: requested model not in catalog; dropping it \
-             (thread stays on codex default)"
+            "codex model reconcile: requested model not in catalog; rejecting setup"
         );
         *backend.current_model.lock().await = None;
+        *backend.resume_poison.lock().await = Some(format!(
+            "codex requested model unavailable: `{requested}` is not in the live model catalog"
+        ));
         return;
     }
 
@@ -318,6 +336,9 @@ async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String)
     );
     if let Err(e) = backend.dispatch(Command::SetModel { model: requested }).await {
         tracing::error!(error = %e, "codex model reconcile: SetModel dispatch failed");
+        *backend.resume_poison.lock().await = Some(format!(
+            "codex requested model unavailable: settings update failed: {e}"
+        ));
     }
 }
 
@@ -338,10 +359,12 @@ async fn reconcile_codex_mode(backend: &CodexSessionBackend, requested: String) 
     // each catalog id back to its colon profile id so both sides of the `contains` check
     // below are colon-shaped (a custom profile is already colon → normalize is a no-op).
     let catalog: Vec<String> = await_codex_catalog(backend, |d| {
-        d.modes
-            .iter()
-            .map(|m| codex_perm::normalize_to_profile_id(&m.id))
-            .collect()
+        (!d.modes.is_empty()).then(|| {
+            d.modes
+                .iter()
+                .map(|m| codex_perm::normalize_to_profile_id(&m.id))
+                .collect()
+        })
     })
     .await;
 
@@ -559,9 +582,10 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         }
         params["config"] = json!({ "mcp_servers": servers });
     }
-    // Verified with codex 0.162.0-alpha.17.2: selecting :workspace resets
-    // legacy sandbox_workspace_write.network_access. Named profiles preserve
-    // the built-in filesystem policy while explicitly enabling network access.
+    // Verified against the packaged codex 0.162.1 app-server schema and live
+    // wire: named profiles preserve the built-in filesystem policy while
+    // explicitly enabling network access. The same table is installed at
+    // process startup because settings updates reload process configuration.
     if !config.generation_only {
         params["config"]["default_permissions"] = json!(custom_profile.as_deref().unwrap_or(match sandbox {
             "read-only" => "ellmsha-read-network",
@@ -954,6 +978,9 @@ pub struct CodexSessionBackend {
     /// cleared and `resume_poison` set. A success either opens the resume gate
     /// immediately or starts the native-memory catalog check below.
     pending_resume: Arc<Mutex<Option<u64>>>,
+    /// App-owned skill-root registration must complete before the first turn.
+    pending_skill_roots: Arc<Mutex<Option<u64>>>,
+    skill_roots_ready: Arc<std::sync::atomic::AtomicBool>,
     /// Resume-only readiness barrier for the built-in memory catalog. A resumed
     /// thread is pre-bound so dead-anchor handling keeps working, but its first
     /// turn must not start until Codex has connected the current Tencent MCP and
@@ -1039,6 +1066,9 @@ pub struct CodexSessionBackend {
     /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
     /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    /// Fresh sessions with a requested model must not admit their first turn until
+    /// the live catalog validated it and Codex acknowledged the settings update.
+    model_reconcile_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One in-flight prompt-carrying client request (GAP-A correlation entry).
@@ -1064,7 +1094,9 @@ struct PendingSend {
 /// the reader claims by rpc id; none touches the FSM.
 #[derive(Clone, Copy)]
 enum DiscoveryKind {
-    Models,
+    Models {
+        page: usize,
+    },
     /// codex's mode axis: filled from `permissionProfile/list` and mapped to the fixed
     /// permission-tier enum (feature 012). codex sends no `collaborationMode/list`.
     Permissions,
@@ -1072,10 +1104,40 @@ enum DiscoveryKind {
     Rewind,
 }
 
+const MODEL_LIST_PAGE_LIMIT: usize = 100;
+const MODEL_LIST_MAX_PAGES: usize = 8;
+const MODEL_LIST_MAX_ITEMS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelPaginationDecision {
+    Complete,
+    Next(String),
+    Truncated(String),
+}
+
+fn model_pagination_decision(result: &Value, page: usize, item_count: usize) -> ModelPaginationDecision {
+    let Some(cursor) = result
+        .get("nextCursor")
+        .or_else(|| result.get("next_cursor"))
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+    else {
+        return ModelPaginationDecision::Complete;
+    };
+    if page + 1 >= MODEL_LIST_MAX_PAGES {
+        return ModelPaginationDecision::Truncated(format!("pagination exceeded {MODEL_LIST_MAX_PAGES} pages"));
+    }
+    if item_count >= MODEL_LIST_MAX_ITEMS {
+        return ModelPaginationDecision::Truncated(format!("pagination exceeded {MODEL_LIST_MAX_ITEMS} models"));
+    }
+    ModelPaginationDecision::Next(cursor.to_owned())
+}
+
 /// Per-session handshake-discovered capability lists (B-CODEX-MODEL-LIST).
 #[derive(Default, Clone)]
 struct Discovered {
     models: Vec<crate::capability::ModelInfo>,
+    models_complete: bool,
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
@@ -1166,7 +1228,10 @@ struct CodexReaderState {
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    model_reconcile_ready: Arc<std::sync::atomic::AtomicBool>,
     pending_resume: Arc<Mutex<Option<u64>>>,
+    pending_skill_roots: Arc<Mutex<Option<u64>>>,
+    skill_roots_ready: Arc<std::sync::atomic::AtomicBool>,
     rpc_id: Arc<AtomicU64>,
     resume_ready: Arc<std::sync::atomic::AtomicBool>,
     resume_needs_memory_catalog: Arc<std::sync::atomic::AtomicBool>,
@@ -1204,7 +1269,10 @@ fn start_codex_reader(
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
+            state.model_reconcile_ready,
             state.pending_resume,
+            state.pending_skill_roots,
+            state.skill_roots_ready,
             state.rpc_id,
             state.resume_ready,
             state.resume_needs_memory_catalog,
@@ -1290,7 +1358,7 @@ impl CodexSessionBackend {
         self.pending_discovery
             .lock()
             .await
-            .insert(rpc_id, DiscoveryKind::Models);
+            .insert(rpc_id, DiscoveryKind::Models { page: 0 });
     }
 
     /// Test-support seam: register a pending `thread/settings/update`
@@ -1338,7 +1406,10 @@ impl CodexSessionBackend {
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
+        let model_reconcile_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let pending_resume = Arc::new(Mutex::new(None));
+        let pending_skill_roots = Arc::new(Mutex::new(None));
+        let skill_roots_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let rpc_id = Arc::new(AtomicU64::new(0));
         let resume_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let resume_needs_memory_catalog = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1367,7 +1438,10 @@ impl CodexSessionBackend {
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
+            model_reconcile_ready: model_reconcile_ready.clone(),
             pending_resume: pending_resume.clone(),
+            pending_skill_roots: pending_skill_roots.clone(),
+            skill_roots_ready: skill_roots_ready.clone(),
             rpc_id: rpc_id.clone(),
             resume_ready: resume_ready.clone(),
             resume_needs_memory_catalog: resume_needs_memory_catalog.clone(),
@@ -1429,7 +1503,10 @@ impl CodexSessionBackend {
             pending_sends,
             pending_discovery,
             pending_set,
+            model_reconcile_ready,
             pending_resume,
+            pending_skill_roots,
+            skill_roots_ready,
             resume_ready,
             resume_needs_memory_catalog,
             pending_resume_catalog,
@@ -1484,6 +1561,18 @@ impl CodexSessionBackend {
     /// passes `handshake_budget()`; tests pass a tiny budget to exercise the timeout
     /// branch deterministically without a global env override / a 30s wait).
     async fn bound_thread_within(&self, budget: std::time::Duration) -> Result<String, BackendError> {
+        self.bound_thread_within_gate(budget, true).await
+    }
+
+    async fn bound_thread_for_setup(&self) -> Result<String, BackendError> {
+        self.bound_thread_within_gate(super::handshake_budget(), false).await
+    }
+
+    async fn bound_thread_within_gate(
+        &self,
+        budget: std::time::Duration,
+        require_model_reconcile: bool,
+    ) -> Result<String, BackendError> {
         let polls = (budget.as_millis() / 50).max(1) as u64;
         for _ in 0..polls {
             // Dead resume anchor (ELECTRON-3Q0): codex rejected the thread/resume,
@@ -1495,6 +1584,9 @@ impl CodexSessionBackend {
                 return Err(
                     if poison.starts_with("codex thread/start failed:")
                         || poison.starts_with("codex resume MCP catalog failed:")
+                        || poison.starts_with("codex model catalog unavailable:")
+                        || poison.starts_with("codex requested model unavailable:")
+                        || poison.starts_with("codex skills/extraRoots/set failed:")
                     {
                         BackendError::SetupRejected(poison)
                     } else {
@@ -1503,6 +1595,8 @@ impl CodexSessionBackend {
                 );
             }
             if self.resume_ready.load(Ordering::SeqCst)
+                && self.skill_roots_ready.load(Ordering::SeqCst)
+                && (!require_model_reconcile || self.model_reconcile_ready.load(Ordering::SeqCst))
                 && let Some(tid) = self.thread_binding.lock().await.clone()
             {
                 return Ok(tid);
@@ -1528,10 +1622,24 @@ impl CodexSessionBackend {
         *self.resume_poison.lock().await = None;
         self.resume_ready.store(true, Ordering::SeqCst);
         self.resume_needs_memory_catalog.store(false, Ordering::SeqCst);
+        self.skill_roots_ready.store(true, Ordering::SeqCst);
+        *self.pending_skill_roots.lock().await = None;
         *self.pending_resume_catalog.lock().await = None;
         *self.resume_catalog_deadline.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
+        if !config.init.managed_skill_roots.is_empty() {
+            self.skill_roots_ready.store(false, Ordering::SeqCst);
+            let request_id = self.next_rpc_id();
+            *self.pending_skill_roots.lock().await = Some(request_id);
+            self.write_frame(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "skills/extraRoots/set",
+                "params": { "extraRoots": config.init.managed_skill_roots.clone() }
+            }))
+            .await?;
+        }
         match mode {
             HandshakeMode::Resume(tid) => {
                 self.resume_ready.store(false, Ordering::SeqCst);
@@ -1596,10 +1704,10 @@ impl CodexSessionBackend {
         self.pending_discovery
             .lock()
             .await
-            .insert(model_list_id, DiscoveryKind::Models);
+            .insert(model_list_id, DiscoveryKind::Models { page: 0 });
         self.write_frame(json!({
             "jsonrpc": "2.0", "id": model_list_id, "method": "model/list",
-            "params": { "includeHidden": false }
+            "params": { "includeHidden": false, "limit": MODEL_LIST_PAGE_LIMIT }
         }))
         .await?;
         // feature 012: codex's mode selector IS its permission axis, so we discover
@@ -1633,8 +1741,7 @@ impl CodexSessionBackend {
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
         let config = self.wake.config_snapshot();
-        let mut args = vec!["app-server".to_string()];
-        args.extend(config.extra_args.iter().cloned());
+        let args = codex_app_server_args(&config);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
@@ -1697,7 +1804,10 @@ async fn reader_task(
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    model_reconcile_ready: Arc<std::sync::atomic::AtomicBool>,
     pending_resume: Arc<Mutex<Option<u64>>>,
+    pending_skill_roots: Arc<Mutex<Option<u64>>>,
+    skill_roots_ready: Arc<std::sync::atomic::AtomicBool>,
     rpc_id: Arc<AtomicU64>,
     resume_ready: Arc<std::sync::atomic::AtomicBool>,
     resume_needs_memory_catalog: Arc<std::sync::atomic::AtomicBool>,
@@ -2083,6 +2193,25 @@ async fn reader_task(
                                     .unwrap_or("request rejected (no error message)")
                                     .to_string()
                             });
+                            let is_skill_roots = {
+                                let mut pending = pending_skill_roots.lock().await;
+                                match *pending {
+                                    Some(pid) if pid == rid => {
+                                        *pending = None;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+                            if is_skill_roots {
+                                if let Some(message) = error_message.as_deref() {
+                                    *resume_poison.lock().await =
+                                        Some(format!("codex skills/extraRoots/set failed: {message}"));
+                                } else {
+                                    skill_roots_ready.store(true, Ordering::SeqCst);
+                                }
+                                continue;
+                            }
                             // (ELECTRON-3Q0 fix A) Claim the thread/resume response.
                             // An ERROR ("no rollout found for thread id …", verified:
                             // samples/codex-cli/0.144.1/dead_resume.jsonl) means the
@@ -2159,7 +2288,10 @@ async fn reader_task(
                                         })
                                     })
                                     .is_some_and(|server| {
-                                        server.get("runtimeStatus").and_then(Value::as_str) == Some("connected")
+                                        server
+                                            .get("runtimeStatus")
+                                            .and_then(Value::as_str)
+                                            .is_none_or(|status| status == "connected")
                                             && server
                                                 .get("tools")
                                                 .and_then(Value::as_object)
@@ -2307,16 +2439,62 @@ async fn reader_task(
                             // `discovered` cache (capabilities() merges them);
                             // thread/turns/list (Checkpoints) is mapped to a
                             // CheckpointList event instead (O2 up-leg — a query
-                            // result, not a capability). Lazy; a later page
-                            // (next_cursor) is ignored — first page bounds the N2
-                            // unbounded-catalog risk (we don't chase the cursor).
+                            // result, not a capability). model/list pagination is
+                            // bounded by both page count and accumulated item count.
                             let disc_kind = pending_discovery.lock().await.remove(&rid);
                             if let Some(kind) = disc_kind
                                 && let Some(result) = frame.get("result")
                             {
                                 match kind {
-                                    DiscoveryKind::Models | DiscoveryKind::Permissions => {
-                                        fill_discovery(kind, result, &discovered);
+                                    DiscoveryKind::Models { .. } | DiscoveryKind::Permissions => {
+                                        let page = match kind {
+                                            DiscoveryKind::Models { page } => page,
+                                            _ => 0,
+                                        };
+                                        fill_discovery_page(kind, result, &discovered, page > 0);
+                                        if let DiscoveryKind::Models { page } = kind {
+                                            let item_count = discovered
+                                                .lock()
+                                                .unwrap_or_else(|error| error.into_inner())
+                                                .models
+                                                .len();
+                                            match model_pagination_decision(result, page, item_count) {
+                                                ModelPaginationDecision::Complete => {
+                                                    discovered
+                                                        .lock()
+                                                        .unwrap_or_else(|error| error.into_inner())
+                                                        .models_complete = true;
+                                                }
+                                                ModelPaginationDecision::Next(cursor) => {
+                                                    let request_id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                                                    pending_discovery
+                                                        .lock()
+                                                        .await
+                                                        .insert(request_id, DiscoveryKind::Models { page: page + 1 });
+                                                    let request = json!({
+                                                        "jsonrpc": "2.0",
+                                                        "id": request_id,
+                                                        "method": "model/list",
+                                                        "params": {
+                                                            "includeHidden": false,
+                                                            "cursor": cursor,
+                                                            "limit": MODEL_LIST_PAGE_LIMIT,
+                                                        }
+                                                    });
+                                                    if !write_reader_frame(&stdin, &request).await {
+                                                        pending_discovery.lock().await.remove(&request_id);
+                                                        *resume_poison.lock().await = Some(
+                                                            "codex model catalog unavailable: failed to request the next catalog page"
+                                                                .to_owned(),
+                                                        );
+                                                    }
+                                                }
+                                                ModelPaginationDecision::Truncated(reason) => {
+                                                    *resume_poison.lock().await =
+                                                        Some(format!("codex model catalog unavailable: {reason}"));
+                                                }
+                                            }
+                                        }
                                         // Signal the async catalog arrival so the conversation
                                         // re-projects the model/mode picker (the ACP
                                         // `emit_snapshot_events` analogue). model/list and
@@ -2389,32 +2567,40 @@ async fn reader_task(
                             // On SUCCESS this does nothing: codex converges via the
                             // separate thread/settings/updated notification (→ ConfigChanged),
                             // so the claim only matters when the response carries an error.
-                            if let Some(label) = pending_set.lock().await.remove(&rid)
-                                && let Some(err) = frame.get("error")
-                            {
-                                let message = err
-                                    .get("message")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("set rejected")
-                                    .to_string();
-                                tracing::error!(
-                                    conversation_id = %session_id,
-                                    set = %label,
-                                    "codex thread/settings/update (SetMode/SetModel/effort) rejected by agent: {message}"
-                                );
-                                emit(
-                                    &event_tx,
-                                    &session_id,
-                                    turn_gen.load(Ordering::SeqCst),
-                                    SessionEvent::Notice {
-                                        // NoticeLevel has no Error tier; Warning is the
-                                        // highest user-facing level (the error-ness is in
-                                        // the message + the error! log above).
-                                        level: crate::event::NoticeLevel::Warning,
-                                        message: format!("{label} failed: {message}"),
-                                        localized: None,
-                                    },
-                                );
+                            if let Some(label) = pending_set.lock().await.remove(&rid) {
+                                if frame.get("error").is_none() && label.starts_with("model→") {
+                                    model_reconcile_ready.store(true, Ordering::SeqCst);
+                                }
+                                if let Some(err) = frame.get("error") {
+                                    let message = err
+                                        .get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("set rejected")
+                                        .to_string();
+                                    tracing::error!(
+                                        conversation_id = %session_id,
+                                        set = %label,
+                                        "codex thread/settings/update (SetMode/SetModel/effort) rejected by agent: {message}"
+                                    );
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        turn_gen.load(Ordering::SeqCst),
+                                        SessionEvent::Notice {
+                                            // NoticeLevel has no Error tier; Warning is the
+                                            // highest user-facing level (the error-ness is in
+                                            // the message + the error! log above).
+                                            level: crate::event::NoticeLevel::Warning,
+                                            message: format!("{label} failed: {message}"),
+                                            localized: None,
+                                        },
+                                    );
+                                    if label.starts_with("model→") {
+                                        *resume_poison.lock().await = Some(format!(
+                                            "codex requested model unavailable: {label} failed: {message}"
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2660,7 +2846,8 @@ mod codex_perm {
 /// → empty lists → config-options empty → frontend fell back to a hardcoded model
 /// name → Bedrock 404):
 /// - BOTH lists are under `result.data[]` (NOT `models`/`modes`); a `nextCursor`
-///   rides alongside (first page only — we do not chase it, N2 bound). We try
+///   rides alongside. The reader follows model cursors within fixed page/item
+///   bounds. We try
 ///   `data` first then fall back to `models`/`modes` so a cross-version rename in
 ///   either direction degrades gracefully rather than silently emptying.
 /// - model item: `{id, displayName, description, supportedReasoningEfforts}` where
@@ -2675,7 +2862,12 @@ mod codex_perm {
 /// A genuinely empty list after a successful response means the wire shape drifted
 /// again — `warn!` so it is diagnosable (it must never silently degrade to empty
 /// like the original bug did).
-fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::sync::Mutex<Discovered>>) {
+fn fill_discovery_page(
+    kind: DiscoveryKind,
+    result: &Value,
+    discovered: &Arc<std::sync::Mutex<Discovered>>,
+    append: bool,
+) {
     use crate::capability::{ModeInfo, ModelInfo};
     // The real wire wraps both lists in `data`; `models`/`modes` is the legacy/guessed
     // key kept only as a cross-version fallback.
@@ -2687,7 +2879,7 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             .cloned()
     };
     match kind {
-        DiscoveryKind::Models => {
+        DiscoveryKind::Models { .. } => {
             let arr = list("data", "models");
             let present = arr.is_some();
             let models = arr
@@ -2723,7 +2915,21 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             if present && models.is_empty() {
                 tracing::warn!("codex model/list parsed to empty (wire shape may have drifted from result.data[])");
             }
-            discovered.lock().unwrap_or_else(|e| e.into_inner()).models = models;
+            let mut guard = discovered.lock().unwrap_or_else(|e| e.into_inner());
+            if !append {
+                guard.models.clear();
+                guard.models_complete = false;
+            }
+            for model in models {
+                if guard.models.len() >= MODEL_LIST_MAX_ITEMS {
+                    break;
+                }
+                if let Some(existing) = guard.models.iter_mut().find(|existing| existing.id == model.id) {
+                    *existing = model;
+                } else {
+                    guard.models.push(model);
+                }
+            }
         }
         DiscoveryKind::Permissions => {
             // codex's mode axis IS the permission axis. This is the DISCOVERY half of the
@@ -3144,8 +3350,8 @@ async fn request_resumed_memory_catalog(
         "method": "mcpServerStatus/list",
         "params": {
             "threadId": thread_id,
-            "serverName": "ellmsha-tencentdb-memory",
-            "detail": "toolsAndAuthOnly"
+            "detail": "toolsAndAuthOnly",
+            "limit": 1000
         }
     });
     if write_reader_frame(stdin, &request).await {
@@ -4460,13 +4666,12 @@ impl SessionBackend for CodexSessionBackend {
                     .await?;
                 // for codex the mode axis IS the permission axis. The mode value is a
                 // DISCOVERED colon-prefixed profile id (`permissionProfile/list`), applied
-                // via `thread/settings/update{threadId, permissions:":workspace"}` — NOT the
-                // old collaborationMode object. U1 (live 0.139.0) froze the wire: the id
-                // MUST retain its leading colon (a bare id is rejected with
-                // "default_permissions requires a [permissions] table"), and `permissions`
-                // is mutually exclusive with `sandboxPolicy`. Unlike the old
-                // collaborationMode path this needs NO current_model. Applies to the NEXT
-                // turn; confirmed via the thread/settings/updated notif.
+                // through `thread/settings/update.permissions` — NOT the old
+                // collaborationMode object. Built-in filesystem tiers map to the
+                // process-defined network-enabled named profiles; custom profile ids flow
+                // through unchanged. Unlike the old collaborationMode path this needs NO
+                // current_model. Applies to the NEXT turn; confirmed via the
+                // thread/settings/updated notification on packaged Codex 0.144.6.
                 //
                 // `normalize_to_profile_id` is the codex analogue of legacy ACP
                 // `normalize_requested_mode`: a discovered colon id flows through verbatim,
@@ -4516,7 +4721,7 @@ impl SessionBackend for CodexSessionBackend {
                         .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                         .await?;
                 }
-                let tid = self.bound_thread().await?;
+                let tid = self.bound_thread_for_setup().await?;
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the profile) surfaces as a Notice instead of
@@ -4551,7 +4756,7 @@ impl SessionBackend for CodexSessionBackend {
                 // codex `thread/settings/update{threadId, model}` (verified frame:
                 // {"threadId":..,"model":"gpt-5.5"}). Applies to subsequent turns.
                 // Track it so a subsequent SetMode can build collaborationMode (M1).
-                let tid = self.bound_thread().await?;
+                let tid = self.bound_thread_for_setup().await?;
                 *self.current_model.lock().await = Some(model.clone());
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
@@ -8987,6 +9192,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn handshake_registers_managed_skill_roots_before_opening_thread() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            concat!(
+                r#"{"jsonrpc":"2.0","id":2,"result":{}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"managed-skills-thread"}}}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-managed-skills", Box::new(fake)).await;
+        backend.wake.config.write().unwrap().init.managed_skill_roots = vec!["/app/managed/skills".into()];
+
+        backend
+            .run_handshake(HandshakeMode::Fresh)
+            .await
+            .expect("handshake writes");
+
+        let written = captured_str(&captured).await;
+        let roots = written.find("skills/extraRoots/set").expect("extra roots request");
+        let start = written.find("thread/start").expect("thread start request");
+        assert!(
+            roots < start,
+            "managed roots must be registered before thread discovery: {written}"
+        );
+        assert!(written.contains(r#""extraRoots":["/app/managed/skills"]"#), "{written}");
+        release();
+        assert_eq!(
+            backend
+                .bound_thread_within(std::time::Duration::from_secs(1))
+                .await
+                .expect("successful extra-roots response opens the first-turn gate"),
+            "managed-skills-thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_managed_skill_roots_fail_session_setup() {
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"invalid extra root"}}
+"#
+            .to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-managed-skills-rejected", Box::new(fake)).await;
+        backend.wake.config.write().unwrap().init.managed_skill_roots = vec!["/app/managed/skills".into()];
+
+        backend
+            .run_handshake(HandshakeMode::Fresh)
+            .await
+            .expect("handshake writes");
+        release();
+
+        let error = backend
+            .bound_thread_within(std::time::Duration::from_secs(1))
+            .await
+            .expect_err("rejected extra roots must block the first turn");
+        assert!(matches!(error, BackendError::SetupRejected(message) if message.contains("skills/extraRoots/set")));
+    }
+
     /// A resumed thread is pre-bound, so without a separate readiness barrier the
     /// first turn can race ahead while Tencent is still starting and snapshot an
     /// empty native-tool catalog. Only a connected, nonempty inventory opens it.
@@ -9001,7 +9270,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","id":5,"result":{"data":[{"name":"ellmsha-tencentdb-memory","authStatus":"unsupported","runtimeStatus":"starting","tools":{},"toolsError":null,"resources":[],"resourceTemplates":[]}]}}
 "#
             .to_vec(),
-            br#"{"jsonrpc":"2.0","id":6,"result":{"data":[{"name":"ellmsha-tencentdb-memory","authStatus":"unsupported","runtimeStatus":"connected","tools":{"tdai_scenario_read":{"name":"tdai_scenario_read","inputSchema":{"type":"object"}}},"toolsError":null,"resources":[],"resourceTemplates":[]}]}}
+            br#"{"jsonrpc":"2.0","id":6,"result":{"data":[{"name":"ellmsha-tencentdb-memory","authStatus":"unsupported","tools":{"tdai_scenario_read":{"name":"tdai_scenario_read","inputSchema":{"type":"object"}}},"resources":[],"resourceTemplates":[]}]}}
 "#
             .to_vec(),
         ]);
@@ -9032,6 +9301,8 @@ mod tests {
         let written = captured_str(&captured).await;
         assert!(written.contains(r#""method":"mcpServerStatus/list""#), "{written}");
         assert!(written.contains(r#""threadId":"legacy-thread""#), "{written}");
+        assert!(written.contains(r#""limit":1000"#), "{written}");
+        assert!(!written.contains("serverName"), "{written}");
         assert!(
             backend
                 .bound_thread_within(std::time::Duration::from_millis(100))
@@ -9155,6 +9426,18 @@ mod tests {
             spec.args.iter().any(|a| a == "--flag"),
             "extra_args threaded into the spawn"
         );
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == r#"default_permissions="ellmsha-workspace-network""#),
+            "process config contains the default named permission profile"
+        );
+        assert!(
+            spec.args
+                .iter()
+                .any(|arg| arg == r#"permissions.ellmsha-read-network.extends=":read-only""#),
+            "process config contains the read-only network profile used by mode switches"
+        );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/work"), "cwd threaded (workspace)");
         // #103 parity with claude_conn: the orchestration-filled spawn env
         // (AIONUI_* runtime context + per-agent overrides) reaches the process.
@@ -9260,7 +9543,7 @@ mod tests {
         // this after the handshake; build_with_io skips the handshake).
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models { page: 0 });
             pd.insert(51, DiscoveryKind::Permissions);
         }
         // Subscribe to drive the reader; it consumes the two responses → fill_discovery.
@@ -9309,6 +9592,164 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn model_list_follows_cursor_and_merges_live_ids() {
+        let first = r#"{"jsonrpc":"2.0","id":50,"result":{"data":[{"id":"gpt-5.6-sol","displayName":"GPT-5.6 Sol"}],"nextCursor":"page-2"}}"#;
+        let second = r#"{"jsonrpc":"2.0","id":1,"result":{"data":[{"id":"gpt-6-sol","displayName":"GPT-6 Sol"}],"nextCursor":null}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{first}\n{second}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-pages", Box::new(fake)).await;
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(50, DiscoveryKind::Models { page: 0 });
+        let _events = backend.events();
+
+        let mut caps = backend.capabilities();
+        for _ in 0..40 {
+            if caps.available_models.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            caps = backend.capabilities();
+        }
+
+        assert_eq!(
+            caps.available_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-6-sol"]
+        );
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"model/list""#));
+        assert!(written.contains(r#""cursor":"page-2""#));
+        assert!(written.contains(&format!(r#""limit":{MODEL_LIST_PAGE_LIMIT}"#)));
+    }
+
+    #[test]
+    fn model_list_only_completes_when_server_ends_pagination() {
+        assert_eq!(
+            model_pagination_decision(&json!({ "nextCursor": null }), 0, 1),
+            ModelPaginationDecision::Complete
+        );
+        assert_eq!(
+            model_pagination_decision(&json!({ "nextCursor": "next" }), 0, 1),
+            ModelPaginationDecision::Next("next".into())
+        );
+        assert!(matches!(
+            model_pagination_decision(
+                &json!({ "nextCursor": "still-more" }),
+                MODEL_LIST_MAX_PAGES - 1,
+                1
+            ),
+            ModelPaginationDecision::Truncated(reason) if reason.contains("pages")
+        ));
+        assert!(matches!(
+            model_pagination_decision(
+                &json!({ "nextCursor": "still-more" }),
+                0,
+                MODEL_LIST_MAX_ITEMS
+            ),
+            ModelPaginationDecision::Truncated(reason) if reason.contains("models")
+        ));
+    }
+
+    #[tokio::test]
+    async fn requested_model_blocks_first_turn_until_acknowledged() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}
+"#
+            .to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-model-gate", Box::new(fake)).await);
+        backend.seed_thread_binding_for_test("model-gated-thread").await;
+        {
+            let mut discovered = backend.discovered.lock().unwrap_or_else(|error| error.into_inner());
+            discovered.models = vec![crate::capability::ModelInfo {
+                id: "gpt-6-sol".into(),
+                name: "GPT-6 Sol".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }];
+            discovered.models_complete = true;
+        }
+        backend.model_reconcile_ready.store(false, Ordering::SeqCst);
+
+        reconcile_codex_model(&backend, "gpt-6-sol".into()).await;
+        for _ in 0..40 {
+            if captured_str(&captured).await.contains("thread/settings/update") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""model":"gpt-6-sol""#), "{written}");
+
+        assert!(
+            backend
+                .bound_thread_within(std::time::Duration::from_millis(100))
+                .await
+                .is_err(),
+            "a requested model must gate the first turn"
+        );
+        release();
+        assert_eq!(
+            backend
+                .bound_thread_within(std::time::Duration::from_secs(1))
+                .await
+                .expect("settings acknowledgement opens the first-turn gate"),
+            "model-gated-thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_reconcile_waits_for_final_catalog_page() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-reconcile-pages", Box::new(fake)).await);
+        backend.seed_thread_binding_for_test("thread-1").await;
+        {
+            let mut discovered = backend.discovered.lock().unwrap();
+            discovered.models = vec![crate::capability::ModelInfo {
+                id: "gpt-5.6-sol".into(),
+                name: "GPT-5.6 Sol".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            }];
+            discovered.models_complete = false;
+        }
+
+        let reconcile = {
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                reconcile_codex_model(&backend, "gpt-6-sol".into()).await;
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(backend.resume_poison.lock().await.is_none());
+
+        {
+            let mut discovered = backend.discovered.lock().unwrap();
+            discovered.models.push(crate::capability::ModelInfo {
+                id: "gpt-6-sol".into(),
+                name: "GPT-6 Sol".into(),
+                description: None,
+                reasoning_efforts: Vec::new(),
+            });
+            discovered.models_complete = true;
+        }
+        reconcile.await.unwrap();
+
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"thread/settings/update""#));
+        assert!(written.contains(r#""model":"gpt-6-sol""#));
+        assert!(backend.resume_poison.lock().await.is_none());
+    }
+
     /// The FIX (async catalog-arrival signal): each `model/list` /
     /// `collaborationMode/list` RESPONSE must BROADCAST a `CatalogUpdated` carrying the
     /// current `discovered` snapshot — before this the parser silently filled the cache
@@ -9329,7 +9770,7 @@ mod tests {
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models { page: 0 });
             pd.insert(51, DiscoveryKind::Permissions);
         }
         let mut events = backend.events();
@@ -9369,7 +9810,7 @@ mod tests {
             r#"{"models":[{"id":"legacy-1","displayName":"Legacy","supportedReasoningEfforts":["low","high"]}]}"#,
         )
         .unwrap();
-        fill_discovery(DiscoveryKind::Models, &model_result, &discovered);
+        fill_discovery_page(DiscoveryKind::Models { page: 0 }, &model_result, &discovered, false);
         let d = discovered.lock().unwrap();
         assert_eq!(d.models.len(), 1, "legacy result.models[] still parses");
         assert_eq!(
@@ -9392,7 +9833,7 @@ mod tests {
             r#"{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null},{"id":":team-review","name":"Team Review","description":"Custom profile"}],"nextCursor":null}"#,
         )
         .unwrap();
-        fill_discovery(DiscoveryKind::Permissions, &perm_result, &discovered);
+        fill_discovery_page(DiscoveryKind::Permissions, &perm_result, &discovered, false);
         let d = discovered.lock().unwrap();
         // The catalog `id` is the FRONTEND-facing value: the three built-in tiers are mapped
         // to the legacy bare tokens the old ACP path advertised (`:workspace` → `auto`) so
@@ -9510,7 +9951,7 @@ mod tests {
     async fn fill_discovery_permissions_empty_does_not_panic() {
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let perm_result: Value = serde_json::from_str(r#"{"data":[],"nextCursor":null}"#).unwrap();
-        fill_discovery(DiscoveryKind::Permissions, &perm_result, &discovered);
+        fill_discovery_page(DiscoveryKind::Permissions, &perm_result, &discovered, false);
         assert!(discovered.lock().unwrap().modes.is_empty(), "empty data[] → no modes");
     }
 
@@ -9527,7 +9968,7 @@ mod tests {
         let backend = CodexSessionBackend::build_with_io("codex-perm", Box::new(fake)).await;
         {
             let mut pd = backend.pending_discovery.lock().await;
-            pd.insert(50, DiscoveryKind::Models);
+            pd.insert(50, DiscoveryKind::Models { page: 0 });
             pd.insert(52, DiscoveryKind::Permissions);
         }
         let mut events = backend.events();
@@ -9567,7 +10008,11 @@ mod tests {
         let fake = FakeAgentIo::never_exits(bytes);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-rec", Box::new(fake)).await;
-        backend.pending_discovery.lock().await.insert(50, DiscoveryKind::Models);
+        backend
+            .pending_discovery
+            .lock()
+            .await
+            .insert(50, DiscoveryKind::Models { page: 0 });
         // Drive the reader so it binds the thread + fills the catalog.
         let _events = backend.events();
         for _ in 0..40 {
@@ -9605,14 +10050,10 @@ mod tests {
         );
     }
 
-    /// A requested model that is NOT in the catalog (a stale frontend picker default the
-    /// local codex lacks — the exact "新会话首个回复报上游错误" repro) is DROPPED: no
-    /// `thread/settings/update` is written (the thread stays on codex's launch default),
-    /// and the optimistic open-time `current_model` seed is cleared so a later SetMode
-    /// can't build a collaborationMode around a model codex rejected. This is the port of
-    /// ACP's `clear_invalid_desired_model`.
+    /// A requested model that is NOT in the catalog is rejected before the first
+    /// turn rather than silently continuing on Codex's launch default.
     #[tokio::test]
-    async fn codex_model_reconcile_drops_invalid_model_and_clears_seed() {
+    async fn codex_model_reconcile_rejects_invalid_model_and_clears_seed() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
         // Optimistic open-time seed (open_session sets this from config.model).
         *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
@@ -9626,6 +10067,13 @@ mod tests {
         assert!(
             !written.contains(r#""method":"thread/settings/update""#),
             "an invalid model must NOT be applied to codex (no thread/settings/update), got: {written}"
+        );
+        let error = backend
+            .bound_thread_within(std::time::Duration::from_millis(100))
+            .await
+            .expect_err("invalid persisted model must reject setup");
+        assert!(
+            matches!(error, BackendError::SetupRejected(message) if message.contains("requested model unavailable"))
         );
     }
 
