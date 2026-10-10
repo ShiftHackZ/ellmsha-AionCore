@@ -10,7 +10,7 @@ use axum::http::{HeaderName, Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Router, middleware};
+use axum::{Extension, Router, middleware};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use aionui_ai_agent::{
@@ -29,7 +29,7 @@ use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
-use aionui_extension::{extension_routes, hub_routes, skill_routes};
+use aionui_extension::{ExtensionWatcher, extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
@@ -50,6 +50,10 @@ use super::trace::with_access_log;
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+    /// Keeps extension filesystem monitoring alive for the server lifetime.
+    /// The route tree only needs cloned extension state, so leaving this handle
+    /// in `ModuleStates` made it drop as soon as router assembly completed.
+    _extension_watcher: Option<Arc<ExtensionWatcher>>,
 }
 
 /// Create the application router with all routes and global middleware.
@@ -93,9 +97,10 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         }
     });
 
-    let (states, channel_components) = build_module_states(services).await?;
+    let (mut states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
     let team_service = states.team.service.clone();
+    let extension_watcher = states.extension_watcher.take().map(Arc::new);
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
@@ -146,6 +151,14 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let fs_router = spawn_fs_monitor(Arc::new(services.project_service.clone()), services.ws_manager.clone());
     let ws_state = build_ws_state(services, fs_router);
     let router = create_router_with_all_state(services, states, ws_state);
+    // The router and RouterRuntime share this lifetime guard. Production keeps
+    // RouterRuntime through `serve`; the public `create_router` convenience
+    // drops that return value, so the router must independently retain a clone.
+    let router = if let Some(watcher) = extension_watcher.as_ref() {
+        router.layer(Extension(Arc::clone(watcher)))
+    } else {
+        router
+    };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router assembly completed"
@@ -155,6 +168,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         RouterRuntime {
             client_pref_service,
             team_service,
+            _extension_watcher: extension_watcher,
         },
     ))
 }
@@ -569,6 +583,8 @@ fn boundary_error_for_status(status: StatusCode) -> Option<(&'static str, &'stat
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::http::StatusCode;
 
     use super::{boundary_error_for_status, create_router_with_runtime, is_global_websocket_event};
@@ -607,12 +623,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_router_with_runtime_exposes_team_service_for_background_coordinators() {
+    async fn create_router_with_runtime_retains_background_handles() {
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
 
-        let (_router, _runtime) = create_router_with_runtime(&services)
+        let (router, runtime) = create_router_with_runtime(&services)
             .await
             .expect("router runtime should build");
+        let watcher = runtime
+            ._extension_watcher
+            .as_ref()
+            .expect("router runtime must retain the extension watcher");
+        let weak = Arc::downgrade(watcher);
+        assert!(
+            Arc::strong_count(watcher) >= 2,
+            "router and RouterRuntime must independently retain the watcher"
+        );
+
+        drop(runtime);
+        assert!(
+            weak.upgrade().is_some(),
+            "router-only assembly must keep the watcher alive"
+        );
+        drop(router);
+        assert!(
+            weak.upgrade().is_none(),
+            "watcher must stop after every router owner is dropped"
+        );
     }
 }

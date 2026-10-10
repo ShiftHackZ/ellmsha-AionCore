@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +31,8 @@ const MAX_SKILL_IMPORT_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_SKILL_IMPORT_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 const IMPORT_STAGING_PREFIX: &str = ".import-staging-";
 const DEFAULT_USER_ID: &str = "system_default_user";
+const PLUGIN_SKILL_LINK_STATE_FILE: &str = ".aionui-plugin-skills.json";
+const PLUGIN_SKILL_COPY_MARKER: &str = ".aionui-plugin-source";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillImportLimits {
@@ -498,6 +501,20 @@ pub async fn read_skill_info(skill_path: &Path) -> Result<(String, String), Exte
     };
 
     Ok((final_name, description))
+}
+
+pub(crate) fn validate_skill_file(skill_path: &Path) -> Result<(), ExtensionError> {
+    let skill_file = if skill_path.is_dir() {
+        skill_path.join(SKILL_MANIFEST_FILE)
+    } else {
+        skill_path.to_path_buf()
+    };
+    let content = std::fs::read_to_string(&skill_file)
+        .map_err(|_| ExtensionError::SkillNotFound(skill_file.display().to_string()))?;
+    parse_frontmatter_fields(&content)
+        .filter(|(name, _)| !name.is_empty())
+        .ok_or_else(|| ExtensionError::SkillInvalidFrontmatter(skill_file.display().to_string()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1462,121 @@ pub async fn link_workspace_skills(
     Ok(created)
 }
 
+/// Synchronize plugin-owned skill links in a workspace.
+///
+/// Ownership is recorded separately from the skill name, so disabling or
+/// renaming a plugin skill can remove the old link without ever deleting a
+/// same-named directory created by the user. The copy marker covers the
+/// fallback used on systems where directory links are unavailable.
+pub async fn sync_workspace_plugin_skills(
+    workspace: &Path,
+    skills_rel_dirs: &[&str],
+    active_skills: &[ResolvedAgentSkill],
+) -> Result<usize, ExtensionError> {
+    let active: BTreeMap<_, _> = active_skills
+        .iter()
+        .map(|skill| (skill.name.clone(), skill.source_path.clone()))
+        .collect();
+    let mut created = 0usize;
+
+    for rel in skills_rel_dirs {
+        let target_skills_dir = resolve_workspace_skills_dir(workspace, rel).await;
+        let state_path = target_skills_dir.join(PLUGIN_SKILL_LINK_STATE_FILE);
+        let mut managed: BTreeMap<String, String> = match tokio::fs::read(&state_path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+
+        for (name, recorded_source) in managed.clone() {
+            let target = target_skills_dir.join(&name);
+            let desired = active.get(&name);
+            let unchanged = desired.is_some_and(|path| path.to_string_lossy() == recorded_source);
+            if unchanged && plugin_skill_target_is_owned(&target, Path::new(&recorded_source)).await {
+                continue;
+            }
+            if plugin_skill_target_is_owned(&target, Path::new(&recorded_source)).await {
+                remove_plugin_skill_target(&target).await?;
+            }
+            managed.remove(&name);
+        }
+
+        if !active.is_empty() {
+            tokio::fs::create_dir_all(&target_skills_dir).await?;
+        }
+        for (name, source_path) in &active {
+            if managed.contains_key(name) {
+                continue;
+            }
+            let target = target_skills_dir.join(name);
+            match tokio::fs::symlink_metadata(&target).await {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(target = %target.display(), error = %error, "failed to inspect plugin skill target");
+                    continue;
+                }
+            }
+
+            // Plugin runtime revisions are pruned once no turn snapshot uses
+            // them. Copy into the workspace so a completed turn never leaves
+            // a dangling skill link to an old revision.
+            match copy_plugin_skill_atomic(source_path, &target).await {
+                Ok(()) => {
+                    managed.insert(name.clone(), source_path.to_string_lossy().into_owned());
+                    created += 1;
+                }
+                Err(error) => {
+                    warn!(skill = %name, target = %target.display(), error = %error, "failed to materialize plugin skill");
+                }
+            }
+        }
+
+        if managed.is_empty() {
+            match tokio::fs::remove_file(&state_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            tokio::fs::write(&state_path, serde_json::to_vec_pretty(&managed)?).await?;
+        }
+    }
+    Ok(created)
+}
+
+async fn plugin_skill_target_is_owned(target: &Path, source: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::symlink_metadata(target).await else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return tokio::fs::canonicalize(target).await.ok() == tokio::fs::canonicalize(source).await.ok();
+    }
+    if !metadata.is_dir() {
+        return false;
+    }
+    tokio::fs::read_to_string(target.join(PLUGIN_SKILL_COPY_MARKER))
+        .await
+        .is_ok_and(|recorded| recorded == source.to_string_lossy())
+}
+
+async fn remove_plugin_skill_target(target: &Path) -> Result<(), ExtensionError> {
+    let metadata = tokio::fs::symlink_metadata(target).await?;
+    if metadata.file_type().is_symlink() {
+        #[cfg(windows)]
+        if target.is_dir() {
+            tokio::fs::remove_dir(target).await?;
+        } else {
+            tokio::fs::remove_file(target).await?;
+        }
+        #[cfg(not(windows))]
+        tokio::fs::remove_file(target).await?;
+    } else {
+        tokio::fs::remove_dir_all(target).await?;
+    }
+    Ok(())
+}
+
 async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
     let requested = workspace.join(skills_rel_dir);
     if path_is_dir(&requested).await {
@@ -2215,7 +2347,7 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ExtensionError
     tokio::fs::create_dir_all(dst).await?;
 
     let mut entries = tokio::fs::read_dir(src).await?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries.next_entry().await? {
         let entry_path = entry.path();
         let dest_path = dst.join(entry.file_name());
 
@@ -2227,6 +2359,33 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ExtensionError
     }
 
     Ok(())
+}
+
+async fn copy_plugin_skill_atomic(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = dst
+        .parent()
+        .ok_or_else(|| ExtensionError::InvalidSkillPath(dst.display().to_string()))?;
+    let name = dst.file_name().and_then(|name| name.to_str()).unwrap_or("skill");
+    let staging = parent.join(format!(
+        ".{name}.plugin-staging-{}-{}",
+        std::process::id(),
+        STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let result = async {
+        copy_dir_recursive(src, &staging).await?;
+        tokio::fs::write(staging.join(PLUGIN_SKILL_COPY_MARKER), src.to_string_lossy().as_bytes()).await?;
+        tokio::fs::rename(&staging, dst).await?;
+        Ok::<(), ExtensionError>(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+    }
+    result
 }
 
 /// Try to symlink `src` into `dst`; on failure, fall back to a recursive
@@ -3840,6 +3999,45 @@ mod tests {
             !workspace.join(".claude").join("skills").exists(),
             "plural skills dir should not be created when singular skill dir already exists"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_skill_sync_removes_disabled_link_and_preserves_user_directory() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let source = tmp.path().join("plugin-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(SKILL_MANIFEST_FILE), "---\nname: plugin-skill\n---\n").unwrap();
+        let active = vec![ResolvedAgentSkill {
+            name: "plugin-skill".to_owned(),
+            source_path: source,
+        }];
+
+        assert_eq!(
+            sync_workspace_plugin_skills(&workspace, &[".codex/skills"], &active)
+                .await
+                .unwrap(),
+            1
+        );
+        let target = workspace.join(".codex/skills/plugin-skill");
+        assert!(target.is_dir());
+        assert!(!std::fs::symlink_metadata(&target).unwrap().file_type().is_symlink());
+
+        sync_workspace_plugin_skills(&workspace, &[".codex/skills"], &[])
+            .await
+            .unwrap();
+        assert!(!target.exists());
+
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("user.txt"), "keep").unwrap();
+        sync_workspace_plugin_skills(&workspace, &[".codex/skills"], &active)
+            .await
+            .unwrap();
+        sync_workspace_plugin_skills(&workspace, &[".codex/skills"], &[])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("user.txt")).unwrap(), "keep");
     }
 
     #[tokio::test]

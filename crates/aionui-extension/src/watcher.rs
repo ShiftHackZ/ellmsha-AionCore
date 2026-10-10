@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,6 +25,7 @@ pub struct ExtensionWatcher {
     _watcher: RecommendedWatcher,
     /// Signal to request a graceful shutdown of the debounce task.
     shutdown: Arc<Notify>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl ExtensionWatcher {
@@ -41,16 +43,13 @@ impl ExtensionWatcher {
         }
 
         let shutdown = Arc::new(Notify::new());
+        let stopped = Arc::new(AtomicBool::new(false));
 
         // Channel for raw FS events → debounce task.
         let (tx, rx) = mpsc::channel::<()>(16);
 
-        // Spawn the debounce consumer.
-        let shutdown_clone = Arc::clone(&shutdown);
-        tokio::spawn(debounce_loop(rx, registry, shutdown_clone));
-
         // Create the notify watcher with a callback that feeds the channel.
-        let watcher = create_watcher(tx, &directories);
+        let watcher = create_watcher(tx.clone(), &directories);
         let watcher = match watcher {
             Ok(w) => w,
             Err(e) => {
@@ -59,11 +58,18 @@ impl ExtensionWatcher {
             }
         };
 
+        // Spawn background work only after watcher construction succeeds, so
+        // an initialization error cannot leave detached tasks behind.
+        let shutdown_clone = Arc::clone(&shutdown);
+        tokio::spawn(debounce_loop(rx, registry, shutdown_clone));
+        tokio::spawn(poll_for_changes(directories.clone(), tx, Arc::clone(&stopped)));
+
         info!(dirs = directories.len(), "extension watcher started");
 
         Some(Self {
             _watcher: watcher,
             shutdown,
+            stopped,
         })
     }
 
@@ -71,14 +77,73 @@ impl ExtensionWatcher {
     ///
     /// The background task will finish its current cycle (if any) and exit.
     pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
         self.shutdown.notify_one();
     }
 }
 
 impl Drop for ExtensionWatcher {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         self.shutdown.notify_one();
     }
+}
+
+async fn poll_for_changes(directories: Vec<PathBuf>, tx: mpsc::Sender<()>, stopped: Arc<AtomicBool>) {
+    let mut fingerprint = directory_fingerprint_async(&directories).await;
+    while !stopped.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if stopped.load(Ordering::Acquire) {
+            break;
+        }
+        let next = directory_fingerprint_async(&directories).await;
+        if next != fingerprint {
+            fingerprint = next;
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+async fn directory_fingerprint_async(directories: &[PathBuf]) -> u64 {
+    let directories = directories.to_vec();
+    tokio::task::spawn_blocking(move || directory_fingerprint(&directories))
+        .await
+        .unwrap_or_default()
+}
+
+fn directory_fingerprint(directories: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    fn visit(path: &std::path::Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
+        if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            matches!(name, ".git" | "node_modules" | "target")
+                || name.starts_with(".plugin-install-")
+                || name.starts_with(".plugin-backup-")
+        }) {
+            return;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        path.hash(hasher);
+        metadata.len().hash(hasher);
+        metadata.modified().ok().hash(hasher);
+        if metadata.is_dir()
+            && let Ok(entries) = std::fs::read_dir(path)
+        {
+            let mut entries: Vec<_> = entries.flatten().collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                visit(&entry.path(), hasher);
+            }
+        }
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for directory in directories {
+        visit(directory, &mut hasher);
+    }
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +201,7 @@ fn is_relevant_event(event: &Event) -> bool {
     use notify::EventKind;
     matches!(
         event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
     )
 }
 
@@ -215,5 +280,11 @@ mod tests {
     fn irrelevant_event_other() {
         let event = Event::new(notify::EventKind::Other);
         assert!(!is_relevant_event(&event));
+    }
+
+    #[test]
+    fn relevant_event_any() {
+        let event = Event::new(notify::EventKind::Any);
+        assert!(is_relevant_event(&event));
     }
 }

@@ -2665,6 +2665,7 @@ mod tests {
                 mcp_servers: vec![
                     McpServerSpec {
                         name: "fs".into(),
+                        auto_approve_in_unattended: false,
                         transport: McpTransport::Stdio {
                             command: "/usr/bin/node".into(),
                             args: vec!["server.js".into()],
@@ -2673,6 +2674,7 @@ mod tests {
                     },
                     McpServerSpec {
                         name: "remote".into(),
+                        auto_approve_in_unattended: false,
                         transport: McpTransport::Http {
                             url: "https://mcp.example/api".into(),
                             headers: vec![("Authorization".into(), "Bearer y".into())],

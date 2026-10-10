@@ -11,6 +11,7 @@
 pub mod canonical;
 pub mod chat_files;
 pub mod containment;
+mod managed_uploads;
 pub mod monitor;
 pub mod routes;
 pub mod runtime;
@@ -18,6 +19,7 @@ mod service;
 pub mod types;
 
 pub use chat_files::ResolvedChatMessage;
+pub use managed_uploads::ManagedUploadStore;
 pub use routes::{ProjectRouterState, project_routes};
 pub use service::ProjectService;
 pub use types::{

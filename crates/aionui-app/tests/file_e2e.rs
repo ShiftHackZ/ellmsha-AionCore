@@ -2,12 +2,16 @@
 
 mod common;
 
+use aionui_common::{constants::AIONUI_FILES_MARKER, now_ms};
+use aionui_db::models::MessageRow;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_data_dir, build_app_with_file_roots, json_with_token, setup_and_login,
+};
 
 // ===========================================================================
 // Auth guard
@@ -839,7 +843,8 @@ fn upload_request(content_type: &str, body: Vec<u8>, token: &str, csrf: &str) ->
 
 #[tokio::test]
 async fn upload_accepts_small_png_and_returns_readable_path() {
-    let (mut app, services) = build_app().await;
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     // Minimal valid 1x1 PNG (67 bytes).
@@ -866,20 +871,16 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
     let p = std::path::Path::new(path);
     assert!(p.is_absolute(), "returned path must be absolute: {path}");
     assert_eq!(p.file_name().unwrap().to_string_lossy(), "paste.png");
-    // conversation_id routing produced a sub-directory of that name.
-    assert_eq!(p.parent().unwrap().file_name().unwrap().to_string_lossy(), conv_id);
+    assert!(p.starts_with(std::fs::canonicalize(profile.path().join("uploads")).unwrap()));
     // File contents must match what we uploaded.
     let on_disk = std::fs::read(p).expect("uploaded file should be readable");
     assert_eq!(on_disk, png_bytes);
-
-    // Cleanup.
-    let _ = std::fs::remove_file(p);
-    let _ = std::fs::remove_dir(p.parent().unwrap());
 }
 
 #[tokio::test]
 async fn upload_uses_content_disposition_filename_when_file_name_missing() {
-    let (mut app, services) = build_app().await;
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let bytes = b"hello upload".to_vec();
@@ -900,7 +901,8 @@ async fn upload_uses_content_disposition_filename_when_file_name_missing() {
 
 #[tokio::test]
 async fn upload_prefers_explicit_file_name_field_over_dispo() {
-    let (mut app, services) = build_app().await;
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
     let bytes = b"pref".to_vec();
@@ -918,6 +920,220 @@ async fn upload_prefers_explicit_file_name_field_over_dispo() {
     let path = json["data"].as_str().unwrap();
     assert!(path.ends_with(&explicit), "expected filename {explicit}, got {path}");
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn managed_upload_is_profile_owned_and_cross_user_reads_are_denied() {
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "private.txt", "text/plain", b"private")
+        .add_text("conversation_id", "conv-owned")
+        .build();
+    let response = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &admin_token, &admin_csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let path = body_json(response).await["data"].as_str().unwrap().to_owned();
+    assert!(std::path::Path::new(&path).starts_with(std::fs::canonicalize(profile.path().join("uploads")).unwrap()));
+
+    let denied = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({"file": {"kind": "upload", "path": path}, "encoding": "utf8"}),
+        &other_token,
+        &other_csrf,
+    );
+    let response = app.clone().oneshot(denied).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(response).await["code"], "upload_path_outside_root");
+
+    let allowed = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({"file": {"kind": "upload", "path": path}, "encoding": "utf8"}),
+        &admin_token,
+        &admin_csrf,
+    );
+    assert_eq!(body_json(app.oneshot(allowed).await.unwrap()).await["data"], "private");
+}
+
+#[tokio::test]
+async fn startup_adopts_unopened_legacy_upload_before_temp_removal() {
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "name": "Legacy upload", "extra": {}}),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let conversation_id = body_json(response).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let legacy_dir = std::env::temp_dir().join("aionui").join(&conversation_id);
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_path = legacy_dir.join("legacy.txt");
+    std::fs::write(&legacy_path, b"legacy body").unwrap();
+    let missing_path = legacy_dir.join("already-missing.txt");
+    let content = format!(
+        "attachment\n\n{AIONUI_FILES_MARKER}\n{}\n{}",
+        legacy_path.display(),
+        missing_path.display()
+    );
+    let message = MessageRow {
+        id: "legacy-upload-message".to_owned(),
+        conversation_id: conversation_id.clone(),
+        msg_id: Some("legacy-upload-message".to_owned()),
+        r#type: "text".to_owned(),
+        content: json!({"content": content}).to_string(),
+        position: Some("right".to_owned()),
+        status: Some("finish".to_owned()),
+        hidden: false,
+        created_at: now_ms(),
+        backend_turn_id: None,
+    };
+    services
+        .conversation_repo
+        .insert_message("system_default_user", &message)
+        .await
+        .unwrap();
+
+    services.conversation_service.migrate_legacy_uploads_on_startup().await;
+    std::fs::remove_dir_all(&legacy_dir).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conversation_id}/messages"),
+            &token,
+            &csrf,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let migrated_content = body_json(response).await["data"]["items"][0]["content"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut attachment_lines = migrated_content
+        .rsplit_once(AIONUI_FILES_MARKER)
+        .unwrap()
+        .1
+        .trim()
+        .lines();
+    let durable_path = attachment_lines.next().unwrap().to_owned();
+    let canonical_upload_root = std::fs::canonicalize(profile.path().join("uploads")).unwrap();
+    assert!(std::path::Path::new(&durable_path).starts_with(&canonical_upload_root));
+    assert_eq!(attachment_lines.next(), Some(missing_path.to_str().unwrap()));
+    assert_eq!(std::fs::read(&durable_path).unwrap(), b"legacy body");
+
+    let read = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({"file": {"kind": "upload", "path": durable_path}, "encoding": "utf8"}),
+        &token,
+        &csrf,
+    );
+    assert_eq!(
+        body_json(app.clone().oneshot(read).await.unwrap()).await["data"],
+        "legacy body"
+    );
+
+    let persisted = services
+        .conversation_repo
+        .get_message("system_default_user", &conversation_id, "legacy-upload-message")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.content.contains(canonical_upload_root.to_str().unwrap()));
+    assert!(persisted.content.contains(missing_path.to_str().unwrap()));
+}
+
+#[tokio::test]
+async fn legacy_general_requires_persisted_profile_history_before_adoption() {
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(profile.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let create = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({"type": "acp", "name": "Legacy general upload", "extra": {}}),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(create).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let conversation_id = body_json(response).await["data"]["id"].as_str().unwrap().to_owned();
+
+    let legacy_dir = std::env::temp_dir().join("aionui/general");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_path = legacy_dir.join(format!("profile-evidence-{}.txt", aionui_common::generate_short_id()));
+    std::fs::write(&legacy_path, b"owned by persisted history").unwrap();
+
+    let denied = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({"file": {"kind": "upload", "path": legacy_path}, "encoding": "utf8"}),
+        &token,
+        &csrf,
+    );
+    let response = app.clone().oneshot(denied).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "legacy_upload_owner_unknown");
+
+    let content = format!("attachment\n\n{AIONUI_FILES_MARKER}\n{}", legacy_path.display());
+    let message = MessageRow {
+        id: "legacy-general-message".to_owned(),
+        conversation_id: conversation_id.clone(),
+        msg_id: Some("legacy-general-message".to_owned()),
+        r#type: "text".to_owned(),
+        content: json!({"content": content}).to_string(),
+        position: Some("right".to_owned()),
+        status: Some("finish".to_owned()),
+        hidden: false,
+        created_at: now_ms(),
+        backend_turn_id: None,
+    };
+    services
+        .conversation_repo
+        .insert_message("system_default_user", &message)
+        .await
+        .unwrap();
+
+    services.conversation_service.migrate_legacy_uploads_on_startup().await;
+    std::fs::remove_file(&legacy_path).unwrap();
+
+    let persisted = services
+        .conversation_repo
+        .get_message("system_default_user", &conversation_id, "legacy-general-message")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!persisted.content.contains(legacy_path.to_str().unwrap()));
+    let value: serde_json::Value = serde_json::from_str(&persisted.content).unwrap();
+    let durable_path = value["content"]
+        .as_str()
+        .unwrap()
+        .rsplit_once(AIONUI_FILES_MARKER)
+        .unwrap()
+        .1
+        .trim();
+    assert!(
+        std::path::Path::new(durable_path).starts_with(std::fs::canonicalize(profile.path().join("uploads")).unwrap())
+    );
+    assert_eq!(std::fs::read(durable_path).unwrap(), b"owned by persisted history");
 }
 
 #[tokio::test]

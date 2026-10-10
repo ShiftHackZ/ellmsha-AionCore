@@ -35,10 +35,10 @@ use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    MessagePageDirection, MessagePageParams, MessageRowUpdate, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
-use aionui_extension::AssistantRuleDispatcher;
+use aionui_extension::{AssistantRuleDispatcher, ExtensionRegistry, PluginRuntimeSnapshot};
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_project::{ProjectService, ResolvedChatMessage, canonical};
 use aionui_realtime::EventBroadcaster;
@@ -324,6 +324,7 @@ pub struct ConversationService {
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
+    plugin_registry: Arc<RwLock<Option<ExtensionRegistry>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -406,6 +407,7 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
+            plugin_registry: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -452,6 +454,12 @@ impl ConversationService {
     pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
+        }
+    }
+
+    pub fn with_plugin_registry(&self, registry: ExtensionRegistry) {
+        if let Ok(mut guard) = self.plugin_registry.write() {
+            *guard = Some(registry);
         }
     }
 
@@ -526,13 +534,91 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: "project service unavailable; cannot resolve file attachments".to_owned(),
             })?;
-        let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(user_id, content, files, &upload_root)
+            .resolve_chat_message(user_id, content, files)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
             })
+    }
+
+    async fn migrate_legacy_message_uploads(
+        &self,
+        user_id: &str,
+        row: &mut MessageRow,
+    ) -> Result<(), ConversationError> {
+        let Some(project) = self.project_service.read().ok().and_then(|guard| guard.clone()) else {
+            return Ok(());
+        };
+        let mut payload: serde_json::Value = serde_json::from_str(&row.content)
+            .map_err(|error| ConversationError::internal(format!("Invalid message content JSON: {error}")))?;
+        let Some(content) = payload.get("content").and_then(serde_json::Value::as_str) else {
+            return Ok(());
+        };
+        let Some(migrated) = project
+            .migrate_legacy_upload_paths(user_id, &row.conversation_id, content)
+            .await
+            .map_err(|error| ConversationError::internal(format!("legacy upload migration failed: {error}")))?
+        else {
+            return Ok(());
+        };
+        payload["content"] = serde_json::Value::String(migrated);
+        let updated = serde_json::to_string(&payload)
+            .map_err(|error| ConversationError::internal(format!("message content serialization failed: {error}")))?;
+        self.conversation_repo
+            .update_message(
+                user_id,
+                &row.conversation_id,
+                &row.id,
+                &MessageRowUpdate {
+                    content: Some(updated.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        row.content = updated;
+        Ok(())
+    }
+
+    /// Protect every still-existing legacy upload referenced by this profile
+    /// before the server becomes ready. This includes conversations the user
+    /// has not opened since upgrading; each adoption is authorized by the
+    /// persisted message's user/conversation ownership and is idempotent.
+    pub async fn migrate_legacy_uploads_on_startup(&self) {
+        let rows = match self.conversation_repo.list_legacy_upload_messages().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(
+                    error = %ErrorChain(&error),
+                    "startup legacy upload migration query failed"
+                );
+                return;
+            }
+        };
+
+        let mut migrated = 0usize;
+        for candidate in rows {
+            let mut message = candidate.message;
+            let original = message.content.clone();
+            if let Err(error) = self
+                .migrate_legacy_message_uploads(&candidate.user_id, &mut message)
+                .await
+            {
+                warn!(
+                    user_id = %candidate.user_id,
+                    conversation_id = %message.conversation_id,
+                    message_id = %message.id,
+                    error = %ErrorChain(&error),
+                    "startup legacy upload migration skipped a message"
+                );
+                continue;
+            }
+            migrated += usize::from(message.content != original);
+        }
+
+        if migrated > 0 {
+            info!(migrated, "startup legacy upload migration completed");
+        }
     }
 
     pub fn with_assistant_definition_repo(&self, repo: Arc<dyn IAssistantDefinitionRepository>) {
@@ -2094,6 +2180,10 @@ impl ConversationService {
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
                     self.attach_assistant_identity(user_id, &mut resp).await?;
+                    // Sidebar consumers need the live runtime rather than the
+                    // persisted row status, which can legitimately still say
+                    // `running` after a process restart.
+                    resp.runtime = Some(self.runtime_summary_for(&row_id).await);
                     items.push(resp);
                 }
                 Err(err) => warn!(
@@ -2929,7 +3019,8 @@ impl ConversationService {
             .map(|row| encode_message_cursor(&MessagePageCursor::from(row)))
             .transpose()?;
         let mut items = Vec::with_capacity(page.items.len());
-        for row in page.items {
+        for mut row in page.items {
+            self.migrate_legacy_message_uploads(user_id, &mut row).await?;
             let original_content_bytes = row.content.len();
             total_original_content_bytes += original_content_bytes;
             let response = if compact_content {
@@ -2988,13 +3079,15 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        let row = self
+        let mut row = self
             .conversation_repo
             .get_message(user_id, conversation_id, message_id)
             .await?
             .ok_or_else(|| ConversationError::MessageNotFound {
                 id: message_id.to_owned(),
             })?;
+
+        self.migrate_legacy_message_uploads(user_id, &mut row).await?;
 
         let content_bytes = row.content.len();
         let response = row_to_message_response(row)?;
@@ -3104,10 +3197,22 @@ impl ConversationService {
 
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(20);
+        if query.before_created_at.is_some() != query.before_message_id.is_some() {
+            return Err(ConversationError::BadRequest {
+                reason: "before_created_at and before_message_id must be provided together".into(),
+            });
+        }
 
         let result = self
             .conversation_repo
-            .search_messages(user_id, &query.keyword, page, page_size)
+            .search_messages(
+                user_id,
+                &query.keyword,
+                page,
+                page_size,
+                query.before_created_at,
+                query.before_message_id.as_deref(),
+            )
             .await?;
 
         let items = result
@@ -3353,7 +3458,9 @@ impl ConversationService {
             }
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+            .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
         let user_msg_id_ret = user_msg_id.clone();
@@ -3475,7 +3582,9 @@ impl ConversationService {
         };
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+            .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
         let result = ConversationTurnOrchestrator::new(self.clone(), self.task_manager.clone())
@@ -3805,7 +3914,9 @@ impl ConversationService {
 
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
-        self.ensure_workspace_skill_links(&row, &build_opts).await;
+        let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.ensure_workspace_skill_links(&row, &build_opts, plugin_snapshot.as_ref())
+            .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
         let agent = match task_manager.get_or_build_task(conversation_id, build_opts).await {
@@ -4034,7 +4145,12 @@ impl ConversationService {
     /// Ensure native skill links exist in the runtime workspace. Auto
     /// workspaces are constrained to AionUi's generated path; custom
     /// workspaces were validated when the session context was built.
-    pub(crate) async fn ensure_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
+    pub(crate) async fn ensure_workspace_skill_links(
+        &self,
+        row: &ConversationRow,
+        build_opts: &BuildTaskOptions,
+        plugin_snapshot: Option<&PluginRuntimeSnapshot>,
+    ) {
         let context = &build_opts.context;
         let backend = context_backend_value(context);
 
@@ -4054,9 +4170,6 @@ impl ConversationService {
         }
 
         let skill_names = context_skill_names(context);
-        if skill_names.is_empty() {
-            return;
-        }
 
         let Some(rel_dirs) = native_skills_dirs(
             &self.agent_metadata_repo,
@@ -4069,6 +4182,23 @@ impl ConversationService {
             return;
         };
         if rel_dirs.is_empty() {
+            return;
+        }
+
+        if let Some(snapshot) = plugin_snapshot {
+            let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
+            if let Err(error) =
+                aionui_extension::sync_workspace_plugin_skills(&workspace, &rel_dirs_refs, &snapshot.skills).await
+            {
+                warn!(
+                    conversation_id = %row.id,
+                    error = %error,
+                    "failed to synchronize workspace plugin skills"
+                );
+            }
+        }
+
+        if skill_names.is_empty() {
             return;
         }
 
@@ -4091,6 +4221,47 @@ impl ConversationService {
             links = n,
             "ensured skill symlinks in auto workspace"
         );
+    }
+
+    async fn apply_plugin_runtime(
+        &self,
+        row: &ConversationRow,
+        build_opts: &mut BuildTaskOptions,
+    ) -> Option<PluginRuntimeSnapshot> {
+        let registry = self.plugin_registry.read().ok().and_then(|guard| guard.clone());
+        let Some(registry) = registry else {
+            return None;
+        };
+        let snapshot = registry.runtime_snapshot(&row.user_id, row.project_id.as_deref()).await;
+
+        for skill in &snapshot.skills {
+            if !build_opts.context.skills.iter().any(|name| name == &skill.name) {
+                build_opts.context.skills.push(skill.name.clone());
+            }
+        }
+
+        let append = |skills: &mut Vec<String>, mcp_servers: &mut Vec<SessionMcpServer>| {
+            for skill in &snapshot.skills {
+                if !skills.iter().any(|name| name == &skill.name) {
+                    skills.push(skill.name.clone());
+                }
+            }
+            replace_plugin_mcp_servers(mcp_servers, &snapshot.mcp_servers);
+        };
+        match &mut build_opts.context.kind {
+            AgentSessionKind::Acp(context) => {
+                append(&mut context.config.skills, &mut context.config.session_mcp_servers)
+            }
+            AgentSessionKind::Antigravity(context) => {
+                append(&mut context.config.skills, &mut context.config.session_mcp_servers)
+            }
+            AgentSessionKind::Aionrs(context) => {
+                append(&mut context.config.skills, &mut context.config.session_mcp_servers)
+            }
+        }
+        build_opts.runtime_capabilities.plugin_generation = Some(snapshot.generation);
+        build_opts.runtime_capabilities.linear_connection_revision = Some(snapshot.linear_revision);
+        Some(snapshot)
     }
 
     /// Write the resolved workspace back to `conversation.extra.workspace` when
@@ -4969,6 +5140,14 @@ pub(crate) async fn apply_agent_title(
     Ok(true)
 }
 
+/// `plugin:` is a registry-owned namespace. Replace its prior build snapshot so
+/// disabling or rebinding a plugin cannot leave an old MCP server (or trust bit)
+/// in a resumed conversation context.
+fn replace_plugin_mcp_servers(target: &mut Vec<SessionMcpServer>, active: &[SessionMcpServer]) {
+    target.retain(|server| !server.id.starts_with("plugin:"));
+    target.extend(active.iter().cloned());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5141,6 +5320,7 @@ mod tests {
                     url: "https://example.com/mcp".into(),
                     headers: HashMap::new(),
                 },
+                auto_approve_in_unattended: false,
             },
             McpSupportPolicy {
                 stdio: true,
@@ -5164,10 +5344,38 @@ mod tests {
                     args: Vec::new(),
                     env: HashMap::new(),
                 },
+                auto_approve_in_unattended: false,
             },
             McpSupportPolicy::AIONRS,
         );
 
         assert_eq!(status.status, ConversationMcpStatusKind::Failed);
+    }
+
+    #[test]
+    fn plugin_mcp_snapshot_replaces_stale_runtime_and_disable_removes_it() {
+        let server = |id: &str, trusted| SessionMcpServer {
+            id: id.into(),
+            name: id.into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "node".into(),
+                args: Vec::new(),
+                env: HashMap::new(),
+            },
+            auto_approve_in_unattended: trusted,
+        };
+        let mut target = vec![server("user-mcp", false), server("plugin:fixture:old", true)];
+        let active = vec![server("plugin:fixture:new", true)];
+
+        replace_plugin_mcp_servers(&mut target, &active);
+        assert_eq!(target.len(), 2);
+        assert_eq!(target[0].id, "user-mcp");
+        assert_eq!(target[1].id, "plugin:fixture:new");
+        assert!(target[1].auto_approve_in_unattended);
+
+        replace_plugin_mcp_servers(&mut target, &[]);
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].id, "user-mcp");
+        assert!(!target[0].auto_approve_in_unattended);
     }
 }

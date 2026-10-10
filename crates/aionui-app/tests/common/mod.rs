@@ -20,6 +20,18 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+pub async fn build_app_with_data_dir(root: &std::path::Path) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    let router = create_router(&services).await.expect("build router");
+    (router, services)
+}
+
 /// Build an app whose skill router uses the given temp directories.
 ///
 /// Use for HTTP integration tests that need deterministic on-disk layouts

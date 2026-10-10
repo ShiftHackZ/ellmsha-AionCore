@@ -192,6 +192,10 @@ impl From<ProjectError> for ApiError {
                 "upload_path_outside_root",
                 Some(json!({ "path": path })),
             ),
+            ProjectError::LegacyUploadOwnerUnknown => (StatusCode::FORBIDDEN, "legacy_upload_owner_unknown", None),
+            ProjectError::InvalidUploadIdentity | ProjectError::InvalidUploadName { .. } => {
+                (StatusCode::BAD_REQUEST, err.code(), None)
+            }
             ProjectError::ChatFileMissing { path } => (
                 StatusCode::NOT_FOUND,
                 "chat_file_missing",
@@ -202,11 +206,15 @@ impl From<ProjectError> for ApiError {
                 "local_path_not_readable",
                 Some(json!({ "path": path })),
             ),
-            ProjectError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None),
+            ProjectError::UploadStorageUnavailable
+            | ProjectError::UploadStorageIo { .. }
+            | ProjectError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", None),
         };
         // Never leak internal DB detail to clients (Security: no internal leakage).
         let message = match &err {
-            ProjectError::Database(_) => "internal error".to_owned(),
+            ProjectError::UploadStorageUnavailable
+            | ProjectError::UploadStorageIo { .. }
+            | ProjectError::Database(_) => "internal error".to_owned(),
             other => other.to_string(),
         };
         ApiError::coded(status, code, message, details)

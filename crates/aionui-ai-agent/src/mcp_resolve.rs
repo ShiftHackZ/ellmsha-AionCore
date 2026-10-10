@@ -160,6 +160,7 @@ async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpServe
         id: row.id.clone(),
         name: row.name.clone(),
         transport,
+        auto_approve_in_unattended: false,
     })
 }
 

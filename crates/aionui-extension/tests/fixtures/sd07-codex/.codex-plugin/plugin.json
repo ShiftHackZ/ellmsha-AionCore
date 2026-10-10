@@ -1,0 +1,14 @@
+{
+  "name": "sd07-codex-fixture",
+  "version": "1.2.3",
+  "description": "Codex compatibility fixture based on the installed Ponytail package layout.",
+  "author": {
+    "name": "eLLMsha Test"
+  },
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "SD07 Codex Fixture",
+    "shortDescription": "Codex fixture with skills and MCP"
+  }
+}

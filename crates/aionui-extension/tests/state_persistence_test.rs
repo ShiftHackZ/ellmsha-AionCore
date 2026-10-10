@@ -114,9 +114,8 @@ async fn user_enablement_is_persisted_and_isolated() {
 
     let store = ExtensionStateStore::new(path.clone());
     store.load().await.unwrap();
-    store.set_user_enabled("user-a", "ext-a", false).await;
-    store.set_user_enabled("user-b", "ext-a", true).await;
-    store.flush().await.unwrap();
+    store.set_user_enabled("user-a", "ext-a", false).await.unwrap();
+    store.set_user_enabled("user-b", "ext-a", true).await.unwrap();
 
     let restored = ExtensionStateStore::new(path);
     restored.load().await.unwrap();

@@ -141,6 +141,7 @@ fn validate_manifest_directly() {
         contributes: None,
         lifecycle: None,
         i18n: None,
+        compatibility: None,
     };
     assert!(validate_manifest(&manifest).is_ok());
 }

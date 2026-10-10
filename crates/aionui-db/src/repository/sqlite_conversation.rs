@@ -8,8 +8,9 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, LegacyUploadMessageRow, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -412,17 +413,67 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        // Child histories are ordinary conversation rows so their messages use
+        // the existing FK cascade. Remove children first to avoid invisible
+        // orphan rows after their parent task is deleted.
+        sqlx::query(
+            "DELETE FROM conversations WHERE user_id = ? \
+             AND json_extract(extra, '$.subagent.parent_conversation_id') = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
+        tx.commit().await?;
+
         Ok(())
+    }
+
+    async fn reconcile_empty_subagent_tool_placeholders(
+        &self,
+        user_id: &str,
+        parent_conversation_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        // SD-09 briefly persisted terminal `collabAgentToolCall` ids as child
+        // conversations. A genuine Codex child id is `agentThreadId` (UUID), while
+        // these rows carry the parent call id in both the deterministic row id and
+        // `extra.subagent.ref`. Reconcile only that exact, empty legacy shape.
+        let ids = sqlx::query_scalar::<_, String>(
+            "SELECT c.id FROM conversations c \
+             WHERE c.user_id = ? \
+               AND c.status = 'finished' \
+               AND c.name = json_extract(c.extra, '$.subagent.ref') \
+               AND json_extract(c.extra, '$.subagent.parent_conversation_id') = ? \
+               AND json_extract(c.extra, '$.subagent.ref') GLOB 'call_*' \
+               AND c.id = 'subagent:' || ? || ':' || json_extract(c.extra, '$.subagent.ref') \
+               AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)",
+        )
+        .bind(user_id)
+        .bind(parent_conversation_id)
+        .bind(parent_conversation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for id in &ids {
+            sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(ids)
     }
 
     async fn list_paginated(
@@ -1129,16 +1180,56 @@ impl IConversationRepository for SqliteConversationRepository {
             .collect::<Result<Vec<_>, sqlx::Error>>()?)
     }
 
+    async fn list_legacy_upload_messages(&self) -> Result<Vec<LegacyUploadMessageRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT c.user_id, m.* FROM messages m \
+             INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE m.content LIKE '%[[AION_FILES]]%' \
+               AND m.content LIKE '%aionui%' \
+             ORDER BY m.created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                Ok(LegacyUploadMessageRow {
+                    user_id: row.try_get("user_id")?,
+                    message: MessageRow {
+                        id: row.try_get("id")?,
+                        conversation_id: row.try_get("conversation_id")?,
+                        msg_id: row.try_get("msg_id")?,
+                        r#type: row.try_get("type")?,
+                        content: row.try_get("content")?,
+                        position: row.try_get("position")?,
+                        status: row.try_get("status")?,
+                        hidden: row.try_get("hidden")?,
+                        created_at: row.try_get("created_at")?,
+                        backend_turn_id: row.try_get("backend_turn_id")?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?)
+    }
+
     async fn search_messages(
         &self,
         user_id: &str,
         keyword: &str,
         page: u32,
         page_size: u32,
+        before_created_at: Option<TimestampMs>,
+        before_message_id: Option<&str>,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
         let effective_page = if page == 0 { 1 } else { page };
         let effective_size = if page_size == 0 { 20 } else { page_size };
-        let offset = (effective_page - 1) * effective_size;
+        let has_cursor = before_created_at.is_some() && before_message_id.is_some();
+        let offset = if has_cursor {
+            0
+        } else {
+            (effective_page - 1) * effective_size
+        };
         let fetch_limit = effective_size + 1;
 
         let like_pattern = format!("%{keyword}%");
@@ -1175,11 +1266,17 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM messages m \
              INNER JOIN conversations c ON m.conversation_id = c.id \
              WHERE c.user_id = ? AND m.content LIKE ? \
-             ORDER BY m.created_at DESC \
+               AND (? IS NULL OR m.created_at < ? \
+                    OR (m.created_at = ? AND m.id < ?)) \
+             ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ? OFFSET ?",
         )
         .bind(user_id)
         .bind(&like_pattern)
+        .bind(before_created_at)
+        .bind(before_created_at)
+        .bind(before_created_at)
+        .bind(before_message_id)
         .bind(fetch_limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -2273,7 +2370,10 @@ mod tests {
         msg2.content = r#"{"content":"Python 测试"}"#.to_string();
         repo.insert_message(&conv.user_id, &msg2).await.unwrap();
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "审查", 1, 20).await.unwrap();
+        let result = repo
+            .search_messages(SYSTEM_USER_ID, "审查", 1, 20, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.total, 1);
         assert_eq!(result.items[0].conversation_name, "Test Conversation");
@@ -2289,7 +2389,7 @@ mod tests {
         repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
         let result = repo
-            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", 1, 20)
+            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", 1, 20, None, None)
             .await
             .unwrap();
         assert!(result.items.is_empty());
@@ -2310,10 +2410,61 @@ mod tests {
             repo.insert_message(&conv.user_id, &msg).await.unwrap();
         }
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "keyword", 1, 2).await.unwrap();
+        let result = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", 1, 2, None, None)
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.total, 5);
         assert!(result.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_messages_keyset_cursor_is_stable_when_newer_rows_arrive() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        for id in ["msg-1", "msg-2", "msg-3"] {
+            let mut msg = sample_message(&conv.id);
+            msg.id = id.to_string();
+            msg.content = r#"{"content":"stable keyword"}"#.to_string();
+            msg.created_at = 1_000;
+            repo.insert_message(&conv.user_id, &msg).await.unwrap();
+        }
+
+        let first = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", 1, 2, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg-3", "msg-2"]
+        );
+
+        let mut newer = sample_message(&conv.id);
+        newer.id = "msg-4".to_string();
+        newer.content = r#"{"content":"stable keyword"}"#.to_string();
+        newer.created_at = 1_000;
+        repo.insert_message(&conv.user_id, &newer).await.unwrap();
+
+        let second = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", 1, 2, Some(1_000), Some("msg-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| item.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg-1"]
+        );
+        assert!(!second.has_more);
     }
 
     // ── Filters tests ───────────────────────────────────────────────

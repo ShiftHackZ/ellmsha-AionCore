@@ -121,6 +121,10 @@ fn data() -> Value {
                 "description": "Internal team MCP stdio server."
             },
             {
+                "name": "mcp-clockify-stdio",
+                "description": "Internal per-account Clockify MCP stdio server."
+            },
+            {
                 "name": "prepare-managed-resources",
                 "description": "Packaging helper for managed runtime resources."
             }

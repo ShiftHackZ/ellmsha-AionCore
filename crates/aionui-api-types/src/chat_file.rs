@@ -20,8 +20,8 @@ pub enum ChatFileRef {
     /// via `resolve_reference` with lexical + realpath containment.
     Project { pe_id: String, relative_path: String },
     /// An uploaded file, carried as the absolute path returned by
-    /// `POST /api/fs/upload`. The backend requires it to live under the managed
-    /// upload directory before use.
+    /// `POST /api/fs/upload`. The backend requires it to live under the current
+    /// profile and user's managed upload directory before use.
     Upload { path: String },
     /// A file on the backend machine's filesystem, chosen by the user in the
     /// host-file browser (`/api/fs/browse`, which already exposes the whole

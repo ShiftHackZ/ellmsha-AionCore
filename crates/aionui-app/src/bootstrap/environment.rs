@@ -49,6 +49,11 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     let bootstrap_secret = std::env::var("AIONCORE_BOOTSTRAP_SECRET")
         .ok()
         .filter(|secret| !secret.is_empty());
+    // The capability is retained in AppConfig. Remove the environment copy
+    // before any agent subprocess can inherit it.
+    unsafe {
+        std::env::remove_var("AIONCORE_BOOTSTRAP_SECRET");
+    }
     validate_identity_environment(identity_mode, bootstrap_secret.as_deref())?;
 
     let config = AppConfig {

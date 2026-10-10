@@ -23,6 +23,8 @@
 //! independently contract-tested via the `build_with_io` seam.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -98,7 +100,7 @@ impl BackendConnection for CodexConnection {
         // (default) → never suspends → identical to pre-F-4.
         let wake = CodexWakeRecipe {
             spawner: Some(self.spawner.clone()),
-            config: config.clone(),
+            config: std::sync::RwLock::new(config.clone()),
         };
         let mut backend = CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms).await;
         // Seed the current model (M1): the backend tracks it from the start so the
@@ -402,6 +404,57 @@ impl HandshakeParams {
 /// echoes the request_id back verbatim, so the prefix survives the round-trip.
 const ELICIT_PREFIX: &str = "elicit:";
 
+#[derive(Debug, Clone)]
+struct PendingToolApproval {
+    tool_name: String,
+    input: Option<Value>,
+    answered: bool,
+}
+
+fn is_mcp_tool_approval(input: Option<&Value>) -> bool {
+    input
+        .and_then(|input| input.get("_meta"))
+        .and_then(|meta| meta.get("codex_approval_kind"))
+        .and_then(Value::as_str)
+        == Some("mcp_tool_call")
+}
+
+fn mcp_tool_approval_persistence(input: Option<&Value>, requested_scope: Option<&str>) -> Option<&'static str> {
+    let persist = input?.get("_meta")?.get("persist")?;
+    let supports = |scope: &str| {
+        persist.as_str() == Some(scope)
+            || persist
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(scope)))
+    };
+    match requested_scope {
+        Some("always") if supports("always") => Some("always"),
+        Some("session") if supports("session") => Some("session"),
+        Some(_) => None,
+        None if supports("always") => Some("always"),
+        None if supports("session") => Some("session"),
+        None => None,
+    }
+}
+
+fn mcp_elicitation_title(params: &Value) -> String {
+    let meta = params.get("_meta");
+    let is_tool_approval = meta
+        .and_then(|meta| meta.get("codex_approval_kind"))
+        .and_then(Value::as_str)
+        == Some("mcp_tool_call");
+    meta.and_then(|meta| meta.get("tool_title"))
+        .or_else(|| meta.and_then(|meta| meta.get("tool_name")))
+        .and_then(Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(if is_tool_approval {
+            "MCP tool approval"
+        } else {
+            "Elicitation"
+        })
+        .to_owned()
+}
+
 /// `initialize` params (REAL codex 0.137.0). ⚠️ `capabilities.experimentalApi:true`
 /// is REQUIRED, not optional: the experimental methods we advertise + use
 /// (thread/settings/update for SetMode/SetModel, thread/turns/list for
@@ -439,10 +492,10 @@ fn initialize_params() -> HandshakeParams {
 /// from its CONFIG (NOT a per-thread param), so they go into `config.mcp_servers`
 /// — a map keyed by name (verified live, 0.139.0: thread/start accepts it AND
 /// launches the servers). The preset/system prompt goes into `baseInstructions`.
-/// Both are omitted when empty so the pre-0c handshake is byte-identical.
+/// MCP servers and the preset are omitted when empty.
 fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
-    // G1-A: data-drive the sandbox from SessionConfig (None ⇒ workspace-write,
-    // byte-identical to the pre-G1-A handshake). A yolo agent resolves to
+    // Data-drive the filesystem sandbox from SessionConfig (None ⇒ workspace-write).
+    // A yolo agent resolves to
     // "danger-full-access" at the orchestration boundary (app registry), restoring
     // the legacy codex_sandbox mapping without writing ~/.codex/config.toml.
     let sandbox = config.sandbox_mode.as_deref().unwrap_or("workspace-write");
@@ -450,28 +503,84 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // (byte-identical to the pre-data-driven handshake); a yolo / full-access agent
     // resolves to "never" at the orchestration boundary (app registry).
     let approval = config.approval_policy.as_deref().unwrap_or("on-request");
-    let mut params = json!({
-        "approvalPolicy": approval,
-        "sandbox": sandbox,
-    });
+    let custom_profile = config
+        .mode
+        .as_deref()
+        .map(codex_perm::normalize_to_profile_id)
+        .filter(|profile| !codex_perm::is_builtin_profile_id(profile));
+    let mut params = if let Some(profile) = &custom_profile {
+        // A custom Codex profile owns both its sandbox and approval policy. The
+        // protocol forbids combining `permissions` with `sandbox`, so do not
+        // layer eLLMsha's built-in defaults over a user-defined profile.
+        json!({ "permissions": profile })
+    } else {
+        json!({
+            "approvalPolicy": approval,
+            "sandbox": sandbox,
+        })
+    };
     if let Some(cwd) = &config.cwd {
         params["cwd"] = json!(cwd);
     }
     // NB: `config.model` is intentionally NOT written here — see the doc comment
     // above. It is applied post-discovery by `reconcile_codex_model` (validated).
     if !config.init.mcp_servers.is_empty() {
-        let mut servers = build_codex_mcp_servers(&config.init.mcp_servers);
-        // eLLMsha's built-in durable memory is part of the authorized application
-        // workflow. Codex's MCP policy is separate from sandbox approvals: leaving
-        // it unset prompts even for scenario_list in the UI's Auto mode. Verified
-        // against codex 0.144 config.schema.json RawMcpServerConfig/AppToolApproval.
-        // Do not answer arbitrary MCP elicitations or grant other servers policy.
-        if sandbox != "read-only"
-            && let Some(memory) = servers.get_mut("ellmsha-tencentdb-memory")
-        {
-            memory["default_tools_approval_mode"] = json!("approve");
+        let auto_approval = approval == "never" && sandbox != "read-only";
+        let mut servers = build_codex_mcp_servers_with_approval(&config.init.mcp_servers, auto_approval);
+        // Codex MCP approval is independent from sandbox approval. Grant it only
+        // to application-trusted capabilities in the built-in unattended modes:
+        // native memory, server-authored plugin contributions, and the bounded
+        // lifecycle/read-selection surface on the app-owned browser launcher.
+        // Browser action and file-output tools, user-configured MCP servers, and
+        // custom/manual profiles retain Codex's normal approval boundary.
+        if auto_approval {
+            let mut trust_by_name = std::collections::HashMap::new();
+            for server in &config.init.mcp_servers {
+                trust_by_name.insert(
+                    server.name.as_str(),
+                    server.name == "ellmsha-tencentdb-memory" || server.auto_approve_in_unattended,
+                );
+            }
+            for (name, trusted) in trust_by_name {
+                if trusted && let Some(server) = servers.get_mut(name) {
+                    server["default_tools_approval_mode"] = json!("approve");
+                }
+            }
+        }
+        // Codex treats its global `never` policy as a hard rejection for every
+        // MCP tool that still needs approval, so the per-server default cannot
+        // surface a prompt on its own. Keep Auto's command/file/sandbox behavior
+        // unattended while reopening only MCP elicitations. This is the app-server
+        // `GranularApprovalConfig` contract (0.162+): all other approval classes
+        // remain disabled. Servers that are fully application-trusted keep the
+        // original `never` policy and therefore preserve their no-prompt behavior.
+        if auto_approval && custom_profile.is_none() && codex_mcp_servers_need_user_approval(&servers) {
+            params["approvalPolicy"] = mcp_only_approval_policy();
         }
         params["config"] = json!({ "mcp_servers": servers });
+    }
+    // Verified with codex 0.162.0-alpha.17.2: selecting :workspace resets
+    // legacy sandbox_workspace_write.network_access. Named profiles preserve
+    // the built-in filesystem policy while explicitly enabling network access.
+    if !config.generation_only {
+        params["config"]["default_permissions"] = json!(custom_profile.as_deref().unwrap_or(match sandbox {
+            "read-only" => "ellmsha-read-network",
+            "danger-full-access" => ":danger-full-access",
+            _ => "ellmsha-workspace-network",
+        }));
+        params["config"]["permissions"] = json!({
+            "ellmsha-workspace-network": {"extends": ":workspace", "network": {"enabled": true}},
+            "ellmsha-read-network": {"extends": ":read-only", "network": {"enabled": true}}
+        });
+        let profile = match (custom_profile.is_none(), sandbox) {
+            (true, "workspace-write") => Some("ellmsha-workspace-network"),
+            (true, "read-only") => Some("ellmsha-read-network"),
+            _ => None,
+        };
+        if let Some(profile) = profile {
+            params.as_object_mut().expect("thread params object").remove("sandbox");
+            params["permissions"] = json!(profile);
+        }
     }
     if let Some(preset) = &config.init.preset_context {
         params["baseInstructions"] = json!(preset);
@@ -498,6 +607,26 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         });
     }
     HandshakeParams(params)
+}
+
+fn mcp_only_approval_policy() -> Value {
+    json!({
+        "granular": {
+            "sandbox_approval": false,
+            "rules": false,
+            "skill_approval": false,
+            "request_permissions": false,
+            "mcp_elicitations": true
+        }
+    })
+}
+
+fn codex_mcp_servers_need_user_approval(servers: &Value) -> bool {
+    servers.as_object().is_some_and(|servers| {
+        servers
+            .values()
+            .any(|server| server.get("default_tools_approval_mode").and_then(Value::as_str) != Some("approve"))
+    })
 }
 
 /// `thread/resume` params = the full `thread/start` override surface + the
@@ -553,13 +682,103 @@ enum HandshakeMode<'a> {
 /// `env` is a MAP `{KEY:VAL}` (not an array of `{name,value}`), and an HTTP server
 /// carries `{url, bearer_token_env_var}` (codex resolves the token from the env
 /// var; there is no inline-headers field). Pure `serde_json`, no codex SDK.
-fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
+const BUILTIN_BROWSER_MCP_NAME: &str = "aionui-browser";
+const BUILTIN_BROWSER_MCP_ENTRY: &str = "builtin-mcp-browser.js";
+const BUILTIN_BROWSER_MCP_PATH_ENV: &str = "AIONUI_BUILTIN_BROWSER_MCP_PATH";
+const BROWSER_CDP_PORT_ENV: &str = "AIONUI_CDP_ACTIVE_PORT";
+const BROWSER_CDP_TOKEN_ENV: &str = "AIONUI_CDP_BRIDGE_TOKEN";
+const BUILTIN_BROWSER_LIFECYCLE_AUTO_TOOLS: [&str; 5] = [
+    "browser_tabs_list",
+    "browser_tab_open",
+    "browser_tab_activate",
+    "browser_tab_navigate",
+    "browser_tab_close",
+];
+// These names are the complete default-enabled read/selection surface marked
+// readOnlyHint=true by pinned chrome-devtools-mcp 0.16.0, plus take_snapshot
+// after the browser proxy splits its optional file writer into the separately
+// prompted take_snapshot_to_file tool. Experimental extension/interop tools are
+// intentionally absent because the bundled engine does not enable them.
+const BUILTIN_BROWSER_OBSERVATION_AUTO_TOOLS: [&str; 8] = [
+    "list_pages",
+    "select_page",
+    "take_snapshot",
+    "wait_for",
+    "list_console_messages",
+    "get_console_message",
+    "list_network_requests",
+    "performance_analyze_insight",
+];
+
+fn is_builtin_browser_mcp(server: &crate::backend::McpServerSpec, trusted_launcher: Option<&str>) -> bool {
+    use crate::backend::McpTransport;
+    let McpTransport::Stdio { command, args, env } = &server.transport else {
+        return false;
+    };
+    server.name == BUILTIN_BROWSER_MCP_NAME
+        && command == "node"
+        && args.len() == 1
+        && trusted_launcher == args.first().map(String::as_str)
+        && Path::new(&args[0]).file_name() == Some(OsStr::new(BUILTIN_BROWSER_MCP_ENTRY))
+        // The catalog-authored browser entry has no custom environment. Permit
+        // only legacy bridge keys so the serializer can replace them below; a
+        // client-supplied Node environment (for example NODE_OPTIONS) must not
+        // receive either current bridge credentials or automatic tool approval.
+        && env
+            .iter()
+            .all(|(key, _)| key == BROWSER_CDP_PORT_ENV || key == BROWSER_CDP_TOKEN_ENV)
+}
+
+fn build_codex_mcp_servers_with_approval(servers: &[crate::backend::McpServerSpec], auto_approval: bool) -> Value {
+    build_codex_mcp_servers_with_env_and_approval(servers, auto_approval, |key| std::env::var(key).ok())
+}
+
+/// Codex starts stdio MCP servers from `config.mcp_servers` under its own
+/// restricted child environment. Environment variables inherited by the
+/// app-server process are therefore not automatically visible to an MCP child.
+/// Add the live bridge coordinates only to the app-owned browser entry at the
+/// final provider serialization boundary. They remain in memory and are never
+/// persisted in the conversation or MCP catalog.
+#[cfg(test)]
+fn build_codex_mcp_servers_with_env(
+    servers: &[crate::backend::McpServerSpec],
+    read_env: impl Fn(&str) -> Option<String>,
+) -> Value {
+    build_codex_mcp_servers_with_env_and_approval(servers, false, read_env)
+}
+
+fn build_codex_mcp_servers_with_env_and_approval(
+    servers: &[crate::backend::McpServerSpec],
+    auto_approval: bool,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> Value {
     use crate::backend::McpTransport;
     let mut map = serde_json::Map::new();
+    let trusted_launcher = read_env(BUILTIN_BROWSER_MCP_PATH_ENV).filter(|value| !value.trim().is_empty());
     for s in servers {
-        let entry = match &s.transport {
+        let is_builtin_browser = is_builtin_browser_mcp(s, trusted_launcher.as_deref());
+        let mut entry = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
-                let env_map: serde_json::Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                let mut env_map: serde_json::Map<String, Value> =
+                    env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                if is_builtin_browser {
+                    // A catalog/session snapshot must never pin credentials from
+                    // an older renderer bridge. Replace both values atomically
+                    // from the current backend process environment.
+                    env_map.remove(BROWSER_CDP_PORT_ENV);
+                    env_map.remove(BROWSER_CDP_TOKEN_ENV);
+                    for key in [BROWSER_CDP_PORT_ENV, BROWSER_CDP_TOKEN_ENV] {
+                        if let Some(value) = read_env(key).filter(|value| !value.trim().is_empty()) {
+                            env_map.insert(key.to_owned(), json!(value));
+                        }
+                    }
+                    tracing::info!(
+                        server_name = %s.name,
+                        bridge_port_present = env_map.contains_key(BROWSER_CDP_PORT_ENV),
+                        bridge_token_present = env_map.contains_key(BROWSER_CDP_TOKEN_ENV),
+                        "codex MCP launch environment prepared for built-in browser"
+                    );
+                }
                 json!({ "command": command, "args": args, "env": Value::Object(env_map) })
             }
             // codex streamable-http MCP: url + (optional) bearer token env var. The
@@ -570,6 +789,15 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
                 json!({ "url": url })
             }
         };
+        if auto_approval && is_builtin_browser {
+            entry["tools"] = Value::Object(
+                BUILTIN_BROWSER_LIFECYCLE_AUTO_TOOLS
+                    .into_iter()
+                    .chain(BUILTIN_BROWSER_OBSERVATION_AUTO_TOOLS)
+                    .map(|name| (name.to_owned(), json!({ "approval_mode": "approve" })))
+                    .collect(),
+            );
+        }
         map.insert(s.name.clone(), entry);
     }
     Value::Object(map)
@@ -688,7 +916,7 @@ pub struct CodexSessionBackend {
     session_id: String,
     capabilities: Capabilities,
     /// JSON-RPC request id counter (outbound client requests).
-    rpc_id: AtomicU64,
+    rpc_id: Arc<AtomicU64>,
     /// Live turn epoch (set on dispatch(Send), read by the reader to stamp).
     turn_gen: Arc<AtomicU64>,
     /// stdin shared with the reader task: dispatch writes client requests; the
@@ -723,9 +951,22 @@ pub struct CodexSessionBackend {
     /// reader claims the response: an ERROR means the pre-seeded binding points at
     /// a thread this codex cannot restore ("no rollout found for thread id …",
     /// verified: samples/codex-cli/0.144.1/dead_resume.jsonl) — the binding is
-    /// cleared and `resume_poison` set. A success just drops the correlation
-    /// (the follow-up `thread/started` re-confirms the binding).
+    /// cleared and `resume_poison` set. A success either opens the resume gate
+    /// immediately or starts the native-memory catalog check below.
     pending_resume: Arc<Mutex<Option<u64>>>,
+    /// Resume-only readiness barrier for the built-in memory catalog. A resumed
+    /// thread is pre-bound so dead-anchor handling keeps working, but its first
+    /// turn must not start until Codex has connected the current Tencent MCP and
+    /// returned its native tool inventory.
+    resume_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the current resume includes eLLMsha's built-in Tencent server and
+    /// therefore needs the focused catalog check before the first turn.
+    resume_needs_memory_catalog: Arc<std::sync::atomic::AtomicBool>,
+    /// RPC id for the resume-time `mcpServerStatus/list` inventory request.
+    pending_resume_catalog: Arc<Mutex<Option<u64>>>,
+    /// Deadline shared by the bounded resume-catalog polling loop. Transient
+    /// `starting`/empty inventory responses retry until this instant.
+    resume_catalog_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     /// Set when codex REJECTED the `thread/resume` (dead resume anchor). Carries
     /// the codex error message; `bound_thread_within` fails FAST with it
     /// (`BackendError::SessionNotFound`) instead of polling a binding that will
@@ -766,7 +1007,7 @@ pub struct CodexSessionBackend {
     /// the sync `pending_permission_requests()` trait method reads it without await —
     /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
     /// every post-wake reader via `reader_state`) shares the one registry.
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
     /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
     /// client: `turn/start` gets a synchronous response
@@ -845,7 +1086,10 @@ struct Discovered {
 /// is used for test-built backends, which never suspend, so it is never consulted.
 struct CodexWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
-    config: SessionConfig,
+    /// Effective session configuration. Live mode changes update this copy so
+    /// an idle wake or deliberate MCP-policy refresh cannot resurrect the
+    /// startup permission mode.
+    config: std::sync::RwLock<SessionConfig>,
 }
 
 impl CodexWakeRecipe {
@@ -855,9 +1099,56 @@ impl CodexWakeRecipe {
     fn inert() -> Self {
         Self {
             spawner: None,
-            config: SessionConfig::default(),
+            config: std::sync::RwLock::new(SessionConfig::default()),
         }
     }
+
+    fn config_snapshot(&self) -> SessionConfig {
+        self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Update the resume recipe and report whether an application-trusted MCP
+    /// setting changed. Codex cannot change MCP server config through
+    /// `thread/settings/update`, so that transition requires a bounded respawn.
+    fn update_mode(&self, profile_id: &str) -> bool {
+        let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
+        let old_mcp_trust = trusted_mcp_auto_approved(&config);
+        config.mode = Some(profile_id.to_owned());
+        match profile_id {
+            ":workspace" => {
+                config.sandbox_mode = Some("workspace-write".into());
+                config.approval_policy = Some("never".into());
+            }
+            ":read-only" => {
+                config.sandbox_mode = Some("read-only".into());
+                config.approval_policy = Some("on-request".into());
+            }
+            ":danger-full-access" => {
+                config.sandbox_mode = Some("danger-full-access".into());
+                config.approval_policy = Some("never".into());
+            }
+            _ => {
+                config.sandbox_mode = None;
+                config.approval_policy = None;
+            }
+        }
+        old_mcp_trust != trusted_mcp_auto_approved(&config)
+    }
+}
+
+fn trusted_mcp_auto_approved(config: &SessionConfig) -> bool {
+    let trusted_launcher = std::env::var(BUILTIN_BROWSER_MCP_PATH_ENV).ok();
+    trusted_mcp_auto_approved_with_launcher(config, trusted_launcher.as_deref())
+}
+
+fn trusted_mcp_auto_approved_with_launcher(config: &SessionConfig, trusted_launcher: Option<&str>) -> bool {
+    config.approval_policy.as_deref() == Some("never")
+        && config.sandbox_mode.as_deref() != Some("read-only")
+        && config.init.mcp_servers.iter().any(|server| {
+            server.name == "ellmsha-tencentdb-memory"
+                || server.auto_approve_in_unattended
+                || is_builtin_browser_mcp(server, trusted_launcher)
+        })
 }
 
 /// Shared reader inputs — held by the backend, cloned into the open-time reader
@@ -871,11 +1162,16 @@ struct CodexReaderState {
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
+    rpc_id: Arc<AtomicU64>,
+    resume_ready: Arc<std::sync::atomic::AtomicBool>,
+    resume_needs_memory_catalog: Arc<std::sync::atomic::AtomicBool>,
+    pending_resume_catalog: Arc<Mutex<Option<u64>>>,
+    resume_catalog_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_open: Arc<Mutex<Option<(u64, &'static str)>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
@@ -909,6 +1205,11 @@ fn start_codex_reader(
             state.pending_discovery,
             state.pending_set,
             state.pending_resume,
+            state.rpc_id,
+            state.resume_ready,
+            state.resume_needs_memory_catalog,
+            state.pending_resume_catalog,
+            state.resume_catalog_deadline,
             state.resume_poison,
             state.pending_open,
             state.discovered,
@@ -950,7 +1251,7 @@ impl CodexSessionBackend {
     ) -> Self {
         let wake = CodexWakeRecipe {
             spawner: Some(spawner),
-            config: SessionConfig::default(),
+            config: std::sync::RwLock::new(SessionConfig::default()),
         };
         Self::spawn_with_wake(session_id.into(), io, wake, Some(idle_ttl_ms)).await
     }
@@ -1038,6 +1339,11 @@ impl CodexSessionBackend {
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
+        let rpc_id = Arc::new(AtomicU64::new(0));
+        let resume_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let resume_needs_memory_catalog = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_resume_catalog = Arc::new(Mutex::new(None));
+        let resume_catalog_deadline = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_open = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
@@ -1062,6 +1368,11 @@ impl CodexSessionBackend {
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
             pending_resume: pending_resume.clone(),
+            rpc_id: rpc_id.clone(),
+            resume_ready: resume_ready.clone(),
+            resume_needs_memory_catalog: resume_needs_memory_catalog.clone(),
+            pending_resume_catalog: pending_resume_catalog.clone(),
+            resume_catalog_deadline: resume_catalog_deadline.clone(),
             resume_poison: resume_poison.clone(),
             pending_open: pending_open.clone(),
             discovered: discovered.clone(),
@@ -1101,7 +1412,7 @@ impl CodexSessionBackend {
         Self {
             session_id,
             capabilities: codex_capabilities(),
-            rpc_id: AtomicU64::new(0),
+            rpc_id,
             turn_gen,
             stdin,
             event_tx,
@@ -1119,6 +1430,10 @@ impl CodexSessionBackend {
             pending_discovery,
             pending_set,
             pending_resume,
+            resume_ready,
+            resume_needs_memory_catalog,
+            pending_resume_catalog,
+            resume_catalog_deadline,
             resume_poison,
             pending_open,
             discovered,
@@ -1177,13 +1492,19 @@ impl CodexSessionBackend {
             // dead-session error class, which clears the persisted anchor and lets
             // the conversation's auto-replay reopen Fresh.
             if let Some(poison) = self.resume_poison.lock().await.clone() {
-                return Err(if poison.starts_with("codex thread/start failed:") {
-                    BackendError::SetupRejected(poison)
-                } else {
-                    BackendError::SessionNotFound(poison)
-                });
+                return Err(
+                    if poison.starts_with("codex thread/start failed:")
+                        || poison.starts_with("codex resume MCP catalog failed:")
+                    {
+                        BackendError::SetupRejected(poison)
+                    } else {
+                        BackendError::SessionNotFound(poison)
+                    },
+                );
             }
-            if let Some(tid) = self.thread_binding.lock().await.clone() {
+            if self.resume_ready.load(Ordering::SeqCst)
+                && let Some(tid) = self.thread_binding.lock().await.clone()
+            {
                 return Ok(tid);
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1201,13 +1522,31 @@ impl CodexSessionBackend {
     /// open) and `wake_handle` (an idle-wake re-attach), so the wire shape lives in
     /// one place.
     async fn run_handshake(&self, mode: HandshakeMode<'_>) -> Result<(), BackendError> {
+        let config = self.wake.config_snapshot();
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
         *self.resume_poison.lock().await = None;
+        self.resume_ready.store(true, Ordering::SeqCst);
+        self.resume_needs_memory_catalog.store(false, Ordering::SeqCst);
+        *self.pending_resume_catalog.lock().await = None;
+        *self.resume_catalog_deadline.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
         match mode {
             HandshakeMode::Resume(tid) => {
+                self.resume_ready.store(false, Ordering::SeqCst);
+                self.resume_needs_memory_catalog.store(
+                    config
+                        .init
+                        .mcp_servers
+                        .iter()
+                        .any(|server| server.name == "ellmsha-tencentdb-memory"),
+                    Ordering::SeqCst,
+                );
+                if self.resume_needs_memory_catalog.load(Ordering::SeqCst) {
+                    *self.resume_catalog_deadline.lock().await =
+                        Some(tokio::time::Instant::now() + super::handshake_budget());
+                }
                 *self.thread_binding.lock().await = Some(tid.to_string());
                 // Resume re-sends the full thread/start override surface — a bare
                 // {threadId} resume silently drops the user's MCP servers and
@@ -1221,7 +1560,7 @@ impl CodexSessionBackend {
                 // (ELECTRON-3Q0).
                 let resume_id = self.next_rpc_id();
                 *self.pending_resume.lock().await = Some(resume_id);
-                self.write_frame(thread_resume_params(&self.wake.config, tid).into_frame(resume_id, "thread/resume"))
+                self.write_frame(thread_resume_params(&config, tid).into_frame(resume_id, "thread/resume"))
                     .await?;
             }
             HandshakeMode::Fork {
@@ -1240,15 +1579,14 @@ impl CodexSessionBackend {
                 let fork_id = self.next_rpc_id();
                 *self.pending_open.lock().await = Some((fork_id, "thread/fork"));
                 self.write_frame(
-                    thread_fork_params(&self.wake.config, parent_thread_id, last_turn_id)
-                        .into_frame(fork_id, "thread/fork"),
+                    thread_fork_params(&config, parent_thread_id, last_turn_id).into_frame(fork_id, "thread/fork"),
                 )
                 .await?;
             }
             HandshakeMode::Fresh => {
                 let start_id = self.next_rpc_id();
                 *self.pending_open.lock().await = Some((start_id, "thread/start"));
-                self.write_frame(thread_start_params(&self.wake.config).into_frame(start_id, "thread/start"))
+                self.write_frame(thread_start_params(&config).into_frame(start_id, "thread/start"))
                     .await?;
             }
         }
@@ -1294,15 +1632,16 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
+        let config = self.wake.config_snapshot();
         let mut args = vec!["app-server".to_string()];
-        args.extend(self.wake.config.extra_args.iter().cloned());
+        args.extend(config.extra_args.iter().cloned());
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
             // (R16 continuity).
-            command: self.wake.config.cli_program.clone().unwrap_or_else(|| "codex".into()),
+            command: config.cli_program.clone().unwrap_or_else(|| "codex".into()),
             args,
-            env: self.wake.config.spawn_env.clone(),
-            cwd: self.wake.config.cwd.clone(),
+            env: config.spawn_env.clone(),
+            cwd: config.cwd.clone(),
         };
         let proc = spawner
             .spawn(cmd, &[], "aionui-session")
@@ -1354,11 +1693,16 @@ async fn reader_task(
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
+    rpc_id: Arc<AtomicU64>,
+    resume_ready: Arc<std::sync::atomic::AtomicBool>,
+    resume_needs_memory_catalog: Arc<std::sync::atomic::AtomicBool>,
+    pending_resume_catalog: Arc<Mutex<Option<u64>>>,
+    resume_catalog_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_open: Arc<Mutex<Option<(u64, &'static str)>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
@@ -1465,6 +1809,58 @@ async fn reader_task(
                 let has_id = frame.get("id").is_some();
                 match (method, has_id) {
                     (Some(m), true) => {
+                        let params = frame.get("params").unwrap_or(&Value::Null);
+                        let root_thread = thread_binding.lock().await.clone();
+                        let request_thread = params.get("threadId").and_then(Value::as_str);
+                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), request_thread) {
+                            if thread_id != root {
+                                if m == "mcpServer/elicitation/request" {
+                                    // A spawned Codex child inherits the root thread's
+                                    // MCP inventory and approval policy. Its view is
+                                    // read-only, so route the approval to the writable
+                                    // parent conversation instead of rejecting it. The
+                                    // reverse-RPC id is connection-global; answering the
+                                    // parent card therefore resumes the exact child call.
+                                    handle_reverse_rpc(
+                                        m,
+                                        &frame,
+                                        &session_id,
+                                        &turn_gen,
+                                        &event_tx,
+                                        &pending_auth_id,
+                                        &pending_tool_approvals,
+                                        &stdin,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                // Child threads share the app-server JSON-RPC transport,
+                                // but the parent conversation is the only writable UI.
+                                // Unsupported child reverse-RPC classes remain rejected
+                                // without registering them in the parent's pending set.
+                                let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                                write_reverse_error(
+                                    &stdin,
+                                    &id,
+                                    -32601,
+                                    "subagent approval is unavailable in the read-only child view",
+                                )
+                                .await;
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    turn_gen.load(Ordering::SeqCst),
+                                    SessionEvent::SubagentStream {
+                                        r#ref: thread_id.to_owned(),
+                                        event: Box::new(SessionEvent::AdapterSpecific {
+                                            tag: "codex_child_reverse_rpc_rejected".into(),
+                                            payload: json!({ "method": m, "id": id }),
+                                        }),
+                                    },
+                                );
+                                continue;
+                            }
+                        }
                         // reverse-RPC (ServerRequest): infra → auto-reject to prevent
                         // deadlock (A2/A3); auth-refresh + approvals → surface as
                         // Permission (NOT auto-answered — a human/credential answers).
@@ -1484,6 +1880,48 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        // codex multiplexes spawned agents onto this same JSON-RPC
+                        // stream. Route any non-root thread into an explicit child
+                        // envelope before touching the root binding/turn terminal
+                        // bookkeeping. ServerNotification.json generated by codex
+                        // app-server 0.162.0-alpha.2 defines threadId on turn/item
+                        // notifications and thread.id on thread/started.
+                        let root_thread = thread_binding.lock().await.clone();
+                        let notification_thread = notification_thread_id(m, params);
+                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), notification_thread) {
+                            if thread_id != root {
+                                let resolves_parent_confirmation = m == "serverRequest/resolved"
+                                    && params
+                                        .get("request_id")
+                                        .or_else(|| params.get("requestId"))
+                                        .is_some_and(|id| {
+                                            has_pending_tool_approval(&pending_tool_approvals, &id.to_string())
+                                        });
+                                if !resolves_parent_confirmation {
+                                    let child_events = if m == "turn/completed" {
+                                        vec![map_turn_completed(params)]
+                                    } else {
+                                        map_notification(m, params)
+                                    };
+                                    for event in child_events {
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            cur,
+                                            SessionEvent::SubagentStream {
+                                                r#ref: thread_id.to_string(),
+                                                event: Box::new(event),
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                }
+                                // The approval card lives in the writable parent
+                                // conversation even when the blocked MCP call is
+                                // running in a child. Let the normal resolved path
+                                // below clear that exact parent card/counter.
+                            }
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -1670,6 +2108,106 @@ async fn reader_task(
                                 );
                                 *thread_binding.lock().await = None;
                                 *resume_poison.lock().await = Some(format!("codex thread/resume failed: {msg}"));
+                                continue;
+                            }
+                            if is_resume {
+                                if resume_needs_memory_catalog.load(Ordering::SeqCst) {
+                                    let Some(thread_id) = thread_binding.lock().await.clone() else {
+                                        *resume_poison.lock().await = Some(
+                                            "codex resume MCP catalog failed: resumed thread id unavailable".into(),
+                                        );
+                                        continue;
+                                    };
+                                    if !request_resumed_memory_catalog(
+                                        &rpc_id,
+                                        &pending_resume_catalog,
+                                        &stdin,
+                                        &thread_id,
+                                    )
+                                    .await
+                                    {
+                                        *resume_poison.lock().await = Some(
+                                            "codex resume MCP catalog failed: inventory request could not be sent"
+                                                .into(),
+                                        );
+                                    }
+                                } else {
+                                    resume_ready.store(true, Ordering::SeqCst);
+                                }
+                                continue;
+                            }
+
+                            let is_resume_catalog = {
+                                let mut pending = pending_resume_catalog.lock().await;
+                                match *pending {
+                                    Some(prid) if prid == rid => {
+                                        *pending = None;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            };
+                            if is_resume_catalog {
+                                let memory_ready = frame
+                                    .get("result")
+                                    .and_then(|result| result.get("data"))
+                                    .and_then(Value::as_array)
+                                    .and_then(|servers| {
+                                        servers.iter().find(|server| {
+                                            server.get("name").and_then(Value::as_str)
+                                                == Some("ellmsha-tencentdb-memory")
+                                        })
+                                    })
+                                    .is_some_and(|server| {
+                                        server.get("runtimeStatus").and_then(Value::as_str) == Some("connected")
+                                            && server
+                                                .get("tools")
+                                                .and_then(Value::as_object)
+                                                .is_some_and(|tools| !tools.is_empty())
+                                            && server.get("toolsError").is_none_or(Value::is_null)
+                                    });
+                                if memory_ready {
+                                    *resume_catalog_deadline.lock().await = None;
+                                    resume_ready.store(true, Ordering::SeqCst);
+                                    tracing::info!(
+                                        conversation_id = %session_id,
+                                        "codex resumed TencentDB MCP catalog ready"
+                                    );
+                                } else if error_message.is_none()
+                                    && resume_catalog_deadline
+                                        .lock()
+                                        .await
+                                        .is_some_and(|deadline| tokio::time::Instant::now() < deadline)
+                                {
+                                    // A status read may observe `starting` before
+                                    // tool discovery completes. Keep the reader
+                                    // responsive with a short bounded pause, then
+                                    // re-query the same thread-local MCP connection.
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    let Some(thread_id) = thread_binding.lock().await.clone() else {
+                                        *resume_poison.lock().await = Some(
+                                            "codex resume MCP catalog failed: resumed thread id unavailable".into(),
+                                        );
+                                        continue;
+                                    };
+                                    if !request_resumed_memory_catalog(
+                                        &rpc_id,
+                                        &pending_resume_catalog,
+                                        &stdin,
+                                        &thread_id,
+                                    )
+                                    .await
+                                    {
+                                        *resume_poison.lock().await = Some(
+                                            "codex resume MCP catalog failed: inventory retry could not be sent".into(),
+                                        );
+                                    }
+                                } else {
+                                    *resume_catalog_deadline.lock().await = None;
+                                    *resume_poison.lock().await = Some(
+                                        "codex resume MCP catalog failed: TencentDB native tools unavailable".into(),
+                                    );
+                                }
                                 continue;
                             }
                             // Claim the thread/fork response (pending_resume's
@@ -1997,7 +2535,11 @@ mod codex_perm {
     /// codex would reject. Validation against the DISCOVERED catalog (a custom id that no
     /// longer exists) happens at the call site, exactly as legacy `is_mode_valid` did.
     pub(super) fn normalize_to_profile_id(mode: &str) -> String {
-        let trimmed = mode.trim();
+        let trimmed = match mode.trim() {
+            "ellmsha-workspace-network" => ":workspace",
+            "ellmsha-read-network" => ":read-only",
+            other => other,
+        };
         if let Some(rest) = trimmed.strip_prefix(':') {
             // Already a profile id (discovery / custom / re-persisted colon value):
             // pass through verbatim, unless it is empty (`":"`) which is nonsense.
@@ -2033,8 +2575,8 @@ mod codex_perm {
     /// its `name` via `defaultValue`, and echoes the colon id back unchanged).
     pub(super) fn profile_id_to_legacy_value(profile_id: &str) -> String {
         match profile_id {
-            ":read-only" => "read-only".to_owned(),
-            ":workspace" => "auto".to_owned(),
+            ":read-only" | "ellmsha-read-network" => "read-only".to_owned(),
+            ":workspace" | "ellmsha-workspace-network" => "auto".to_owned(),
             ":danger-full-access" => "full-access".to_owned(),
             other => other.to_owned(),
         }
@@ -2055,6 +2597,18 @@ mod codex_perm {
     /// from the tier that would be applied.
     pub(super) fn mode_to_catalog_value(mode: &str) -> String {
         profile_id_to_legacy_value(&normalize_to_profile_id(mode))
+    }
+
+    pub(super) fn network_profile_id(profile_id: &str) -> &str {
+        match profile_id {
+            ":workspace" => "ellmsha-workspace-network",
+            ":read-only" => "ellmsha-read-network",
+            other => other,
+        }
+    }
+
+    pub(super) fn is_builtin_profile_id(profile_id: &str) -> bool {
+        matches!(profile_id, ":workspace" | ":read-only" | ":danger-full-access")
     }
 
     /// Friendly display `(name, description)` for a built-in codex permission profile.
@@ -2080,11 +2634,11 @@ mod codex_perm {
         match profile_id {
             ":read-only" => Some((
                 "Read Only",
-                "Codex can read files in the current workspace. Approval is required to edit files or access the internet.",
+                "Codex can read files and access the internet. Approval is required to edit files.",
             )),
             ":workspace" => Some((
                 "Default",
-                "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)",
+                "Codex can read and edit workspace files, run commands, and access the internet. Filesystem access remains restricted to the workspace.",
             )),
             ":danger-full-access" => Some((
                 "Full Access",
@@ -2193,6 +2747,9 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
                             // what SetMode sends back and what the reader matches. Skip only
                             // a malformed entry with no id.
                             let profile_id = p.get("id").and_then(Value::as_str)?;
+                            if matches!(profile_id, "ellmsha-workspace-network" | "ellmsha-read-network") {
+                                return None; // Internal aliases of the existing Auto/Read Only rows.
+                            }
                             // Display layer (matches legacy ACP): codex's built-in profiles
                             // arrive with no name and `description:null`, so prefer codex's
                             // own fields when present (a custom `[permissions.<id>]` may carry
@@ -2294,11 +2851,51 @@ fn rollback_to_turn(result: &Value) -> u64 {
 /// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so
 /// a resolved notification clears either entry shape. `dispatch(AnswerPermission)`
 /// passes the exact stored key (raw or prefixed), which the first lookup catches.
-fn remove_pending_tool_approval(pending: &Arc<std::sync::Mutex<HashMap<String, String>>>, request_id: &str) {
+fn remove_pending_tool_approval(
+    pending: &Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    request_id: &str,
+) {
     let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
     if map.remove(request_id).is_none() {
         map.remove(&format!("{ELICIT_PREFIX}{request_id}"));
     }
+}
+
+fn has_pending_tool_approval(
+    pending: &Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    request_id: &str,
+) -> bool {
+    let map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    map.contains_key(request_id) || map.contains_key(&format!("{ELICIT_PREFIX}{request_id}"))
+}
+
+fn mark_pending_tool_approval_answered(
+    pending: &Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    request_id: &str,
+) {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get_mut(request_id) {
+        entry.answered = true;
+    }
+}
+
+/// Preserve the exact approval params and add a renderer-friendly description.
+/// The desktop card already renders `command` as its main detail; `description`
+/// carries the remaining cwd/reason/file/MCP context instead of leaving a blank
+/// or generic approval prompt.
+fn permission_context(input: Option<&Value>) -> Option<Value> {
+    let mut input = input?.clone();
+    let description = input
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()));
+    if let Some(object) = input.as_object_mut() {
+        object
+            .entry("description")
+            .or_insert_with(|| Value::String(description));
+    }
+    Some(input)
 }
 
 /// Reverse-RPC handler (A2/A3). The blocking ServerRequest MUST eventually get a
@@ -2320,7 +2917,7 @@ async fn handle_reverse_rpc(
     turn_gen: &Arc<AtomicU64>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     pending_auth_id: &Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
 ) {
     let cur = turn_gen.load(Ordering::SeqCst);
@@ -2379,22 +2976,26 @@ async fn handle_reverse_rpc(
         // can't be granted — strictly better than a malformed answer or a deadlock).
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             let request_id = id.to_string();
+            let input = permission_context(frame.get("params"));
             // Register for REST recovery (`GET /confirmations`): a tool/file approval
             // raised before the client subscribed (or after a page reload) must be
             // rebuildable, else the turn hangs waiting for an answer that can never be
             // given. Keyed by the SAME request_id we surface, so a duplicate live+
-            // recovered pair de-dups; the value is a safe title (the approval class,
-            // NOT the command body — TIO-13). Cleared on serverRequest/resolved or
-            // dispatch(AnswerPermission).
+            // recovered pair de-dups. Keep the exact request params with the title
+            // so recovery renders the same command/context as the live card.
             let title = if method == "item/fileChange/requestApproval" {
                 "FileChange"
             } else {
                 "CommandExecution"
             };
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), title.to_string());
+            pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                request_id.clone(),
+                PendingToolApproval {
+                    tool_name: title.to_string(),
+                    input: input.clone(),
+                    answered: false,
+                },
+            );
             emit(
                 event_tx,
                 session_id,
@@ -2412,7 +3013,7 @@ async fn handle_reverse_rpc(
                     // and falls back to the title otherwise, so an unprobed params
                     // shape degrades to the previous title-only card.
                     tool_name: Some(title.to_string()),
-                    input: frame.get("params").cloned(),
+                    input,
                 },
             );
         }
@@ -2429,21 +3030,24 @@ async fn handle_reverse_rpc(
         // emits the matching PermissionResolved{Tool} on answer.
         "mcpServer/elicitation/request" => {
             let request_id = format!("{ELICIT_PREFIX}{id}");
-            // Carry the elicitation context so the conversation can render a form /
-            // approval prompt: the message, the requested schema, and the mode.
-            let input = json!({
-                "message": frame.get("params").and_then(|p| p.get("message")),
-                "requestedSchema": frame.get("params").and_then(|p| p.get("requestedSchema")),
-                "mode": frame.get("params").and_then(|p| p.get("mode")),
-                "serverName": frame.get("params").and_then(|p| p.get("serverName")),
-            });
+            // Preserve the complete app-server params. In particular, Codex marks
+            // tool approvals with `_meta.codex_approval_kind=mcp_tool_call` and
+            // advertises supported persistence scopes in `_meta.persist`; dropping
+            // those fields makes an "Allow Always" click indistinguishable from a
+            // one-time accept. The payload is shown only to the approver, never logged.
+            let input = permission_context(frame.get("params")).expect("elicitation context is an object");
+            let title = mcp_elicitation_title(&input);
             // Register for REST recovery, keyed by the ELICIT_PREFIX-tagged request_id
-            // (the same id we surface + dispatch(AnswerPermission) answers). Title is
-            // the safe approval class, not the elicitation message body (TIO-13).
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), "Elicitation".to_string());
+            // (the same id we surface + dispatch(AnswerPermission) answers), with
+            // the same elicitation context used by the live permission card.
+            pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                request_id.clone(),
+                PendingToolApproval {
+                    tool_name: title.clone(),
+                    input: Some(input.clone()),
+                    answered: false,
+                },
+            );
             emit(
                 event_tx,
                 session_id,
@@ -2452,7 +3056,7 @@ async fn handle_reverse_rpc(
                     request_id,
                     kind: crate::event::PermissionKind::Tool,
                     metadata: None,
-                    tool_name: None,
+                    tool_name: Some(title),
                     input: Some(input),
                 },
             );
@@ -2509,6 +3113,46 @@ async fn write_reverse_error(
         line.push(b'\n');
         let _ = w.write_all(&line).await;
         let _ = w.flush().await;
+    }
+}
+
+/// Write a client request from the reader task. Resume uses this after the
+/// `thread/resume` response so the MCP inventory check cannot race ahead of the
+/// thread restore. Returns false when the process has already lost stdin.
+async fn write_reader_frame(stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>, frame: &Value) -> bool {
+    let mut guard = stdin.lock().await;
+    let Some(w) = guard.as_mut() else { return false };
+    use tokio::io::AsyncWriteExt;
+    let Ok(mut line) = serde_json::to_vec(frame) else {
+        return false;
+    };
+    line.push(b'\n');
+    w.write_all(&line).await.is_ok() && w.flush().await.is_ok()
+}
+
+async fn request_resumed_memory_catalog(
+    rpc_id: &Arc<AtomicU64>,
+    pending: &Arc<Mutex<Option<u64>>>,
+    stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
+    thread_id: &str,
+) -> bool {
+    let request_id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+    *pending.lock().await = Some(request_id);
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "mcpServerStatus/list",
+        "params": {
+            "threadId": thread_id,
+            "serverName": "ellmsha-tencentdb-memory",
+            "detail": "toolsAndAuthOnly"
+        }
+    });
+    if write_reader_frame(stdin, &request).await {
+        true
+    } else {
+        *pending.lock().await = None;
+        false
     }
 }
 
@@ -2701,6 +3345,17 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
     }
 }
 
+/// Thread attribution from the app-server ServerNotification schema. Most
+/// notifications carry `params.threadId`; `thread/started` carries
+/// `params.thread.id` instead.
+fn notification_thread_id<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    if method == "thread/started" {
+        params.get("thread")?.get("id")?.as_str()
+    } else {
+        params.get("threadId").and_then(Value::as_str)
+    }
+}
+
 /// Build a [`SessionEvent::Notice`] message from a codex `deprecationNotice` /
 /// `configWarning` params object: `{summary, details?, ...}`. Joins summary +
 /// details (when present) so the user sees the actionable guidance, not just the
@@ -2735,6 +3390,53 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
+fn map_subagent_activity_status(kind: &str) -> SubagentStatus {
+    match kind {
+        "interrupted" => SubagentStatus::Interrupted,
+        "completed" => SubagentStatus::Completed,
+        _ => SubagentStatus::Running,
+    }
+}
+
+fn subagent_label_from_path(path: &str) -> Option<String> {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .filter(|part| *part != "root")
+        .map(str::to_owned)
+}
+
+fn collab_tool_name(tool: &str) -> String {
+    match tool {
+        "spawnAgent" => "spawn_agent",
+        "sendInput" => "send_input",
+        "resumeAgent" => "resume_agent",
+        "closeAgent" => "close_agent",
+        "sendMessage" => "send_message",
+        "followupTask" => "followup_task",
+        "interruptAgent" => "interrupt_agent",
+        "listAgents" => "list_agents",
+        "wait" => "wait_agent",
+        other => other,
+    }
+    .to_owned()
+}
+
+fn push_completed_tool(out: &mut Vec<SessionEvent>, id: &str, name: String, input: Value, is_error: bool) {
+    out.push(SessionEvent::ToolCall {
+        tool_use_id: id.to_owned(),
+        name,
+        subagent: crate::event::SubagentKind::Inline,
+        input,
+        parent_tool_use_id: None,
+    });
+    out.push(SessionEvent::ToolResult {
+        tool_use_id: id.to_owned(),
+        is_error,
+        content: Vec::new(),
+        parent_tool_use_id: None,
+    });
+}
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
@@ -2747,8 +3449,9 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
     // GAP-E (C5.3 frozen item-brackets, §9.2): emit the ADDITIVE partial-lifecycle
     // bracket (Tier-0; reducer no-op) around the content event(s), for the
     // bracketable item types the (P2) TurnFinalizer needs. We do NOT bracket the
-    // server's userMessage echo (not a model item) nor the collabAgent item (a
-    // subagent lifecycle carried by SubagentUpdate, not a message/tool item).
+    // server's userMessage echo (not a model item). Collaboration items synthesize
+    // their complete tool lifecycle below because current app-server versions may
+    // emit only item/completed for them.
     let bracketed = matches!(
         item_type,
         "agentMessage"
@@ -2905,12 +3608,31 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            // `model` is the agent's model id; empty on the spawn-in-flight frame.
-            let label = item
-                .get("model")
+            let tool = item
+                .get("tool")
                 .and_then(Value::as_str)
-                .filter(|m| !m.is_empty())
-                .map(str::to_string);
+                .unwrap_or("collabAgentToolCall");
+            let tool_name = collab_tool_name(tool);
+            if completed {
+                push_completed_tool(
+                    &mut out,
+                    &id,
+                    tool_name,
+                    item.clone(),
+                    matches!(
+                        item.get("status").and_then(Value::as_str),
+                        Some("failed" | "interrupted")
+                    ),
+                );
+            } else {
+                out.push(SessionEvent::ToolCall {
+                    tool_use_id: id.clone(),
+                    name: tool_name,
+                    subagent: crate::event::SubagentKind::Inline,
+                    input: item.clone(),
+                    parent_tool_use_id: None,
+                });
+            }
             match item.get("agentsStates").and_then(Value::as_object) {
                 Some(states) if !states.is_empty() => {
                     for (thread_id, st) in states {
@@ -2927,7 +3649,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                             });
                         out.push(SessionEvent::SubagentUpdate {
                             r#ref: thread_id.clone(),
-                            label: label.clone(),
+                            label: None,
                             status,
                             parent_ref: parent_ref.clone(),
                             // codex collab threads declare no container kind, and no
@@ -2937,23 +3659,50 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         });
                     }
                 }
-                // No child thread reported yet (the spawn-in-flight frame carries an
-                // empty `agentsStates`): fall back to the tool-call id so the action
-                // still surfaces, with a bool-derived status. The spawn tool's own
-                // completion is terminal, so this fallback entry settles + prunes at
-                // the turn boundary; the next frame carries the real child threadId.
-                _ => {
-                    out.push(SessionEvent::SubagentUpdate {
-                        r#ref: id.clone(),
-                        label,
-                        status: if completed {
-                            SubagentStatus::Completed
-                        } else {
-                            SubagentStatus::Running
-                        },
-                        parent_ref,
-                        // Same as the agentsStates branch: no declared kind.
-                        kind: None,
+                // A collab operation such as wait/list has no receiving child. Its
+                // call id identifies the parent tool invocation, never a child thread.
+                _ => {}
+            }
+        }
+        "subAgentActivity" => {
+            let Some(thread_id) = item
+                .get("agentThreadId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                return out;
+            };
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or("interacted");
+            let label = item
+                .get("agentPath")
+                .and_then(Value::as_str)
+                .and_then(subagent_label_from_path);
+            let parent_ref = params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            out.push(SessionEvent::SubagentUpdate {
+                r#ref: thread_id.to_owned(),
+                label: label.clone(),
+                status: map_subagent_activity_status(kind),
+                parent_ref,
+                kind: None,
+            });
+            if kind == "started" {
+                let mut input = item.clone();
+                if let Some(label) = label {
+                    input["taskName"] = Value::String(label);
+                }
+                if completed {
+                    push_completed_tool(&mut out, &id, "spawn_agent".to_owned(), input, false);
+                } else {
+                    out.push(SessionEvent::ToolCall {
+                        tool_use_id: id.clone(),
+                        name: "spawn_agent".to_owned(),
+                        subagent: crate::event::SubagentKind::Inline,
+                        input,
+                        parent_tool_use_id: None,
                     });
                 }
             }
@@ -3609,9 +4358,10 @@ impl SessionBackend for CodexSessionBackend {
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
                 };
-                if self.wake.config.generation_only && method == "turn/start" {
-                    params["model"] = json!(self.wake.config.model);
-                    if let Some(schema) = &self.wake.config.generation_response_schema {
+                let config = self.wake.config_snapshot();
+                if config.generation_only && method == "turn/start" {
+                    params["model"] = json!(config.model);
+                    if let Some(schema) = &config.generation_response_schema {
                         params["outputSchema"] = schema.clone();
                     }
                 }
@@ -3726,6 +4476,46 @@ impl SessionBackend for CodexSessionBackend {
                 // catalog (a stale custom id) is the reader's job on the response (a reject
                 // surfaces as a Notice), exactly as legacy `set_mode` relied on the backend.
                 let profile_id = codex_perm::normalize_to_profile_id(&mode);
+                let custom_profile = !codex_perm::is_builtin_profile_id(&profile_id);
+                if custom_profile {
+                    let catalog_id = codex_perm::profile_id_to_legacy_value(&profile_id);
+                    let discovered = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+                    if !discovered.modes.iter().any(|candidate| candidate.id == catalog_id) {
+                        return Err(BackendError::Transport(format!(
+                            "codex permission profile is not available: {profile_id}"
+                        )));
+                    }
+                }
+                let mcp_trust_changed = self.wake.update_mode(&profile_id);
+                // Fresh sessions reconcile their persisted mode after discovery.
+                // Keep that follow-up settings write on the same effective approval
+                // policy as thread/start: Auto may be `never` for shell/file work
+                // while an imported MCP still needs the granular elicitation gate.
+                // Using the handshake serializer as the source of truth also keeps
+                // trusted-only, read-only, and custom-profile behavior aligned with
+                // resume/fork without broadening any approval class.
+                let effective_approval_policy = thread_start_params(&self.wake.config_snapshot())
+                    .0
+                    .get("approvalPolicy")
+                    .cloned();
+                // MCP server approval defaults are part of thread config and are
+                // absent from `thread/settings/update`. Refresh the app-server
+                // only when crossing an application-trusted MCP boundary; the
+                // retained thread id is immediately resumed with the updated
+                // effective config. This keeps Auto unattended without carrying
+                // that trust into read-only or custom/manual profiles.
+                // A custom profile owns its approval policy. Codex represents the
+                // settings override as Option<AskForApproval>, so JSON null is the
+                // same as omission and cannot clear Auto's prior `never`. Resume
+                // the thread with `permissions:<custom>` and no approval/sandbox
+                // override instead. The discovery check above prevents a stale id
+                // from entering the wake recipe or killing the healthy process.
+                if (mcp_trust_changed || custom_profile) && self.wake.spawner.is_some() {
+                    self.suspend.terminate().await;
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                }
                 let tid = self.bound_thread().await?;
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
@@ -3735,12 +4525,16 @@ impl SessionBackend for CodexSessionBackend {
                     .lock()
                     .await
                     .insert(id, format!("mode\u{2192}{profile_id}"));
+                let mut params = json!({
+                    "threadId": tid,
+                    "permissions": codex_perm::network_profile_id(&profile_id)
+                });
+                if let Some(approval_policy) = effective_approval_policy {
+                    params["approvalPolicy"] = approval_policy;
+                }
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
-                    "params": {
-                        "threadId": tid,
-                        "permissions": profile_id
-                    }
+                    "params": params
                 });
                 self.write_frame(frame).await?;
                 Ok(CommandReceipt {
@@ -3892,8 +4686,8 @@ impl SessionBackend for CodexSessionBackend {
             Command::AnswerPermission {
                 request_id,
                 decision,
-                selected: _, // codex approval is accept/decline; no pick-one label
-                answers: _,  // codex has no AskUserQuestion; per-question answers N/A
+                selected,
+                answers: _, // codex has no AskUserQuestion; per-question answers N/A
             } => {
                 let approved = matches!(
                     decision,
@@ -3916,13 +4710,33 @@ impl SessionBackend for CodexSessionBackend {
                 // is purely a dispatch-side wire-shape selector.
                 let frame = if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX) {
                     let id: Value = serde_json::from_str(raw_id).unwrap_or(Value::String(raw_id.to_string()));
-                    // Elicitation has only accept/decline (no per-session variant);
-                    // accept executes the tool / submits the form; decline cancels.
-                    // We have no form values to fill (the conversation layer would
-                    // supply them when a real form UI exists), so content is empty.
+                    let pending = self
+                        .pending_tool_approvals
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&request_id)
+                        .cloned();
+                    let is_tool_approval = is_mcp_tool_approval(pending.as_ref().and_then(|p| p.input.as_ref()));
+                    // MCP tool approvals use the normal elicitation accept/decline
+                    // action plus optional `_meta.persist`. Codex owns that scoped
+                    // grant; eLLMsha forwards it only when the request advertised the
+                    // scope. Ordinary MCP forms retain their existing empty-object
+                    // content until a structured form editor is available.
+                    let mut result = json!({
+                        "action": if approved { "accept" } else { "decline" },
+                        "content": if approved && !is_tool_approval { json!({}) } else { Value::Null }
+                    });
+                    if matches!(decision, super::types::PermissionDecision::AllowAlways)
+                        && let Some(scope) = mcp_tool_approval_persistence(
+                            pending.as_ref().and_then(|pending| pending.input.as_ref()),
+                            selected.as_deref(),
+                        )
+                    {
+                        result["_meta"] = json!({ "persist": scope });
+                    }
                     json!({
                         "jsonrpc": "2.0", "id": id,
-                        "result": { "action": if approved { "accept" } else { "decline" }, "content": {} }
+                        "result": result
                     })
                 } else {
                     let id: Value = serde_json::from_str(&request_id).unwrap_or(Value::String(request_id.clone()));
@@ -3932,11 +4746,12 @@ impl SessionBackend for CodexSessionBackend {
                     })
                 };
                 self.write_frame(frame).await?;
-                // We answered it → drop from the REST-recovery registry so a
-                // subsequent GET /confirmations no longer resurfaces a card the user
-                // already resolved. `request_id` is the exact stored key (raw for
-                // tool/file, ELICIT_PREFIX-tagged for elicitation).
-                remove_pending_tool_approval(&self.pending_tool_approvals, &request_id);
+                // Hide an answered request from REST recovery immediately, but retain
+                // its correlation entry until `serverRequest/resolved`. Child MCP
+                // approvals resolve on the child's thread id; keeping the entry lets
+                // the reader route that resolution back to the parent confirmation
+                // state instead of treating it as an unrelated child notification.
+                mark_pending_tool_approval_answered(&self.pending_tool_approvals, &request_id);
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4062,24 +4877,27 @@ impl SessionBackend for CodexSessionBackend {
     /// REST-recovery (`GET /confirmations`) source: the transient registry of
     /// currently-open (unanswered) codex approval requests — command/file
     /// approvals (`*/requestApproval`) and MCP elicitations. The reader inserts on
-    /// each such reverse-RPC, and removes on `serverRequest/resolved` (codex
-    /// retracted/answered) and `dispatch(AnswerPermission)` (we answered). Without
+    /// each such reverse-RPC, marks it hidden when `dispatch(AnswerPermission)`
+    /// answers, and removes it on `serverRequest/resolved`. Without
     /// this override (the default empty `Vec`), a codex tool/file approval raised
     /// before the client subscribed — or lost on a page reload — could never be
     /// rebuilt, and the turn hung forever waiting for an answer. The recovered
     /// card's id==call_id==request_id, matching the live `Permission` frame so a
     /// duplicate live+recovered pair de-dups. codex approvals carry no question
-    /// payload (AskUserQuestion is claude-only), so `questions` is always `None`;
-    /// the raw command body is NOT exposed (TIO-13) — only the approval-class title.
+    /// payload (AskUserQuestion is claude-only), so `questions` is always `None`.
+    /// The transient input is retained so recovered dialogs show the same command
+    /// or elicitation context as the live event.
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         self.pending_tool_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|(request_id, title)| PendingPermissionView {
+            .filter(|(_, pending)| !pending.answered)
+            .map(|(request_id, pending)| PendingPermissionView {
                 request_id: request_id.clone(),
-                tool_name: title.clone(),
+                tool_name: pending.tool_name.clone(),
                 questions: None,
+                input: pending.input.clone(),
             })
             .collect()
     }
@@ -4521,12 +5339,18 @@ mod tests {
             assert_eq!(perm.0.as_deref(), Some(title), "{m} carries the approval class");
             let input = perm.1.expect("params ride as input for the card");
             assert_eq!(input["command"], "rm -rf /", "{m} passes the wire params through");
+            assert!(
+                input["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("rm -rf /")),
+                "{m} includes renderer-visible approval context"
+            );
         }
     }
 
     /// REST-recovery parity with claude: a codex tool approval is LISTED by
     /// `pending_permission_requests()` while open, and the list is EMPTY after
-    /// `dispatch(AnswerPermission)` consumes it. Without the registry the recovery
+    /// `dispatch(AnswerPermission)` marks it answered. Without the registry the recovery
     /// read returned empty and a reloaded `waiting_confirmation` codex turn hung
     /// forever (the id needed to answer lived only in the missed live frame).
     #[tokio::test]
@@ -4570,8 +5394,13 @@ mod tests {
         assert_eq!(open[0].request_id, request_id, "recovered id == live request_id");
         assert_eq!(open[0].tool_name, "CommandExecution");
         assert!(open[0].questions.is_none(), "codex approvals carry no question payload");
+        assert_eq!(
+            open[0].input.as_ref().and_then(|input| input.get("command")),
+            Some(&json!("rm -rf /")),
+            "recovery retains the exact command shown by the live card"
+        );
 
-        // ANSWER: dispatch(AnswerPermission) → the registry entry is dropped.
+        // ANSWER: dispatch(AnswerPermission) → the answered entry is hidden from recovery.
         backend
             .dispatch(Command::AnswerPermission {
                 request_id: request_id.clone(),
@@ -4890,9 +5719,10 @@ mod tests {
                 SessionEvent::Permission {
                     request_id,
                     kind: PermissionKind::Tool,
+                    tool_name,
                     input,
                     ..
-                } => Some((request_id.clone(), input.clone())),
+                } => Some((request_id.clone(), tool_name.clone(), input.clone())),
                 _ => None,
             })
             .expect("elicitation surfaces as Permission(Tool)");
@@ -4901,10 +5731,153 @@ mod tests {
             "request_id is tagged with the elicit prefix (so dispatch writes {{action,content}}), got {}",
             perm.0
         );
-        let input = perm.1.expect("elicitation carries its context as input");
+        assert_eq!(perm.1.as_deref(), Some("Elicitation"));
+        let input = perm.2.expect("elicitation carries its context as input");
         assert_eq!(input["message"], "Pick a color");
+        assert_eq!(input["description"], "Pick a color");
         assert_eq!(input["mode"], "form");
         assert!(input["requestedSchema"]["properties"].get("color").is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_approval_preserves_metadata_and_persistent_grant() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":23,"method":"mcpServer/elicitation/request","params":{"threadId":"th-1","serverName":"plugin:sd07-live-qa:safe-echo","mode":"form","message":"Allow safe echo?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","tool_name":"safe_echo","tool_title":"Safe Echo","persist":["session","always"]}}}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        releaser();
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Permission {
+                    request_id,
+                    tool_name,
+                    input,
+                    ..
+                } = env.event
+                {
+                    assert_eq!(tool_name.as_deref(), Some("Safe Echo"));
+                    assert_eq!(
+                        input.as_ref().and_then(|v| v.pointer("/_meta/persist/1")),
+                        Some(&json!("always"))
+                    );
+                    return request_id;
+                }
+            }
+            panic!("missing MCP approval permission");
+        })
+        .await
+        .expect("MCP approval must surface");
+
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id,
+                decision: super::super::types::PermissionDecision::AllowAlways,
+                selected: Some("always".into()),
+                answers: vec![],
+            })
+            .await
+            .expect("persistent MCP approval accepted");
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""action":"accept""#), "got: {written}");
+        assert!(
+            written.contains(r#""content":null"#),
+            "tool approval has no form content: {written}"
+        );
+        assert!(
+            written.contains(r#""_meta":{"persist":"always"}"#),
+            "persistent scope forwarded: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_mcp_approval_routes_to_parent_confirmation_and_can_resume_child() {
+        let fake = FakeAgentIo::never_exits(
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        )
+        .with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":31,"method":"mcpServer/elicitation/request","params":{"threadId":"child","serverName":"plugin:sd07-live-qa:safe-echo","mode":"form","message":"Allow child safe echo?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","tool_name":"safe_echo","persist":"session"}}}"#,
+                "\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let releaser = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        releaser();
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Permission { request_id, input, .. } = env.event {
+                    assert_eq!(input.as_ref().and_then(|v| v.get("threadId")), Some(&json!("child")));
+                    return request_id;
+                }
+            }
+            panic!("missing child MCP approval permission");
+        })
+        .await
+        .expect("child MCP approval must surface in parent");
+
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id,
+                decision: super::super::types::PermissionDecision::Approved,
+                selected: None,
+                answers: vec![],
+            })
+            .await
+            .expect("child approval answer accepted");
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""id":31"#),
+            "answer targets child request id: {written}"
+        );
+        assert!(
+            written.contains(r#""action":"accept""#),
+            "answer resumes child tool call: {written}"
+        );
+        assert!(
+            !written.contains(r#""error""#),
+            "child MCP approval is not rejected: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_mcp_cancel_resolves_parent_confirmation() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+            r#"{"jsonrpc":"2.0","id":32,"method":"mcpServer/elicitation/request","params":{"threadId":"child","serverName":"plugin:sd07-live-qa:safe-echo","mode":"form","message":"Allow child safe echo?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","tool_name":"safe_echo"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"threadId":"child","requestId":32}}"#,
+        ])
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SessionEvent::Permission { request_id, .. } if request_id == &format!("{ELICIT_PREFIX}32")
+            )),
+            "child request surfaces in the parent: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SessionEvent::PermissionResolved { request_id, .. } if request_id == "32"
+            )),
+            "child cancellation clears the parent confirmation: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -5537,21 +6510,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collab_agent_maps_to_subagent_update() {
-        // A codex collab/spawned agent item → SubagentUpdate (§6b b1) — the same
-        // canonical subagent channel claude Task/Workflow uses. The spawn-in-flight
-        // frame carries an EMPTY agentsStates → fall back to the tool-call id so the
-        // action still surfaces (Running, no parent yet).
+    async fn collab_tool_without_receiver_is_not_a_subagent() {
+        // Empty receiver/state sets describe a parent collab operation (wait/list),
+        // not a child thread. Keep the tool card and never invent a child ref from
+        // the call id.
         let events = drive_codex(&[
-            r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"type":"collabAgentToolCall","id":"agent-9","model":"o3"},"threadId":"th1","turnId":"t1"}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"collabAgentToolCall","id":"call_070055264322442a9ffc26ff54b874c5","tool":"wait","status":"completed","senderThreadId":"01a120cc-parent","receiverThreadIds":[],"receiverAgents":[],"agentsStates":{}},"threadId":"01a120cc-parent","turnId":"t1"}}"#,
         ])
         .await;
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                SessionEvent::SubagentUpdate { r#ref, status: SubagentStatus::Running, .. } if r#ref == "agent-9"
+                SessionEvent::ToolCall { tool_use_id, name, .. }
+                    if tool_use_id == "call_070055264322442a9ffc26ff54b874c5" && name == "wait_agent"
             )),
-            "collabAgentToolCall (empty agentsStates) → SubagentUpdate keyed by item.id, got {events:?}"
+            "collab operation should remain visible as a parent tool, got {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::ToolResult { tool_use_id, is_error: false, .. }
+                if tool_use_id == "call_070055264322442a9ffc26ff54b874c5"
+        )));
+        assert!(
+            !events.iter().any(|e| matches!(e, SessionEvent::SubagentUpdate { .. })),
+            "an empty collab receiver set must not create a child, got {events:?}"
         );
     }
 
@@ -5574,9 +6556,9 @@ mod tests {
                     r#ref,
                     status: SubagentStatus::PendingInit,
                     parent_ref: Some(p),
-                    label: Some(l),
+                    label: None,
                     kind: None,
-                } if r#ref == "019eabea-child" && p == "019eabe9-parent" && l == "openai.gpt-5.5"
+                } if r#ref == "019eabea-child" && p == "019eabe9-parent"
             )),
             "real collab frame → SubagentUpdate keyed by CHILD thread, status from agentsStates, parent edge from senderThreadId, got {events:?}"
         );
@@ -5588,6 +6570,47 @@ mod tests {
                 .any(|e| matches!(e, SessionEvent::SubagentUpdate { r#ref, .. } if r#ref == "call_2")),
             "with a known child thread, the tool-call id must not also surface as a roster entry, got {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_activity_uses_thread_identity_and_path_label() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"subAgentActivity","id":"call_spawn","kind":"started","agentThreadId":"01a120cc-child","agentPath":"/root/qa_alpha"},"threadId":"01a120cc-parent","turnId":"t1"}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"subAgentActivity","id":"subagent-completed-1","kind":"completed","agentThreadId":"01a120cc-child","agentPath":"/root/qa_alpha"},"threadId":"01a120cc-parent","turnId":"t1"}}"#,
+        ])
+        .await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentUpdate {
+                r#ref,
+                label: Some(label),
+                status: SubagentStatus::Running,
+                parent_ref: Some(parent),
+                ..
+            } if r#ref == "01a120cc-child" && label == "qa_alpha" && parent == "01a120cc-parent"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentUpdate {
+                r#ref,
+                label: Some(label),
+                status: SubagentStatus::Completed,
+                ..
+            } if r#ref == "01a120cc-child" && label == "qa_alpha"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolCall { tool_use_id, name, .. }
+                if tool_use_id == "call_spawn" && name == "spawn_agent"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResult { tool_use_id, .. } if tool_use_id == "call_spawn"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentUpdate { r#ref, .. } if r#ref.starts_with("call_")
+        )));
     }
 
     #[test]
@@ -5684,6 +6707,29 @@ mod tests {
         assert!(
             written.contains(r#""id":5"#),
             "keyed by the stripped wire id (numeric), got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_answer_permission_elicit_rejects_without_form_content() {
+        let fake = fake_with_binding("th-1", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id: format!("{ELICIT_PREFIX}6"),
+                decision: super::super::types::PermissionDecision::Denied,
+                selected: None,
+                answers: vec![],
+            })
+            .await
+            .expect("rejection accepted");
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""action":"decline""#), "got: {written}");
+        assert!(written.contains(r#""content":null"#), "got: {written}");
+        assert!(
+            !written.contains(r#""_meta""#),
+            "rejection grants no persistence: {written}"
         );
     }
 
@@ -6580,12 +7626,49 @@ mod tests {
             "carries the discovered colon-prefixed profile id verbatim, got: {written}"
         );
         assert!(
+            written.contains(r#""approvalPolicy":"never""#),
+            "full access stays unattended when the profile is applied, got: {written}"
+        );
+        assert!(
             !written.contains(r#""collaborationMode""#),
             "must NOT send the old collaborationMode object, got: {written}"
         );
         assert!(
             !written.contains(r#""permissions":"danger-full-access""#),
             "must NOT strip the mandatory leading colon, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_mode_preserves_auto_and_read_only_approval_semantics() {
+        let fake = fake_with_binding("th-auto", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-auto", Box::new(fake)).await;
+
+        backend
+            .dispatch(Command::SetMode { mode: "auto".into() })
+            .await
+            .expect("auto accepted");
+        backend
+            .dispatch(Command::SetMode {
+                mode: "read-only".into(),
+            })
+            .await
+            .expect("read-only accepted");
+
+        let written = captured_str(&captured).await;
+        let frames: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON-RPC frame"))
+            .collect();
+        assert_eq!(frames[0]["params"]["permissions"], "ellmsha-workspace-network");
+        assert_eq!(frames[0]["params"]["approvalPolicy"], "never");
+        assert_eq!(frames[1]["params"]["permissions"], "ellmsha-read-network");
+        assert_eq!(frames[1]["params"]["approvalPolicy"], "on-request");
+        assert_eq!(
+            backend.wake.config_snapshot().approval_policy.as_deref(),
+            Some("on-request"),
+            "idle resume keeps the most recently selected permission policy"
         );
     }
 
@@ -6619,6 +7702,16 @@ mod tests {
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         backend
+            .discovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .modes
+            .push(crate::capability::ModeInfo {
+                id: ":team-review".into(),
+                name: "Team Review".into(),
+                description: None,
+            });
+        backend
             .dispatch(Command::SetMode {
                 mode: ":team-review".into(),
             })
@@ -6628,6 +7721,36 @@ mod tests {
         assert!(
             written.contains(r#""permissions":":team-review""#),
             "custom profile id reaches the wire verbatim, got: {written}"
+        );
+        assert!(
+            !written.contains(r#""approvalPolicy""#),
+            "custom profile owns its policy after the production resume reset, got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_mode_rejects_unknown_custom_profile_before_mutating_resume_config() {
+        let fake = fake_with_binding("th-custom-stale", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-custom-stale", Box::new(fake)).await;
+        let before = backend.wake.config_snapshot();
+
+        let error = backend
+            .dispatch(Command::SetMode {
+                mode: ":stale-profile".into(),
+            })
+            .await
+            .expect_err("an undiscovered custom profile must be rejected");
+
+        assert!(matches!(error, BackendError::Transport(message) if message.contains(":stale-profile")));
+        assert_eq!(
+            backend.wake.config_snapshot(),
+            before,
+            "failed validation cannot poison a later wake"
+        );
+        assert!(
+            captured_str(&captured).await.is_empty(),
+            "validation failure writes no settings frame"
         );
     }
 
@@ -6698,7 +7821,7 @@ mod tests {
             .expect("plan normalizes to :workspace, accepted");
         let written = captured_str(&captured).await;
         assert!(
-            written.contains(r#""permissions":":workspace""#),
+            written.contains(r#""permissions":"ellmsha-workspace-network""#),
             "the obsolete `plan` token normalizes to the default workspace profile, got: {written}"
         );
     }
@@ -6832,6 +7955,64 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, SessionEvent::TurnResult { .. }))
             .count()
+    }
+
+    #[tokio::test]
+    async fn child_thread_events_do_not_rebind_or_finish_parent_turn() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"parent","turn":{"id":"parent-turn"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"child"}}}"#,
+            r#"{"jsonrpc":"2.0","id":17,"method":"item/commandExecution/requestApproval","params":{"threadId":"child","command":"echo child"}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"child","turnId":"child-turn","itemId":"child-message","delta":"child output"}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"parent","turnId":"parent-turn","itemId":"parent-message","delta":"parent continues"}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"parent","turn":{"id":"parent-turn","status":"completed"}}}"#,
+        ])
+        .await;
+
+        let bindings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::BackendBound { backend_session_id } => backend_session_id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            vec!["parent"],
+            "child thread/started must not overwrite the root binding"
+        );
+        assert_eq!(
+            count_turn_results(&events),
+            1,
+            "only the parent completion terminates the parent turn"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentStream { r#ref, event }
+                if r#ref == "child" && matches!(event.as_ref(), SessionEvent::MessageDelta { text, .. } if text == "child output")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentStream { r#ref, event }
+                if r#ref == "child" && matches!(event.as_ref(), SessionEvent::TurnResult { .. })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::SubagentStream { r#ref, event }
+                if r#ref == "child" && matches!(event.as_ref(), SessionEvent::AdapterSpecific { tag, .. } if tag == "codex_child_reverse_rpc_rejected")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Permission { .. })),
+            "child approvals must never enter the parent permission state"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::MessageDelta { text, .. } if text == "parent continues"
+        )));
     }
 
     /// R8 — turn/completed arrives FIRST, then status→idle. Exactly one
@@ -6979,6 +8160,40 @@ mod tests {
     /// (model/list comes AFTER thread/start), so a requested model is applied later
     /// via a validated `SetModel` (`reconcile_codex_model`), never here.
     #[test]
+    fn network_profiles_keep_filesystem_tiers_and_custom_policy() {
+        for (mode, sandbox, profile, parent) in [
+            ("auto", "workspace-write", "ellmsha-workspace-network", ":workspace"),
+            ("read-only", "read-only", "ellmsha-read-network", ":read-only"),
+        ] {
+            let config = SessionConfig {
+                mode: Some(mode.into()),
+                sandbox_mode: Some(sandbox.into()),
+                ..Default::default()
+            };
+            for params in [
+                thread_start_params(&config).0,
+                thread_resume_params(&config, "thread-1").0,
+                thread_fork_params(&config, "thread-1", None).0,
+            ] {
+                assert_eq!(params["permissions"], profile);
+                assert_eq!(params["config"]["default_permissions"], profile);
+                assert_eq!(params["config"]["permissions"][profile]["extends"], parent);
+                assert_eq!(params["config"]["permissions"][profile]["network"]["enabled"], true);
+                assert!(params.get("sandbox").is_none());
+            }
+            assert_eq!(codex_perm::profile_id_to_legacy_value(profile), mode);
+        }
+        let custom = thread_start_params(&SessionConfig {
+            mode: Some(":private".into()),
+            ..Default::default()
+        })
+        .0;
+        assert_eq!(custom["permissions"], ":private");
+        assert!(custom.get("sandbox").is_none());
+        assert_eq!(codex_perm::network_profile_id(":private"), ":private");
+    }
+
+    #[test]
     fn thread_start_frame_threads_cwd_and_never_model() {
         let frame = thread_start_params(&SessionConfig {
             cwd: Some("/work".into()),
@@ -6994,16 +8209,22 @@ mod tests {
              (applied post-discovery via a validated SetModel instead)"
         );
         assert_eq!(frame["params"]["approvalPolicy"], "on-request");
-        assert_eq!(frame["params"]["sandbox"], "workspace-write");
+        assert_eq!(frame["params"]["permissions"], "ellmsha-workspace-network");
         // omitted when config has neither
         let bare = thread_start_params(&SessionConfig::default()).into_frame(3, "thread/start");
         assert!(bare["params"].get("cwd").is_none());
         assert!(bare["params"].get("model").is_none());
-        // Wave 0c: a default (empty) init carries NO config/baseInstructions — the
-        // pre-0c thread/start is byte-identical for conversations with no MCP/preset.
+        assert_eq!(
+            bare["params"]["config"]["permissions"]["ellmsha-workspace-network"]["extends"],
+            ":workspace"
+        );
+        assert_eq!(
+            bare["params"]["config"]["permissions"]["ellmsha-workspace-network"]["network"]["enabled"],
+            true
+        );
         assert!(
-            bare["params"].get("config").is_none(),
-            "empty init → no config override"
+            bare["params"].get("sandbox").is_none(),
+            "profiles and sandbox are mutually exclusive"
         );
         assert!(bare["params"].get("baseInstructions").is_none());
     }
@@ -7011,10 +8232,13 @@ mod tests {
     #[test]
     fn builtin_memory_auto_policy_preserves_sandbox_and_other_tool_policies() {
         let mut config = SessionConfig::default();
+        config.mode = Some("auto".into());
+        config.approval_policy = Some("never".into());
         config.init.mcp_servers = ["ellmsha-tencentdb-memory", "user-server"]
             .into_iter()
             .map(|name| crate::backend::McpServerSpec {
                 name: name.into(),
+                auto_approve_in_unattended: false,
                 transport: crate::backend::McpTransport::Stdio {
                     command: "node".into(),
                     args: vec![],
@@ -7032,14 +8256,323 @@ mod tests {
                 .get("default_tools_approval_mode")
                 .is_none()
         );
-        assert_eq!(frame["params"]["approvalPolicy"], "on-request");
-        assert_eq!(frame["params"]["sandbox"], "workspace-write");
+        assert_eq!(frame["params"]["approvalPolicy"], mcp_only_approval_policy());
+        assert_eq!(frame["params"]["permissions"], "ellmsha-workspace-network");
+        config.mode = Some("read-only".into());
         config.sandbox_mode = Some("read-only".into());
+        config.approval_policy = Some("on-request".into());
         let frame = thread_resume_params(&config, "existing").into_frame(2, "thread/resume");
         assert!(
             frame["params"]["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]
                 .get("default_tools_approval_mode")
                 .is_none()
+        );
+
+        config.mode = Some(":team-review".into());
+        config.sandbox_mode = None;
+        config.approval_policy = None;
+        let custom = thread_resume_params(&config, "existing").into_frame(3, "thread/resume");
+        assert_eq!(custom["params"]["permissions"], ":team-review");
+        assert!(custom["params"].get("sandbox").is_none());
+        assert!(custom["params"].get("approvalPolicy").is_none());
+        assert!(
+            custom["params"]["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]
+                .get("default_tools_approval_mode")
+                .is_none(),
+            "custom/manual profiles never inherit Auto's native-memory trust"
+        );
+    }
+
+    #[test]
+    fn enabled_plugin_mcp_is_auto_approved_only_in_builtin_auto_mode() {
+        use crate::backend::{McpServerSpec, McpTransport};
+        let server = |name: &str, trusted| McpServerSpec {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            auto_approve_in_unattended: trusted,
+        };
+        let mut config = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            ..Default::default()
+        };
+        config.init.mcp_servers = vec![
+            server("plugin:sd05-fixture:safe-echo", true),
+            server("ordinary-user-mcp", false),
+        ];
+
+        let auto = thread_start_params(&config).0;
+        assert_eq!(
+            auto["config"]["mcp_servers"]["plugin:sd05-fixture:safe-echo"]["default_tools_approval_mode"],
+            "approve"
+        );
+        assert!(
+            auto["config"]["mcp_servers"]["ordinary-user-mcp"]
+                .get("default_tools_approval_mode")
+                .is_none(),
+            "Auto must not approve an unrelated user-configured MCP server"
+        );
+        assert_eq!(
+            auto["approvalPolicy"],
+            mcp_only_approval_policy(),
+            "Auto keeps shell/file approvals disabled while allowing an untrusted MCP to ask the user"
+        );
+
+        config.mode = Some("read-only".into());
+        config.approval_policy = Some("on-request".into());
+        config.sandbox_mode = Some("read-only".into());
+        let manual = thread_resume_params(&config, "thread-1").0;
+        assert!(
+            manual["config"]["mcp_servers"]["plugin:sd05-fixture:safe-echo"]
+                .get("default_tools_approval_mode")
+                .is_none(),
+            "manual/read-only mode retains Codex's MCP approval boundary"
+        );
+
+        config.mode = Some(":team-review".into());
+        config.approval_policy = None;
+        config.sandbox_mode = None;
+        let custom = thread_resume_params(&config, "thread-1").0;
+        assert!(
+            custom["config"]["mcp_servers"]["plugin:sd05-fixture:safe-echo"]
+                .get("default_tools_approval_mode")
+                .is_none(),
+            "custom profiles retain their own MCP approval policy"
+        );
+    }
+
+    #[test]
+    fn imported_mcp_uses_mcp_only_prompt_policy_for_fresh_resume_and_fork() {
+        use crate::backend::{McpServerSpec, McpTransport};
+        let config = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            init: crate::backend::SessionInit {
+                mcp_servers: vec![McpServerSpec {
+                    name: "plugin:sd07-live-qa:safe-echo".into(),
+                    transport: McpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec!["safe-echo.mjs".into()],
+                        env: vec![],
+                    },
+                    auto_approve_in_unattended: false,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for params in [
+            thread_start_params(&config).0,
+            thread_resume_params(&config, "thread-1").0,
+            thread_fork_params(&config, "thread-1", Some("turn-1")).0,
+        ] {
+            assert_eq!(params["approvalPolicy"], mcp_only_approval_policy());
+            assert_eq!(params["permissions"], "ellmsha-workspace-network");
+            assert_eq!(
+                params["config"]["permissions"]["ellmsha-workspace-network"]["network"]["enabled"],
+                true
+            );
+            assert!(
+                params["config"]["mcp_servers"]["plugin:sd07-live-qa:safe-echo"]
+                    .get("default_tools_approval_mode")
+                    .is_none(),
+                "imported MCP remains untrusted and must prompt"
+            );
+        }
+    }
+
+    /// A real fresh open performs a second permission write after
+    /// permissionProfile/list validates the persisted Auto mode. That write must
+    /// preserve the imported MCP elicitation gate established by thread/start;
+    /// serializing the built-in profile's raw `never` policy here makes every
+    /// imported MCP call fail before the UI can display an approval request.
+    #[tokio::test]
+    async fn fresh_mode_reconcile_preserves_imported_mcp_prompt_policy() {
+        use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+
+        let responses = concat!(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"fresh-imported-mcp"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"fresh-imported-mcp"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":4,"result":{"data":[{"id":":read-only","description":null},{"id":":workspace","description":null},{"id":":danger-full-access","description":null}],"nextCursor":null}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![responses]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-fresh-imported-mcp", Box::new(fake)).await;
+        *backend.wake.config.write().unwrap() = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            init: SessionInit {
+                mcp_servers: vec![McpServerSpec {
+                    name: "plugin:sd07-live-qa:sd07-live-echo".into(),
+                    transport: McpTransport::Stdio {
+                        command: "node".into(),
+                        args: vec!["safe-echo.mjs".into()],
+                        env: vec![],
+                    },
+                    auto_approve_in_unattended: false,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        backend
+            .run_handshake(HandshakeMode::Fresh)
+            .await
+            .expect("fresh handshake writes");
+        release();
+        for _ in 0..40 {
+            let mode_ready = !backend
+                .discovered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .modes
+                .is_empty();
+            if mode_ready && backend.thread_binding.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        reconcile_codex_mode(&backend, "auto".into()).await;
+        let written = captured_str(&captured).await;
+        let frames: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON-RPC frame"))
+            .collect();
+        let start = frames
+            .iter()
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("fresh thread/start frame");
+        let reconcile = frames
+            .iter()
+            .find(|frame| frame["method"] == "thread/settings/update" && frame["params"].get("permissions").is_some())
+            .expect("post-discovery mode reconcile frame");
+        assert_eq!(start["params"]["approvalPolicy"], mcp_only_approval_policy());
+        assert_eq!(reconcile["params"]["approvalPolicy"], mcp_only_approval_policy());
+        assert_eq!(reconcile["params"]["permissions"], "ellmsha-workspace-network");
+        assert_ne!(reconcile["params"]["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn trusted_only_mcp_keeps_builtin_auto_policy() {
+        let config = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            init: crate::backend::SessionInit {
+                mcp_servers: vec![crate::backend::McpServerSpec {
+                    name: "ellmsha-tencentdb-memory".into(),
+                    transport: crate::backend::McpTransport::Stdio {
+                        command: "memory".into(),
+                        args: vec![],
+                        env: vec![],
+                    },
+                    auto_approve_in_unattended: false,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let params = thread_start_params(&config).0;
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(
+            params["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]["default_tools_approval_mode"],
+            "approve"
+        );
+    }
+
+    #[test]
+    fn live_mode_recipe_respawns_across_plugin_mcp_trust_boundary() {
+        use crate::backend::{McpServerSpec, McpTransport};
+        let mut config = SessionConfig {
+            mode: Some("auto".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            approval_policy: Some("never".into()),
+            ..Default::default()
+        };
+        config.init.mcp_servers.push(McpServerSpec {
+            name: "plugin:sd05-fixture:safe-echo".into(),
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![],
+                env: vec![],
+            },
+            auto_approve_in_unattended: true,
+        });
+        let wake = CodexWakeRecipe {
+            spawner: None,
+            config: std::sync::RwLock::new(config),
+        };
+
+        assert!(wake.update_mode(":read-only"));
+        assert!(
+            thread_resume_params(&wake.config_snapshot(), "thread-1").0["config"]
+                ["mcp_servers"]["plugin:sd05-fixture:safe-echo"]
+                .get("default_tools_approval_mode")
+                .is_none()
+        );
+        assert!(wake.update_mode(":workspace"));
+        assert_eq!(
+            thread_resume_params(&wake.config_snapshot(), "thread-1").0["config"]["mcp_servers"]["plugin:sd05-fixture:safe-echo"]
+                ["default_tools_approval_mode"],
+            "approve"
+        );
+    }
+
+    #[test]
+    fn live_mode_recipe_tracks_memory_trust_boundaries_for_resume() {
+        let mut config = SessionConfig {
+            mode: Some("auto".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            approval_policy: Some("never".into()),
+            ..Default::default()
+        };
+        config.init.mcp_servers.push(crate::backend::McpServerSpec {
+            name: "ellmsha-tencentdb-memory".into(),
+            auto_approve_in_unattended: false,
+            transport: crate::backend::McpTransport::Stdio {
+                command: "memory".into(),
+                args: vec![],
+                env: vec![],
+            },
+        });
+        let wake = CodexWakeRecipe {
+            spawner: None,
+            config: std::sync::RwLock::new(config),
+        };
+
+        assert!(wake.update_mode(":read-only"), "Auto to read-only revokes memory trust");
+        let read_only = thread_resume_params(&wake.config_snapshot(), "thread-1").0;
+        assert_eq!(read_only["approvalPolicy"], "on-request");
+        assert_eq!(read_only["permissions"], "ellmsha-read-network");
+        assert!(
+            read_only["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]
+                .get("default_tools_approval_mode")
+                .is_none()
+        );
+
+        assert!(wake.update_mode(":workspace"), "read-only to Auto grants memory trust");
+        let auto = thread_resume_params(&wake.config_snapshot(), "thread-1").0;
+        assert_eq!(auto["approvalPolicy"], "never");
+        assert_eq!(auto["permissions"], "ellmsha-workspace-network");
+        assert_eq!(
+            auto["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]["default_tools_approval_mode"],
+            "approve"
         );
     }
 
@@ -7070,7 +8603,7 @@ mod tests {
         })
         .into_frame(3, "thread/start");
         assert_eq!(
-            ro["params"]["sandbox"], "read-only",
+            ro["params"]["permissions"], "ellmsha-read-network",
             "a read-only conversation must launch its thread under the read-only sandbox"
         );
     }
@@ -7095,7 +8628,7 @@ mod tests {
             "a resolved approval_policy overrides the on-request default"
         );
         // sandbox keeps its default when only approval_policy is set.
-        assert_eq!(frame["params"]["sandbox"], "workspace-write");
+        assert_eq!(frame["params"]["permissions"], "ellmsha-workspace-network");
     }
 
     /// Wave 0c: MCP servers reach codex via `config.mcp_servers` (a MAP keyed by
@@ -7111,6 +8644,7 @@ mod tests {
                 mcp_servers: vec![
                     McpServerSpec {
                         name: "fs".into(),
+                        auto_approve_in_unattended: false,
                         transport: McpTransport::Stdio {
                             command: "/usr/bin/node".into(),
                             args: vec!["s.js".into()],
@@ -7119,6 +8653,7 @@ mod tests {
                     },
                     McpServerSpec {
                         name: "remote".into(),
+                        auto_approve_in_unattended: false,
                         transport: McpTransport::Http {
                             url: "https://mcp.example/api".into(),
                             headers: vec![],
@@ -7142,6 +8677,234 @@ mod tests {
         assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
     }
 
+    #[test]
+    fn built_in_browser_gets_live_bridge_env_at_codex_provider_boundary() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let servers = vec![McpServerSpec {
+            name: BUILTIN_BROWSER_MCP_NAME.into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["/app/out/main/builtin-mcp-browser.js".into()],
+                env: vec![
+                    (BROWSER_CDP_PORT_ENV.into(), "stale-port".into()),
+                    (BROWSER_CDP_TOKEN_ENV.into(), "stale-token".into()),
+                ],
+            },
+        }];
+        let value = build_codex_mcp_servers_with_env(&servers, |key| match key {
+            BUILTIN_BROWSER_MCP_PATH_ENV => Some("/app/out/main/builtin-mcp-browser.js".into()),
+            BROWSER_CDP_PORT_ENV => Some("60698".into()),
+            BROWSER_CDP_TOKEN_ENV => Some("current-token".into()),
+            _ => None,
+        });
+        let env = &value[BUILTIN_BROWSER_MCP_NAME]["env"];
+        assert_eq!(env[BROWSER_CDP_PORT_ENV], "60698");
+        assert_eq!(env[BROWSER_CDP_TOKEN_ENV], "current-token");
+    }
+
+    #[test]
+    fn builtin_browser_auto_approves_only_lifecycle_and_read_selection_tools() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let launcher = "/app/out/main/builtin-mcp-browser.js";
+        let browser = McpServerSpec {
+            name: BUILTIN_BROWSER_MCP_NAME.into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec![launcher.into()],
+                env: vec![],
+            },
+        };
+        let serialize = |auto_approval| {
+            build_codex_mcp_servers_with_env_and_approval(&[browser.clone()], auto_approval, |key| {
+                (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| launcher.into())
+            })
+        };
+
+        let auto = serialize(true);
+        let server = &auto[BUILTIN_BROWSER_MCP_NAME];
+        assert!(server.get("default_tools_approval_mode").is_none());
+        assert_eq!(server["tools"].as_object().expect("per-tool approval map").len(), 13);
+        for name in BUILTIN_BROWSER_LIFECYCLE_AUTO_TOOLS
+            .into_iter()
+            .chain(BUILTIN_BROWSER_OBSERVATION_AUTO_TOOLS)
+        {
+            assert_eq!(server["tools"][name]["approval_mode"], "approve");
+        }
+        for protected in [
+            "take_snapshot_to_file",
+            "take_screenshot",
+            "get_network_request",
+            "navigate_page",
+            "click",
+            "fill",
+            "evaluate_script",
+        ] {
+            assert!(
+                server["tools"].get(protected).is_none(),
+                "browser actions and file-output tools must retain Codex's normal approval policy"
+            );
+        }
+
+        let manual = serialize(false);
+        assert!(
+            manual[BUILTIN_BROWSER_MCP_NAME].get("tools").is_none(),
+            "manual modes must retain Codex's normal MCP approval policy"
+        );
+    }
+
+    #[test]
+    fn browser_auto_approval_requires_exact_app_owned_launcher_identity() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let trusted_launcher = "/app/out/main/builtin-mcp-browser.js";
+        let server = |name: &str, command: &str, launcher: &str| McpServerSpec {
+            name: name.into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: vec![launcher.into()],
+                env: vec![],
+            },
+        };
+        let cases = [
+            server("untrusted-browser", "node", trusted_launcher),
+            server(BUILTIN_BROWSER_MCP_NAME, "node", "/tmp/lookalike.js"),
+            server(BUILTIN_BROWSER_MCP_NAME, "node", "/tmp/builtin-mcp-browser.js"),
+            server(BUILTIN_BROWSER_MCP_NAME, "/tmp/node", trusted_launcher),
+            McpServerSpec {
+                name: BUILTIN_BROWSER_MCP_NAME.into(),
+                auto_approve_in_unattended: false,
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec![trusted_launcher.into()],
+                    env: vec![("NODE_OPTIONS".into(), "--require=/tmp/injected.js".into())],
+                },
+            },
+        ];
+
+        for candidate in cases {
+            let config = SessionConfig {
+                approval_policy: Some("never".into()),
+                sandbox_mode: Some("workspace-write".into()),
+                init: crate::backend::SessionInit {
+                    mcp_servers: vec![candidate.clone()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let serialized = build_codex_mcp_servers_with_env_and_approval(&[candidate.clone()], true, |key| {
+                (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| trusted_launcher.into())
+            });
+            assert!(serialized[&candidate.name].get("tools").is_none());
+            assert!(serialized[&candidate.name]["env"].get(BROWSER_CDP_TOKEN_ENV).is_none());
+            assert!(serialized[&candidate.name]["env"].get(BROWSER_CDP_PORT_ENV).is_none());
+            assert!(!trusted_mcp_auto_approved_with_launcher(
+                &config,
+                Some(trusted_launcher)
+            ));
+        }
+
+        let trusted = server(BUILTIN_BROWSER_MCP_NAME, "node", trusted_launcher);
+        let config = SessionConfig {
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("workspace-write".into()),
+            init: crate::backend::SessionInit {
+                mcp_servers: vec![trusted],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(trusted_mcp_auto_approved_with_launcher(&config, Some(trusted_launcher)));
+        assert!(!trusted_mcp_auto_approved_with_launcher(&config, None));
+    }
+
+    #[test]
+    fn browser_bridge_env_is_not_exposed_to_lookalike_mcp_servers() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let serialize = |server| {
+            build_codex_mcp_servers_with_env(&[server], |key| match key {
+                BUILTIN_BROWSER_MCP_PATH_ENV => Some("/app/out/main/builtin-mcp-browser.js".into()),
+                BROWSER_CDP_PORT_ENV | BROWSER_CDP_TOKEN_ENV => Some("secret".into()),
+                _ => None,
+            })
+        };
+        let cases = vec![
+            McpServerSpec {
+                name: "untrusted-browser".into(),
+                auto_approve_in_unattended: false,
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec!["/app/out/main/builtin-mcp-browser.js".into()],
+                    env: vec![],
+                },
+            },
+            McpServerSpec {
+                name: BUILTIN_BROWSER_MCP_NAME.into(),
+                auto_approve_in_unattended: false,
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec!["/tmp/lookalike.js".into()],
+                    env: vec![],
+                },
+            },
+            McpServerSpec {
+                name: BUILTIN_BROWSER_MCP_NAME.into(),
+                auto_approve_in_unattended: false,
+                transport: McpTransport::Stdio {
+                    command: "node".into(),
+                    args: vec!["/tmp/builtin-mcp-browser.js".into()],
+                    env: vec![],
+                },
+            },
+            McpServerSpec {
+                name: BUILTIN_BROWSER_MCP_NAME.into(),
+                auto_approve_in_unattended: false,
+                transport: McpTransport::Stdio {
+                    command: "/tmp/node".into(),
+                    args: vec!["/app/out/main/builtin-mcp-browser.js".into()],
+                    env: vec![],
+                },
+            },
+        ];
+        for server in cases {
+            let name = server.name.clone();
+            let value = serialize(server);
+            assert!(value[name]["env"].as_object().expect("stdio env map").is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_live_bridge_env_removes_stale_browser_values() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let servers = vec![McpServerSpec {
+            name: BUILTIN_BROWSER_MCP_NAME.into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["builtin-mcp-browser.js".into()],
+                env: vec![
+                    (BROWSER_CDP_PORT_ENV.into(), "old-port".into()),
+                    (BROWSER_CDP_TOKEN_ENV.into(), "old-token".into()),
+                ],
+            },
+        }];
+        let value = build_codex_mcp_servers_with_env(&servers, |key| {
+            (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| "builtin-mcp-browser.js".into())
+        });
+        assert!(
+            value[BUILTIN_BROWSER_MCP_NAME]["env"]
+                .as_object()
+                .expect("stdio env map")
+                .is_empty()
+        );
+    }
+
     /// thread/resume re-sends the FULL thread/start override surface + threadId.
     /// LIVE-confirmed (0.144.1, `samples/codex-cli/0.144.1/_probe_resume_mcp.py`):
     /// a bare `{threadId}` resume drops the user's MCP servers (inventory EMPTY)
@@ -7158,6 +8921,7 @@ mod tests {
             init: SessionInit {
                 mcp_servers: vec![McpServerSpec {
                     name: "fs".into(),
+                    auto_approve_in_unattended: false,
                     transport: McpTransport::Stdio {
                         command: "/usr/bin/node".into(),
                         args: vec!["s.js".into()],
@@ -7184,8 +8948,166 @@ mod tests {
         // baseInstructions keys (mirrors the bare thread/start shape).
         let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
         assert_eq!(bare["params"]["threadId"], "th-2");
-        assert!(bare["params"].get("config").is_none());
+        assert_eq!(
+            bare["params"]["config"]["permissions"]["ellmsha-workspace-network"]["network"]["enabled"],
+            true
+        );
         assert!(bare["params"].get("baseInstructions").is_none());
+    }
+
+    #[test]
+    fn thread_resume_restores_auto_policy_and_native_memory_catalog() {
+        use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+        let config = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            init: SessionInit {
+                mcp_servers: vec![McpServerSpec {
+                    name: "ellmsha-tencentdb-memory".into(),
+                    auto_approve_in_unattended: false,
+                    transport: McpTransport::Stdio {
+                        command: "/usr/bin/node".into(),
+                        args: vec!["memory-server.js".into()],
+                        env: vec![],
+                    },
+                }],
+                resume: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let frame = thread_resume_params(&config, "existing-thread").into_frame(9, "thread/resume");
+        assert_eq!(frame["params"]["threadId"], "existing-thread");
+        assert_eq!(frame["params"]["approvalPolicy"], "never");
+        assert_eq!(frame["params"]["permissions"], "ellmsha-workspace-network");
+        assert_eq!(
+            frame["params"]["config"]["mcp_servers"]["ellmsha-tencentdb-memory"]["default_tools_approval_mode"],
+            "approve"
+        );
+    }
+
+    /// A resumed thread is pre-bound, so without a separate readiness barrier the
+    /// first turn can race ahead while Tencent is still starting and snapshot an
+    /// empty native-tool catalog. Only a connected, nonempty inventory opens it.
+    #[tokio::test]
+    async fn resumed_native_memory_waits_for_connected_catalog_before_first_turn() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            br#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"legacy-thread"}}}
+"#
+            .to_vec(),
+            br#"{"jsonrpc":"2.0","id":5,"result":{"data":[{"name":"ellmsha-tencentdb-memory","authStatus":"unsupported","runtimeStatus":"starting","tools":{},"toolsError":null,"resources":[],"resourceTemplates":[]}]}}
+"#
+            .to_vec(),
+            br#"{"jsonrpc":"2.0","id":6,"result":{"data":[{"name":"ellmsha-tencentdb-memory","authStatus":"unsupported","runtimeStatus":"connected","tools":{"tdai_scenario_read":{"name":"tdai_scenario_read","inputSchema":{"type":"object"}}},"toolsError":null,"resources":[],"resourceTemplates":[]}]}}
+"#
+            .to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-resume-memory", Box::new(fake)).await;
+        backend.wake.config.write().unwrap().init.mcp_servers = vec![McpServerSpec {
+            name: "ellmsha-tencentdb-memory".into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["memory.js".into()],
+                env: vec![],
+            },
+        }];
+
+        backend
+            .run_handshake(HandshakeMode::Resume("legacy-thread"))
+            .await
+            .expect("resume handshake writes");
+        release();
+        for _ in 0..40 {
+            if captured_str(&captured).await.contains("mcpServerStatus/list") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"mcpServerStatus/list""#), "{written}");
+        assert!(written.contains(r#""threadId":"legacy-thread""#), "{written}");
+        assert!(
+            backend
+                .bound_thread_within(std::time::Duration::from_millis(100))
+                .await
+                .is_err(),
+            "resume response alone must not open the first-turn gate"
+        );
+
+        release();
+        for _ in 0..40 {
+            if captured_str(&captured).await.matches("mcpServerStatus/list").count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            backend
+                .bound_thread_within(std::time::Duration::from_millis(100))
+                .await
+                .is_err(),
+            "transient starting inventory must keep the first-turn gate closed"
+        );
+
+        release();
+        assert_eq!(
+            backend
+                .bound_thread_within(std::time::Duration::from_secs(1))
+                .await
+                .expect("connected native catalog opens gate"),
+            "legacy-thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_resumed_native_catalog_preserves_history_anchor() {
+        use crate::backend::{McpServerSpec, McpTransport};
+
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_segments(vec![
+            br#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"legacy-thread"}}}
+"#
+            .to_vec(),
+            br#"{"jsonrpc":"2.0","id":5,"error":{"code":-32000,"message":"inventory unavailable"}}
+"#
+            .to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-resume-memory-missing", Box::new(fake)).await;
+        backend.wake.config.write().unwrap().init.mcp_servers = vec![McpServerSpec {
+            name: "ellmsha-tencentdb-memory".into(),
+            auto_approve_in_unattended: false,
+            transport: McpTransport::Stdio {
+                command: "node".into(),
+                args: vec!["memory.js".into()],
+                env: vec![],
+            },
+        }];
+
+        backend
+            .run_handshake(HandshakeMode::Resume("legacy-thread"))
+            .await
+            .expect("resume handshake writes");
+        release();
+        for _ in 0..40 {
+            if captured_str(&captured).await.contains("mcpServerStatus/list") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        release();
+        let err = backend
+            .bound_thread_within(std::time::Duration::from_secs(1))
+            .await
+            .expect_err("failed Tencent catalog must block the turn");
+        assert!(matches!(err, BackendError::SetupRejected(_)), "{err:?}");
+        assert_eq!(backend.thread_binding.lock().await.as_deref(), Some("legacy-thread"));
     }
 
     /// R4 live spawn: open_session MUST route through the INJECTED Spawner (S14,
@@ -7502,7 +9424,7 @@ mod tests {
         assert_eq!(
             workspace.description.as_deref(),
             Some(
-                "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)"
+                "Codex can read and edit workspace files, run commands, and access the internet. Filesystem access remains restricted to the workspace."
             ),
             "built-in workspace tier gets the legacy friendly description"
         );

@@ -123,8 +123,13 @@ impl StreamRelay {
         repo: Arc<dyn IConversationRepository>,
         broadcaster: Arc<dyn EventBroadcaster>,
     ) -> Self {
-        let adapter =
-            StreamPersistenceAdapter::new(user_id.clone(), conversation_id.clone(), msg_id.clone(), repo, None);
+        let adapter = StreamPersistenceAdapter::new(
+            user_id.clone(),
+            conversation_id.clone(),
+            msg_id.clone(),
+            repo.clone(),
+            None,
+        );
         Self {
             conversation_id,
             msg_id,
@@ -228,7 +233,6 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
         let mut pending_send_error: Option<AgentSendError> = None;
         let mut attempt = TurnAttemptSummary::default();
-
         loop {
             let recv_result = if send_error_done {
                 if let Some(send_error) = pending_send_error.take() {
@@ -296,6 +300,11 @@ impl StreamRelay {
                     }
 
                     match &event {
+                        // A session-lifetime BackgroundStreamWatcher owns child
+                        // transcripts, including while this parent relay is active.
+                        // Keeping one owner preserves buffered child text when the
+                        // parent turn finishes before the child.
+                        AgentStreamEvent::Subagent(_) => {}
                         AgentStreamEvent::SegmentBreak => {
                             // Intra-turn soft boundary (see AgentStreamEvent::SegmentBreak):
                             // close the current text/thinking segment so the next batch of
@@ -685,6 +694,7 @@ impl StreamRelay {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
+            AgentStreamEvent::Subagent(_) => "Subagent",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         }
     }
@@ -2809,6 +2819,7 @@ mod tests {
         conversation: Mutex<Option<aionui_db::models::ConversationRow>>,
         /// Conversation-level updates recorded by `update` (agent-title tests).
         conversation_updates: Mutex<Vec<(String, aionui_db::ConversationRowUpdate)>>,
+        created_conversations: Mutex<Vec<aionui_db::models::ConversationRow>>,
         not_found: AtomicBool,
         foreign_key_failure: AtomicBool,
     }
@@ -2820,6 +2831,7 @@ mod tests {
                 updates: Mutex::new(vec![]),
                 conversation: Mutex::new(None),
                 conversation_updates: Mutex::new(vec![]),
+                created_conversations: Mutex::new(vec![]),
                 not_found: AtomicBool::new(false),
                 foreign_key_failure: AtomicBool::new(false),
             }
@@ -2914,13 +2926,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IConversationRepository for RecordingRepo {
-        async fn get(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
-            Ok(self.conversation.lock().unwrap().clone())
+        async fn get(&self, _user_id: &str, id: &str) -> Result<Option<aionui_db::models::ConversationRow>, DbError> {
+            if let Some(created) = self
+                .created_conversations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == id)
+                .cloned()
+            {
+                return Ok(Some(created));
+            }
+            Ok(self.conversation.lock().unwrap().clone().filter(|row| row.id == id))
         }
         async fn owner_user_id(&self, _id: &str) -> Result<Option<String>, DbError> {
             Ok(Some("user-1".into()))
         }
-        async fn create(&self, _row: &aionui_db::models::ConversationRow) -> Result<(), DbError> {
+        async fn create(&self, row: &aionui_db::models::ConversationRow) -> Result<(), DbError> {
+            self.created_conversations.lock().unwrap().push(row.clone());
             Ok(())
         }
         async fn update(
@@ -3056,6 +3079,8 @@ mod tests {
             _keyword: &str,
             _page: u32,
             _page_size: u32,
+            _before_created_at: Option<aionui_common::TimestampMs>,
+            _before_message_id: Option<&str>,
         ) -> Result<aionui_common::PaginatedResult<aionui_db::MessageSearchRow>, DbError> {
             Ok(aionui_common::PaginatedResult {
                 items: vec![],

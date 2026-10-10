@@ -149,6 +149,16 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     ))
 }
 
+fn ensure_local_or_bootstrap(local: bool, headers: &HeaderMap, bootstrap_secret: Option<&str>) -> Result<(), ApiError> {
+    if local {
+        return Ok(());
+    }
+    if bootstrap_secret.is_none() {
+        return ensure_local_mode(false);
+    }
+    require_bootstrap_secret(headers, bootstrap_secret)
+}
+
 fn require_bootstrap_secret(headers: &HeaderMap, expected: Option<&str>) -> Result<(), ApiError> {
     let Some(expected) = expected else {
         return Err(ApiError::coded(
@@ -582,8 +592,13 @@ async fn list_internal_users_handler(
 
 async fn get_system_user_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<Option<InternalUserResponse>>>, ApiError> {
-    ensure_local_mode(state.local)?;
+    ensure_local_or_bootstrap(
+        state.local,
+        &headers,
+        state.bootstrap_secret.as_deref().map(AsRef::as_ref),
+    )?;
     let user = state.user_repo.get_system_user().await.map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(user.map(InternalUserResponse::from))))
 }
@@ -626,9 +641,14 @@ async fn create_internal_user_handler(
 
 async fn set_system_user_credentials_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
     body: Result<Json<SetSystemUserCredentialsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    ensure_local_mode(state.local)?;
+    ensure_local_or_bootstrap(
+        state.local,
+        &headers,
+        state.bootstrap_secret.as_deref().map(AsRef::as_ref),
+    )?;
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .user_repo
@@ -1041,8 +1061,13 @@ async fn webui_change_username_handler(
 
 async fn webui_reset_password_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
 ) -> Result<Json<ApiResponse<WebuiResetPasswordResponse>>, ApiError> {
-    ensure_local_mode(state.local)?;
+    ensure_local_or_bootstrap(
+        state.local,
+        &headers,
+        state.bootstrap_secret.as_deref().map(AsRef::as_ref),
+    )?;
 
     let user = resolve_webui_admin(&*state.user_repo).await?;
 

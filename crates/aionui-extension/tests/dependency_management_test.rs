@@ -35,6 +35,7 @@ fn ext(name: &str, version: &str, deps: &[(&str, &str)]) -> LoadedExtension {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         },
         directory: format!("/extensions/{name}"),
         source: ExtensionSource::Local,

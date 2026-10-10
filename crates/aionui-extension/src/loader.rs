@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use tracing::{debug, warn};
 
@@ -47,6 +49,62 @@ pub fn resolve_scan_paths_for_data_dir(data_dir: &Path) -> Vec<ScanPath> {
     let env_path = std::env::var("AIONUI_EXTENSIONS_PATH").ok();
     let e2e_mode = is_e2e_test_mode();
     resolve_scan_paths_inner(env_path.as_deref(), e2e_mode, Some(data_dir))
+}
+
+/// Resolve the plugin directories used by eLLMsha.
+///
+/// Built-in plugins live in the v3 repository's `plugins/` directory while
+/// user-installed plugins live in the persistent `<userData>/plugins/`
+/// directory. Legacy extension locations remain at lower priority so existing
+/// installations continue to load.
+pub fn resolve_plugin_scan_paths_for_data_dir(data_dir: &Path) -> Vec<ScanPath> {
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |path: PathBuf, source: ExtensionSource| {
+        if seen.insert(path.clone()) {
+            paths.push(ScanPath { path, source });
+        }
+    };
+
+    if let Some(env_paths) = std::env::var_os("AIONUI_EXTENSIONS_PATH") {
+        for path in std::env::split_paths(&env_paths) {
+            if !path.as_os_str().is_empty() {
+                push(path, ExtensionSource::Env);
+            }
+        }
+    }
+
+    if is_e2e_test_mode() {
+        return paths;
+    }
+
+    if let Some(path) = builtin_plugins_dir() {
+        push(path, ExtensionSource::Builtin);
+    }
+    push(data_dir.join("plugins"), ExtensionSource::Local);
+
+    for legacy in resolve_scan_paths_for_data_dir(data_dir) {
+        push(legacy.path, legacy.source);
+    }
+    paths
+}
+
+/// Persistent install target for user plugins.
+pub fn resolve_plugin_install_target_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("plugins")
+}
+
+fn builtin_plugins_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ELLM_SHA_BUILTIN_PLUGINS_PATH") {
+        return Some(PathBuf::from(path));
+    }
+
+    // In repository/dev builds CARGO_MANIFEST_DIR is
+    // `<v3>/aioncore/crates/aionui-extension`.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .map(|root| root.join("plugins"))
 }
 
 /// Resolve the install target directory using the same priority order as
@@ -179,9 +237,16 @@ fn scan_directory(dir: &Path, source: ExtensionSource) -> Vec<LoadedExtension> {
         if !entry_path.is_dir() {
             continue;
         }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with(".plugin-install-")
+            || file_name.starts_with(".plugin-repository-")
+            || file_name.starts_with(".plugin-backup-")
+        {
+            continue;
+        }
 
-        let manifest_path = entry_path.join(EXTENSION_MANIFEST_FILE);
-        match load_single_extension(&manifest_path, &entry_path, source) {
+        match load_plugin_directory(&entry_path, source) {
             Ok(ext) => {
                 debug!(name = %ext.manifest.name, dir = %entry_path.display(), "loaded extension");
                 loaded.push(ext);
@@ -201,13 +266,15 @@ fn scan_directory(dir: &Path, source: ExtensionSource) -> Vec<LoadedExtension> {
 }
 
 /// Load a single extension from its manifest file.
-fn load_single_extension(
+pub(crate) fn load_single_extension(
     manifest_path: &Path,
     ext_dir: &Path,
     source: ExtensionSource,
 ) -> Result<LoadedExtension, crate::error::ExtensionError> {
     let bytes = std::fs::read(manifest_path)?;
     let manifest = parse_manifest_in_dir(&bytes, ext_dir)?;
+    validate_extension_contribution_paths(&manifest, ext_dir)?;
+    validate_mcp_server_configs(&manifest)?;
 
     let state = ExtensionState {
         name: manifest.name.clone(),
@@ -225,6 +292,175 @@ fn load_single_extension(
         source,
         state,
     })
+}
+
+/// Load either the native eLLMsha manifest or one of the explicitly supported
+/// package conventions. Native manifests take precedence when both exist.
+pub(crate) fn load_plugin_directory(
+    ext_dir: &Path,
+    source: ExtensionSource,
+) -> Result<LoadedExtension, crate::error::ExtensionError> {
+    let native_manifest = ext_dir.join(EXTENSION_MANIFEST_FILE);
+    if native_manifest.is_file() {
+        return load_single_extension(&native_manifest, ext_dir, source);
+    }
+    if !crate::compatibility::has_compatible_manifest(ext_dir) {
+        return Err(crate::error::ExtensionError::ManifestValidation(
+            "no recognized plugin manifest".into(),
+        ));
+    }
+    let manifest = crate::compatibility::load_compatible_manifest(ext_dir)?;
+    validate_manifest_runtime(&manifest, ext_dir, source)
+}
+
+fn validate_manifest_runtime(
+    manifest: &crate::types::ExtensionManifest,
+    ext_dir: &Path,
+    source: ExtensionSource,
+) -> Result<LoadedExtension, crate::error::ExtensionError> {
+    crate::manifest::validate_manifest(manifest)?;
+    validate_extension_contribution_paths(manifest, ext_dir)?;
+    validate_mcp_server_configs(manifest)?;
+    Ok(LoadedExtension {
+        manifest: manifest.clone(),
+        directory: ext_dir.to_string_lossy().into_owned(),
+        source,
+        state: ExtensionState {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            enabled: true,
+            installed_at: None,
+            last_activated_at: None,
+        },
+    })
+}
+
+fn validate_mcp_server_configs(manifest: &crate::types::ExtensionManifest) -> Result<(), crate::error::ExtensionError> {
+    let Some(contributes) = &manifest.contributes else {
+        return Ok(());
+    };
+
+    for server in &contributes.mcp_servers {
+        let config = server.config.get("transport").unwrap_or(&server.config);
+        if config.get("type").and_then(serde_json::Value::as_str) != Some("stdio") {
+            continue;
+        }
+        let Some(command) = config.get("command").and_then(serde_json::Value::as_str) else {
+            return Err(crate::error::ExtensionError::ManifestValidation(format!(
+                "MCP server '{}' is missing a stdio command",
+                server.id
+            )));
+        };
+        let command_name = Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(command);
+        if command_name != "node" && command_name != "node.exe" {
+            continue;
+        }
+        let args = config
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        let Some(eval_index) = args.iter().position(|arg| *arg == "-e" || *arg == "--eval") else {
+            continue;
+        };
+        let Some(script) = args.get(eval_index + 1) else {
+            return Err(crate::error::ExtensionError::ManifestValidation(format!(
+                "MCP server '{}' is missing its Node eval script",
+                server.id
+            )));
+        };
+
+        let mut child = Command::new(command)
+            .args(["--check", "--input-type=module"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                crate::error::ExtensionError::ManifestValidation(format!(
+                    "MCP server '{}' Node syntax check could not start: {error}",
+                    server.id
+                ))
+            })?;
+        child.stdin.take().expect("piped stdin").write_all(script.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let reason = stderr.lines().next().unwrap_or("invalid JavaScript");
+            return Err(crate::error::ExtensionError::ManifestValidation(format!(
+                "MCP server '{}' has invalid Node eval script: {reason}",
+                server.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_extension_contribution_paths(
+    manifest: &crate::types::ExtensionManifest,
+    ext_dir: &Path,
+) -> Result<(), crate::error::ExtensionError> {
+    let canonical_dir = std::fs::canonicalize(ext_dir)?;
+    if let Some(contributes) = &manifest.contributes {
+        for skill in &contributes.skills {
+            let Some(relative_path) = &skill.path else {
+                continue;
+            };
+            let resolved = std::fs::canonicalize(ext_dir.join(relative_path)).map_err(|_| {
+                crate::error::ExtensionError::ManifestValidation(format!(
+                    "skill '{}' path does not exist: {relative_path}",
+                    skill.name
+                ))
+            })?;
+            if !resolved.starts_with(&canonical_dir) {
+                return Err(crate::error::ExtensionError::PathTraversal(relative_path.clone()));
+            }
+            crate::skill_service::validate_skill_file(&resolved)?;
+        }
+    }
+    if let Some(hooks) = &manifest.lifecycle {
+        for hook_path in [
+            hooks.on_install.as_deref(),
+            hooks.on_uninstall.as_deref(),
+            hooks.on_activate.as_deref(),
+            hooks.on_deactivate.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let declared = Path::new(hook_path);
+            if declared.is_absolute()
+                || declared.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+            {
+                return Err(crate::error::ExtensionError::PathTraversal(hook_path.to_owned()));
+            }
+            let resolved = std::fs::canonicalize(ext_dir.join(hook_path)).map_err(|_| {
+                crate::error::ExtensionError::ManifestValidation(format!(
+                    "lifecycle hook path does not exist: {hook_path}"
+                ))
+            })?;
+            if !resolved.starts_with(&canonical_dir) {
+                return Err(crate::error::ExtensionError::PathTraversal(hook_path.to_owned()));
+            }
+            if !resolved.is_file() {
+                return Err(crate::error::ExtensionError::ManifestValidation(format!(
+                    "lifecycle hook path is not a file: {hook_path}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +732,19 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    #[test]
+    fn scan_skips_plugin_install_transaction_directories() {
+        let tmp = TempDir::new().unwrap();
+        for name in [".plugin-install-stale", ".plugin-backup-stale"] {
+            let dir = tmp.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            write_manifest(&dir, "stale-transaction", "1.0.0");
+        }
+
+        let result = scan_directory(tmp.path(), ExtensionSource::Local);
+        assert!(result.is_empty());
+    }
+
     // -- load_all -------------------------------------------------------------
 
     #[test]
@@ -592,6 +841,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                compatibility: None,
             },
             directory: format!("/test/{name}"),
             source: ExtensionSource::Local,

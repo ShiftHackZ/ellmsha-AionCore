@@ -411,6 +411,8 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // SessionTitle is an agent-generated conversation title — applied by the
         // conversation layer under the name_source guard. Never a turn signal.
         | SessionEvent::SessionTitle { .. }
+        // Child-thread events share the transport but never the parent FSM.
+        | SessionEvent::SubagentStream { .. }
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }

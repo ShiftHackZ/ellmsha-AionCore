@@ -605,6 +605,8 @@ impl IConversationRepository for MockRepo {
         _keyword: &str,
         _page: u32,
         _page_size: u32,
+        _before_created_at: Option<aionui_common::TimestampMs>,
+        _before_message_id: Option<&str>,
     ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
         Ok(PaginatedResult {
             items: vec![],
@@ -2423,6 +2425,36 @@ async fn list_returns_created_conversations() {
     let result = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.total, 2);
+    assert!(result.items.iter().all(|conversation| conversation.runtime.is_some()));
+}
+
+#[tokio::test]
+async fn list_runtime_reflects_live_claim_and_ignores_stale_persisted_status() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let claim = svc.runtime_state().try_claim_turn(&conv.id, "turn-1").unwrap();
+    let active = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    let runtime = active.items[0].runtime.as_ref().unwrap();
+    assert!(runtime.is_processing);
+    assert_eq!(runtime.turn_id.as_deref(), Some("turn-1"));
+
+    drop(claim);
+    repo.update(
+        "user_1",
+        &conv.id,
+        &ConversationRowUpdate {
+            status: Some("running".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let restored = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    let runtime = restored.items[0].runtime.as_ref().unwrap();
+    assert!(!runtime.is_processing);
+    assert_eq!(runtime.turn_id, None);
 }
 
 #[tokio::test]
@@ -2951,6 +2983,8 @@ async fn search_messages_empty_keyword_returns_bad_request() {
         keyword: "".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
     assert!(matches!(err, ConversationError::BadRequest { .. }));
@@ -2964,6 +2998,23 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
         keyword: "   ".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
+    };
+    let err = svc.search_messages("user_1", query).await.unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
+}
+
+#[tokio::test]
+async fn search_messages_rejects_partial_keyset_cursor() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let query = SearchMessagesQuery {
+        keyword: "needle".into(),
+        page: None,
+        page_size: None,
+        before_created_at: Some(1234),
+        before_message_id: None,
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
     assert!(matches!(err, ConversationError::BadRequest { .. }));

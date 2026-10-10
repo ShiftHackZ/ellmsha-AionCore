@@ -1,0 +1,28 @@
+{
+  "name": "sd05-fixture",
+  "version": "1.0.0",
+  "displayName": "SD05 Fixture",
+  "description": "Minimal safe plugin used to verify eLLMsha plugin loading.",
+  "apiVersion": "1.0.0",
+  "contributes": {
+    "skills": [
+      {
+        "name": "sd05-safe-echo",
+        "description": "Use the fixture echo tool without side effects.",
+        "path": "skills/sd05-safe-echo/SKILL.md"
+      }
+    ],
+    "mcpServers": [
+      {
+        "id": "safe-echo",
+        "name": "SD05 Safe Echo",
+        "description": "Returns caller supplied text and performs no I/O.",
+        "transport": {
+          "type": "stdio",
+          "command": "node",
+          "args": ["-e", "$file:server.mjs"]
+        }
+      }
+    ]
+  }
+}

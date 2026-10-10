@@ -249,6 +249,8 @@ async fn fixture() -> Fixture {
         .unwrap();
     states.extension = ExtensionRouterState {
         registry: registry.clone(),
+        plugin_installer: None,
+        allow_machine_plugin_mutations: true,
     };
     let hub_dir = ext_data_dir.join("extensions");
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());

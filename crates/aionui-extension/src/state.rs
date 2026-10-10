@@ -34,10 +34,15 @@ struct Inner {
     states: Mutex<HashMap<String, ExtensionState>>,
     /// Per-user enabled/disabled overrides keyed by user id and extension name.
     user_states: Mutex<HashMap<String, HashMap<String, bool>>>,
+    /// Project overrides keyed by user id, project id, and extension name.
+    project_states: Mutex<HashMap<String, HashMap<String, HashMap<String, bool>>>>,
     /// Notifier used to trigger a debounced write.
     write_notify: Notify,
     /// Whether the background writer task has been spawned.
     writer_spawned: Mutex<bool>,
+    /// Serializes snapshot capture and atomic replacement across debounce and
+    /// explicit durable management writes.
+    persist_lock: Mutex<()>,
 }
 
 const EXTENSION_STATES_FILE_ENV: &str = "AIONUI_EXTENSION_STATES_FILE";
@@ -66,6 +71,8 @@ struct PersistedUserStates {
     version: u32,
     #[serde(default)]
     users: BTreeMap<String, BTreeMap<String, bool>>,
+    #[serde(default)]
+    projects: BTreeMap<String, BTreeMap<String, BTreeMap<String, bool>>>,
 }
 
 impl ExtensionStateStore {
@@ -78,8 +85,10 @@ impl ExtensionStateStore {
                 user_file_path,
                 states: Mutex::new(HashMap::new()),
                 user_states: Mutex::new(HashMap::new()),
+                project_states: Mutex::new(HashMap::new()),
                 write_notify: Notify::new(),
                 writer_spawned: Mutex::new(false),
+                persist_lock: Mutex::new(()),
             }),
         }
     }
@@ -99,7 +108,7 @@ impl ExtensionStateStore {
     /// default to enabled). Parse errors are propagated as `ExtensionError`.
     pub async fn load(&self) -> Result<HashMap<String, ExtensionState>, ExtensionError> {
         let states = load_states_from_file(&self.inner.file_path)?;
-        let mut user_states = load_user_states_from_file(&self.inner.user_file_path)?;
+        let (mut user_states, project_states) = load_user_states_from_file(&self.inner.user_file_path)?;
         user_states.entry(SYSTEM_DEFAULT_USER_ID.to_owned()).or_insert_with(|| {
             states
                 .iter()
@@ -109,6 +118,7 @@ impl ExtensionStateStore {
 
         *self.inner.states.lock().await = states.clone();
         *self.inner.user_states.lock().await = user_states;
+        *self.inner.project_states.lock().await = project_states;
         Ok(states)
     }
 
@@ -140,6 +150,26 @@ impl ExtensionStateStore {
         guard.get(user_id).cloned().unwrap_or_default()
     }
 
+    /// Return an explicit project override, if one exists.
+    pub async fn get_project_enabled(&self, user_id: &str, project_id: &str, name: &str) -> Option<bool> {
+        let guard = self.inner.project_states.lock().await;
+        guard
+            .get(user_id)
+            .and_then(|projects| projects.get(project_id))
+            .and_then(|states| states.get(name))
+            .copied()
+    }
+
+    /// Snapshot all overrides for one user/project binding.
+    pub async fn get_project_enabled_all(&self, user_id: &str, project_id: &str) -> HashMap<String, bool> {
+        let guard = self.inner.project_states.lock().await;
+        guard
+            .get(user_id)
+            .and_then(|projects| projects.get(project_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     // -----------------------------------------------------------------------
     // Write (debounced)
     // -----------------------------------------------------------------------
@@ -165,15 +195,57 @@ impl ExtensionStateStore {
 
     /// Persist an enablement override for one user without changing the
     /// machine-level installation state.
-    pub async fn set_user_enabled(&self, user_id: &str, name: &str, enabled: bool) {
-        {
+    pub async fn set_user_enabled(&self, user_id: &str, name: &str, enabled: bool) -> Result<(), ExtensionError> {
+        let previous = {
             let mut guard = self.inner.user_states.lock().await;
             guard
                 .entry(user_id.to_owned())
                 .or_default()
-                .insert(name.to_owned(), enabled);
+                .insert(name.to_owned(), enabled)
+        };
+        if let Err(error) = self.flush().await {
+            let mut guard = self.inner.user_states.lock().await;
+            let states = guard.entry(user_id.to_owned()).or_default();
+            if let Some(previous) = previous {
+                states.insert(name.to_owned(), previous);
+            } else {
+                states.remove(name);
+            }
+            return Err(error);
         }
-        self.schedule_write().await;
+        Ok(())
+    }
+
+    /// Persist an enablement override for one project. Project overrides take
+    /// precedence over the user's global plugin state.
+    pub async fn set_project_enabled(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), ExtensionError> {
+        let previous = {
+            let mut guard = self.inner.project_states.lock().await;
+            guard
+                .entry(user_id.to_owned())
+                .or_default()
+                .entry(project_id.to_owned())
+                .or_default()
+                .insert(name.to_owned(), enabled)
+        };
+        if let Err(error) = self.flush().await {
+            let mut guard = self.inner.project_states.lock().await;
+            let projects = guard.entry(user_id.to_owned()).or_default();
+            let states = projects.entry(project_id.to_owned()).or_default();
+            if let Some(previous) = previous {
+                states.insert(name.to_owned(), previous);
+            } else {
+                states.remove(name);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Remove the persisted state for an extension and schedule a write.
@@ -191,6 +263,7 @@ impl ExtensionStateStore {
 
     /// Immediately write the current in-memory states to disk (no debounce).
     pub async fn flush(&self) -> Result<(), ExtensionError> {
+        let _persist_guard = self.inner.persist_lock.lock().await;
         let state_snapshot = {
             let guard = self.inner.states.lock().await;
             guard.clone()
@@ -199,8 +272,12 @@ impl ExtensionStateStore {
             let guard = self.inner.user_states.lock().await;
             guard.clone()
         };
+        let project_snapshot = {
+            let guard = self.inner.project_states.lock().await;
+            guard.clone()
+        };
         save_states_to_file(&self.inner.file_path, &state_snapshot)?;
-        save_user_states_to_file(&self.inner.user_file_path, &user_snapshot)
+        save_user_states_to_file(&self.inner.user_file_path, &user_snapshot, &project_snapshot)
     }
 
     // -----------------------------------------------------------------------
@@ -231,6 +308,7 @@ impl ExtensionStateStore {
                 // additional notifications.
                 tokio::time::sleep(std::time::Duration::from_millis(STATE_PERSIST_DEBOUNCE_MS)).await;
 
+                let _persist_guard = inner.persist_lock.lock().await;
                 let state_snapshot = {
                     let guard = inner.states.lock().await;
                     guard.clone()
@@ -239,9 +317,13 @@ impl ExtensionStateStore {
                     let guard = inner.user_states.lock().await;
                     guard.clone()
                 };
+                let project_snapshot = {
+                    let guard = inner.project_states.lock().await;
+                    guard.clone()
+                };
 
                 if let Err(e) = save_states_to_file(&inner.file_path, &state_snapshot)
-                    .and_then(|()| save_user_states_to_file(&inner.user_file_path, &user_snapshot))
+                    .and_then(|()| save_user_states_to_file(&inner.user_file_path, &user_snapshot, &project_snapshot))
                 {
                     error!(error = %e, "failed to persist extension states");
                 } else {
@@ -268,10 +350,15 @@ fn user_state_file_path(state_file_path: &Path) -> PathBuf {
     state_file_path.with_file_name(file_name)
 }
 
-fn load_user_states_from_file(path: &Path) -> Result<HashMap<String, HashMap<String, bool>>, ExtensionError> {
+type UserStates = HashMap<String, HashMap<String, bool>>;
+type ProjectStates = HashMap<String, HashMap<String, HashMap<String, bool>>>;
+
+fn load_user_states_from_file(path: &Path) -> Result<(UserStates, ProjectStates), ExtensionError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
         Err(error) => return Err(ExtensionError::Io(error)),
     };
     let persisted: PersistedUserStates = serde_json::from_slice(&bytes)?;
@@ -282,16 +369,31 @@ fn load_user_states_from_file(path: &Path) -> Result<HashMap<String, HashMap<Str
             path.display()
         )));
     }
-    Ok(persisted
+    let users = persisted
         .users
         .into_iter()
         .map(|(user_id, states)| (user_id, states.into_iter().collect()))
-        .collect())
+        .collect();
+    let projects = persisted
+        .projects
+        .into_iter()
+        .map(|(user_id, projects)| {
+            (
+                user_id,
+                projects
+                    .into_iter()
+                    .map(|(project_id, states)| (project_id, states.into_iter().collect()))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok((users, projects))
 }
 
 fn save_user_states_to_file(
     path: &Path,
-    states: &HashMap<String, HashMap<String, bool>>,
+    states: &UserStates,
+    project_states: &ProjectStates,
 ) -> Result<(), ExtensionError> {
     if let Some(parent) = path.parent()
         && !parent.exists()
@@ -311,10 +413,34 @@ fn save_user_states_to_file(
             )
         })
         .collect();
-    let json = serde_json::to_string_pretty(&PersistedUserStates { version: 1, users })?;
+    let projects = project_states
+        .iter()
+        .map(|(user_id, project_map)| {
+            (
+                user_id.clone(),
+                project_map
+                    .iter()
+                    .map(|(project_id, extensions)| {
+                        (
+                            project_id.clone(),
+                            extensions
+                                .iter()
+                                .map(|(name, enabled)| (name.clone(), *enabled))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&PersistedUserStates {
+        version: 1,
+        users,
+        projects,
+    })?;
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, json.as_bytes())?;
-    std::fs::rename(&tmp_path, path)?;
+    replace_state_file(&tmp_path, path)?;
     Ok(())
 }
 
@@ -370,7 +496,8 @@ fn parse_states_from_bytes(path: &Path, bytes: &[u8]) -> Result<HashMap<String, 
         .collect())
 }
 
-/// Write extension states to a JSON file atomically.
+/// Write extension states through a temporary file and atomically replace the
+/// prior destination on every supported platform.
 ///
 /// Creates parent directories if they do not exist.
 pub fn save_states_to_file(path: &Path, states: &HashMap<String, ExtensionState>) -> Result<(), ExtensionError> {
@@ -401,12 +528,50 @@ pub fn save_states_to_file(path: &Path, states: &HashMap<String, ExtensionState>
 
     let json = serde_json::to_string_pretty(&PersistedStates { version: 1, extensions })?;
 
-    // Write to a temp file then rename for atomicity.
+    // Write to a temp file, then replace the prior state file.
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, json.as_bytes())?;
-    std::fs::rename(&tmp_path, path)?;
+    replace_state_file(&tmp_path, path)?;
 
     Ok(())
+}
+
+pub(crate) fn replace_state_file(tmp_path: &Path, path: &Path) -> Result<(), ExtensionError> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+        #[link(name = "Kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+        }
+
+        let existing = tmp_path.as_os_str().encode_wide().chain(once(0)).collect::<Vec<_>>();
+        let replacement = path.as_os_str().encode_wide().chain(once(0)).collect::<Vec<_>>();
+        // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that
+        // remain alive for the duration of the Win32 call.
+        let replaced = unsafe {
+            MoveFileExW(
+                existing.as_ptr(),
+                replacement.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the extension state file path using the historical AionUi rules.
@@ -611,10 +776,14 @@ mod tests {
         let mut states = HashMap::new();
         states.insert("ext-a".to_string(), make_state("ext-a", "1.0.0", true));
         save_states_to_file(&path, &states).unwrap();
+        states.insert("ext-b".to_string(), make_state("ext-b", "2.0.0", false));
+        save_states_to_file(&path, &states).unwrap();
 
         // Temp file should be cleaned up.
         let tmp_path = path.with_extension("json.tmp");
         assert!(!tmp_path.exists());
+        let reloaded = load_states_from_file(&path).unwrap();
+        assert_eq!(reloaded.len(), 2);
     }
 
     // -- ExtensionStateStore (async) ------------------------------------------

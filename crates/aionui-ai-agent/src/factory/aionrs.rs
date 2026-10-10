@@ -1840,6 +1840,7 @@ mod tests {
                 url: mock.uri(),
                 headers: HashMap::new(),
             },
+            auto_approve_in_unattended: false,
         };
         let memory = session_server_to_mcp_server_config(&snapshot, "user-1", "chat-1", test_broadcaster())
             .await
@@ -1953,6 +1954,7 @@ mod tests {
                 args: vec!["new-server".into()],
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
+            auto_approve_in_unattended: false,
         }];
 
         merge_session_snapshot_mcp_servers(

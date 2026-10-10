@@ -4,7 +4,7 @@
 //! `build_*_state` constructs one `*RouterState` from `AppServices`.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
 use aionui_assistant::{
@@ -24,14 +24,18 @@ use aionui_db::{
     SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
-    AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
-    HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
-    resolve_scan_paths_for_data_dir, resolve_state_file_path,
+    AssistantRuleDispatcher, ClockifyConnectionManager, ClockifyConnectionProbe, ClockifyProbeResult,
+    ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExtensionWatcher, ExternalPathsManager,
+    HubIndexManager, HubInstaller, HubRouterState, LINEAR_MCP_URL, LinearConnectionManager, LinearConnectionProbe,
+    LinearProbeFailure, LinearProbeResult, PluginInstaller, SkillRouterState, clockify_api_base,
+    resolve_install_target_dir_for_data_dir, resolve_plugin_install_target_dir, resolve_plugin_scan_paths_for_data_dir,
+    resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, FileWatchService, SnapshotService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
-    McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
+    McpConfigService, McpConnectionTestService, McpRouterState, McpStderrObserver, McpSyncService, McpToolProbeCall,
+    OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService as OfficeSnapshotService,
@@ -133,6 +137,8 @@ pub struct ModuleStates {
     pub project: ProjectRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
+    /// Owns the filesystem watcher for the lifetime of the router.
+    pub extension_watcher: Option<ExtensionWatcher>,
     pub hub: HubRouterState,
     pub skill: SkillRouterState,
     pub channel: ChannelRouterState,
@@ -204,8 +210,15 @@ pub async fn build_module_states(
         "startup: extension states built"
     );
 
-    let scan_paths = resolve_scan_paths_for_data_dir(&services.data_dir);
-    if let Err(error) = ext_state.registry.initialize_with_scan_paths(scan_paths).await {
+    let scan_paths = resolve_plugin_scan_paths_for_data_dir(&services.data_dir);
+    for path in &scan_paths {
+        if matches!(path.source, aionui_extension::ExtensionSource::Local)
+            && let Err(error) = std::fs::create_dir_all(&path.path)
+        {
+            tracing::warn!(path = %path.path.display(), error = %error, "failed to create plugin directory");
+        }
+    }
+    if let Err(error) = ext_state.registry.initialize_with_scan_paths(scan_paths.clone()).await {
         tracing::warn!(
             code = "BOOTSTRAP_DEGRADED_EXTENSION_REGISTRY",
             stage = "extension.registry.initialize",
@@ -213,6 +226,13 @@ pub async fn build_module_states(
             "extension registry initialize failed"
         );
     }
+    let extension_watcher = ExtensionWatcher::start(
+        scan_paths.iter().map(|path| path.path.clone()).collect(),
+        ext_state.registry.clone(),
+    );
+    services
+        .conversation_service
+        .with_plugin_registry(ext_state.registry.clone());
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: extension registry initialized"
@@ -313,6 +333,7 @@ pub async fn build_module_states(
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
+        extension_watcher,
         hub: hub_state,
         skill: skill_state,
         channel: channel_state,
@@ -333,6 +354,7 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
     );
+    states.conversation.service.migrate_legacy_uploads_on_startup().await;
     states
         .conversation
         .service
@@ -902,7 +924,53 @@ pub async fn build_extension_states(
     let skill_data_dir = services.data_dir.clone();
 
     let state_store = ExtensionStateStore::new(resolve_state_file_path(&skill_data_dir));
-    let registry = ExtensionRegistry::new(state_store, services.event_bus.clone(), services.app_version.clone());
+    let legacy_oauth_repo: Arc<dyn aionui_db::IOAuthTokenRepository> = Arc::new(
+        aionui_db::SqliteOAuthTokenRepository::new(services.database.pool().clone()),
+    );
+    let linear_probe: Arc<dyn LinearConnectionProbe> = Arc::new(LinearMcpRemoteProbe {
+        connection_test: McpConnectionTestService::new(reqwest::Client::new(), services.event_bus.clone())
+            .with_timeout(Duration::from_secs(330)),
+        legacy_oauth_repo,
+        browser_opener: Arc::new(aionui_shell::DefaultSystemOpener),
+        oauth_attempt: tokio::sync::Mutex::new(()),
+    });
+    let linear_connections = match LinearConnectionManager::new(&skill_data_dir, linear_probe) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            tracing::error!(error = %error, "Linear plugin connection state is unavailable");
+            None
+        }
+    };
+    let clockify_probe: Arc<dyn ClockifyConnectionProbe> = Arc::new(ClockifyHttpProbe {
+        client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default(),
+    });
+    let mcp_command = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "aioncore".into());
+    let clockify_connections = match ClockifyConnectionManager::new(
+        &skill_data_dir,
+        derive_encryption_key(&services.jwt_secret_raw),
+        mcp_command,
+        clockify_probe,
+    ) {
+        Ok(manager) => Some(manager),
+        Err(error) => {
+            tracing::error!(error = %error, "Clockify plugin connection state is unavailable");
+            None
+        }
+    };
+    let registry = ExtensionRegistry::new_with_plugin_connections(
+        state_store,
+        services.event_bus.clone(),
+        services.app_version.clone(),
+        linear_connections,
+        clockify_connections,
+    );
+    let plugin_installer = PluginInstaller::new(resolve_plugin_install_target_dir(&skill_data_dir), registry.clone());
 
     let hub_dir = resolve_install_target_dir_for_data_dir(&skill_data_dir);
     let index_manager = HubIndexManager::new(hub_dir, registry.clone());
@@ -912,6 +980,8 @@ pub async fn build_extension_states(
 
     let ext_state = ExtensionRouterState {
         registry: registry.clone(),
+        plugin_installer: Some(plugin_installer),
+        allow_machine_plugin_mutations: services.identity_mode.is_local(),
     };
 
     let hub_state = HubRouterState {
@@ -927,6 +997,366 @@ pub async fn build_extension_states(
     };
 
     (ext_state, hub_state, skill_state)
+}
+
+struct ClockifyHttpProbe {
+    client: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl ClockifyConnectionProbe for ClockifyHttpProbe {
+    async fn verify(
+        &self,
+        realm: aionui_api_types::ClockifyRealm,
+        api_key: &str,
+    ) -> Result<ClockifyProbeResult, String> {
+        let user = clockify_probe_json(
+            self.client
+                .get(format!("{}/user", clockify_api_base(realm)))
+                .header("X-Api-Key", api_key)
+                .send()
+                .await
+                .map_err(|_| "Clockify could not be reached. Check the data region and try again.".to_string())?,
+        )
+        .await?;
+        let user = user
+            .as_object()
+            .ok_or_else(|| "Clockify returned invalid account metadata.".to_string())?;
+        let account_id = clockify_required_text(user, "id", 300)?;
+        let account_email = clockify_optional_text(user, "email", 320);
+        let account_name = clockify_optional_text(user, "name", 300)
+            .or_else(|| account_email.clone())
+            .ok_or_else(|| "Clockify returned no account name or email.".to_string())?;
+
+        let workspaces_value = clockify_probe_json(
+            self.client
+                .get(format!("{}/workspaces", clockify_api_base(realm)))
+                .header("X-Api-Key", api_key)
+                .send()
+                .await
+                .map_err(|_| "Clockify could not be reached. Check the data region and try again.".to_string())?,
+        )
+        .await?;
+        let workspaces = workspaces_value
+            .as_array()
+            .ok_or_else(|| "Clockify returned invalid workspace metadata.".to_string())?;
+        if workspaces.len() > 250 {
+            return Err("Clockify returned more workspaces than the safe connection limit.".into());
+        }
+        let workspaces = workspaces
+            .iter()
+            .map(|value| {
+                let workspace = value
+                    .as_object()
+                    .ok_or_else(|| "Clockify returned invalid workspace metadata.".to_string())?;
+                Ok(aionui_api_types::ClockifyWorkspaceIdentity {
+                    id: clockify_required_text(workspace, "id", 300)?,
+                    name: clockify_required_text(workspace, "name", 300)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(ClockifyProbeResult {
+            identity: aionui_api_types::ClockifyVerifiedIdentity {
+                account_id,
+                account_name,
+                account_email,
+            },
+            workspaces,
+        })
+    }
+}
+
+async fn clockify_probe_json(mut response: reqwest::Response) -> Result<serde_json::Value, String> {
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Clockify rejected this API key. Check the key and selected data region.".into());
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "Clockify verification failed with status {}.",
+            response.status()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BYTES as u64)
+    {
+        return Err("Clockify verification response exceeded the safe size limit.".into());
+    }
+    let mut bytes = Vec::with_capacity(response.content_length().unwrap_or_default().min(MAX_BYTES as u64) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Clockify verification response could not be read.".to_string())?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_BYTES {
+            return Err("Clockify verification response exceeded the safe size limit.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Clockify returned invalid verification data.".into())
+}
+
+fn clockify_required_text(
+    value: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_len: usize,
+) -> Result<String, String> {
+    clockify_optional_text(value, key, max_len).ok_or_else(|| format!("Clockify {key} is missing or invalid."))
+}
+
+fn clockify_optional_text(
+    value: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    max_len: usize,
+) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && text.len() <= max_len)
+        .map(str::to_owned)
+}
+
+struct LinearMcpRemoteProbe {
+    connection_test: McpConnectionTestService,
+    legacy_oauth_repo: Arc<dyn aionui_db::IOAuthTokenRepository>,
+    browser_opener: Arc<dyn aionui_shell::ISystemOpener>,
+    oauth_attempt: tokio::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct LinearOAuthProbeState {
+    awaiting_authorization_url: bool,
+    authorization_url_seen: bool,
+    pending_authorization_url: Option<url::Url>,
+    browser_opened: bool,
+    browser_launch_failed: bool,
+}
+
+#[async_trait::async_trait]
+impl LinearConnectionProbe for LinearMcpRemoteProbe {
+    async fn verify(
+        &self,
+        user_id: &str,
+        connection_id: &str,
+        auth_dir: &std::path::Path,
+    ) -> Result<LinearProbeResult, LinearProbeFailure> {
+        // mcp-remote owns one loopback callback at a time. Serializing interactive
+        // attempts avoids one account consuming another account's callback.
+        let _attempt = self.oauth_attempt.lock().await;
+        let args = vec![
+            "-y".into(),
+            format!("mcp-remote@{}", aionui_extension::MCP_REMOTE_VERSION),
+            LINEAR_MCP_URL.into(),
+            "--transport".into(),
+            "http-only".into(),
+            "--auth-timeout".into(),
+            "300".into(),
+        ];
+        let env = std::collections::HashMap::from([(
+            "MCP_REMOTE_CONFIG_DIR".into(),
+            auth_dir.to_string_lossy().into_owned(),
+        )]);
+        let calls = vec![McpToolProbeCall {
+            name: "get_user".into(),
+            arguments: serde_json::json!({ "query": "me" }),
+        }];
+        let scope = format!("plugin:linear:{connection_id}:oauth");
+        let oauth_state = Arc::new(std::sync::Mutex::new(LinearOAuthProbeState::default()));
+        let observer_state = oauth_state.clone();
+        let browser_opener = self.browser_opener.clone();
+        let observer: McpStderrObserver =
+            Arc::new(move |line| observe_linear_oauth_stderr(line, &observer_state, browser_opener.as_ref()));
+        let probe_result = self
+            .connection_test
+            .probe_stdio_tools_observing_stderr("npx", &args, &env, Some(user_id), Some(&scope), &calls, observer)
+            .await;
+        let state = oauth_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let probe = probe_result.map_err(|error| {
+            let failure = if state.browser_launch_failed {
+                LinearProbeFailure::BrowserLaunch
+            } else if state.authorization_url_seen && error.contains("timed out") {
+                LinearProbeFailure::AuthorizationTimeout
+            } else {
+                LinearProbeFailure::Unavailable
+            };
+            tracing::warn!(
+                connection_id,
+                stage = linear_probe_failure_stage(failure),
+                "Linear OAuth probe failed"
+            );
+            failure
+        })?;
+        drop(state);
+        let has_get_user_query = probe
+            .tool_input_schemas
+            .get("get_user")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|properties| properties.contains_key("query"));
+        if !has_get_user_query {
+            return Err(LinearProbeFailure::IdentityUnavailable);
+        }
+        let user = linear_identity_record(
+            linear_tool_json(
+                probe
+                    .results
+                    .get("get_user")
+                    .ok_or(LinearProbeFailure::IdentityUnavailable)?,
+            )
+            .map_err(|_| LinearProbeFailure::IdentityUnavailable)?,
+        )
+        .ok_or(LinearProbeFailure::IdentityUnavailable)?;
+        let required = |value: &serde_json::Value, keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(LinearProbeFailure::IdentityUnavailable)
+        };
+        let workspace = user
+            .get("workspace")
+            .or_else(|| user.get("organization"))
+            .and_then(serde_json::Value::as_object);
+        let has_tool = |name: &str| probe.tools.iter().any(|tool| tool == name);
+        Ok(LinearProbeResult {
+            identity: aionui_api_types::LinearVerifiedIdentity {
+                account_id: required(&user, &["id", "userId"])?,
+                account_name: required(&user, &["displayName", "name"])?,
+                account_email: required(&user, &["email"])?,
+                workspace_id: workspace
+                    .and_then(|value| value.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
+                workspace_name: workspace
+                    .and_then(|value| value.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned),
+                workspace_url: workspace
+                    .and_then(|value| value.get("url"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            },
+            capabilities: aionui_api_types::LinearVerifiedCapabilities {
+                issues_read: has_tool("get_issue") || has_tool("list_issues"),
+                issues_write: has_tool("save_issue"),
+                comments_read: has_tool("list_comments"),
+                comments_write: has_tool("save_comment"),
+                attachment_metadata: has_tool("get_attachment"),
+                attachment_images: has_tool("extract_images"),
+            },
+        })
+    }
+
+    async fn has_legacy_oauth(&self, user_id: &str) -> Result<bool, String> {
+        self.legacy_oauth_repo
+            .get_by_url(user_id, LINEAR_MCP_URL)
+            .await
+            .map(|token| token.is_some())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn observe_linear_oauth_stderr(
+    line: &str,
+    state: &std::sync::Mutex<LinearOAuthProbeState>,
+    browser_opener: &dyn aionui_shell::ISystemOpener,
+) -> Result<(), String> {
+    let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if line.contains("Please authorize this client by visiting:") {
+        state.awaiting_authorization_url = true;
+        return Ok(());
+    }
+    if line.contains("Browser opened automatically.") {
+        state.pending_authorization_url = None;
+        state.browser_opened = true;
+        tracing::info!(
+            stage = "browser_opened",
+            "Linear OAuth authorization opened in system browser"
+        );
+        return Ok(());
+    }
+    if line.contains("Could not open a browser automatically.") {
+        let Some(url) = state.pending_authorization_url.take() else {
+            state.browser_launch_failed = true;
+            return Err("Linear OAuth browser launch failed".to_owned());
+        };
+        if browser_opener.open_detached(url.as_str()).is_err() {
+            state.browser_launch_failed = true;
+            return Err("Linear OAuth browser launch failed".to_owned());
+        }
+        state.browser_opened = true;
+        tracing::info!(
+            stage = "browser_opened_fallback",
+            "Linear OAuth authorization opened through the application system browser"
+        );
+        return Ok(());
+    }
+    if !state.awaiting_authorization_url || line.trim().is_empty() {
+        return Ok(());
+    }
+    state.awaiting_authorization_url = false;
+    state.authorization_url_seen = true;
+    let Some(url) = allowed_linear_authorization_url(line.trim()) else {
+        state.browser_launch_failed = true;
+        return Err("Linear OAuth browser launch failed".to_owned());
+    };
+    // mcp-remote performs a registration preflight after printing the URL and
+    // then tries its own opener. Keep the URL private until it reports that
+    // opener failed; opening here would race the preflight and create two tabs.
+    state.pending_authorization_url = Some(url);
+    Ok(())
+}
+
+const fn linear_probe_failure_stage(failure: LinearProbeFailure) -> &'static str {
+    match failure {
+        LinearProbeFailure::BrowserLaunch => "browser_launch",
+        LinearProbeFailure::AuthorizationTimeout => "authorization_timeout",
+        LinearProbeFailure::IdentityUnavailable => "identity_verification",
+        LinearProbeFailure::Unavailable => "oauth_transport",
+    }
+}
+
+fn allowed_linear_authorization_url(value: &str) -> Option<url::Url> {
+    let url = url::Url::parse(value).ok()?;
+    let host = url.host_str()?;
+    (url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && (host == "linear.app" || host.ends_with(".linear.app")))
+    .then_some(url)
+}
+
+fn linear_tool_json(result: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(value) = result.get("structuredContent") {
+        return Ok(value.clone());
+    }
+    let text = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| {
+            content.iter().find_map(|item| {
+                (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .then(|| item.get("text").and_then(serde_json::Value::as_str))
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| "Linear MCP identity result did not contain JSON text".to_string())?;
+    serde_json::from_str(text).map_err(|error| format!("Linear MCP identity result was not valid JSON: {error}"))
+}
+
+fn linear_identity_record(value: serde_json::Value) -> Option<serde_json::Value> {
+    for key in ["user", "item", "data"] {
+        if let Some(record) = value.get(key).filter(|entry| entry.is_object()) {
+            return Some(record.clone());
+        }
+    }
+    value.is_object().then_some(value)
 }
 
 /// Build the `WsHandlerState` from application services with an explicit inbound
@@ -976,8 +1406,110 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    struct RecordingSystemOpener(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl aionui_shell::ISystemOpener for RecordingSystemOpener {
+        fn open_detached(&self, _target: &str) -> Result<(), aionui_shell::ShellError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn run_command(&self, _program: &str, _args: &[&str]) -> Result<(), aionui_shell::ShellError> {
+            Ok(())
+        }
+
+        fn is_tool_available(&self, _tool_name: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn linear_oauth_browser_observer_opens_only_the_prompted_linear_url() {
+        let state = std::sync::Mutex::new(LinearOAuthProbeState::default());
+        let opener = RecordingSystemOpener(AtomicUsize::new(0));
+
+        observe_linear_oauth_stderr("Discovered authorization server: https://linear.app", &state, &opener).unwrap();
+        assert!(!state.lock().unwrap().browser_opened);
+
+        observe_linear_oauth_stderr("Please authorize this client by visiting:", &state, &opener).unwrap();
+        observe_linear_oauth_stderr(
+            "https://linear.app/oauth/authorize?client_id=test&state=private",
+            &state,
+            &opener,
+        )
+        .unwrap();
+        assert_eq!(opener.0.load(Ordering::SeqCst), 0);
+        observe_linear_oauth_stderr(
+            "Could not open a browser automatically. Please copy and paste the URL above into your browser.",
+            &state,
+            &opener,
+        )
+        .unwrap();
+        let state = state.lock().unwrap();
+        assert!(state.authorization_url_seen);
+        assert!(state.browser_opened);
+        assert!(!state.browser_launch_failed);
+        assert!(state.pending_authorization_url.is_none());
+        assert_eq!(opener.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn linear_oauth_browser_observer_does_not_duplicate_a_successful_proxy_launch() {
+        let state = std::sync::Mutex::new(LinearOAuthProbeState::default());
+        let opener = RecordingSystemOpener(AtomicUsize::new(0));
+        observe_linear_oauth_stderr("Please authorize this client by visiting:", &state, &opener).unwrap();
+        observe_linear_oauth_stderr("https://linear.app/oauth/authorize?state=private", &state, &opener).unwrap();
+        observe_linear_oauth_stderr("Browser opened automatically.", &state, &opener).unwrap();
+
+        assert!(state.lock().unwrap().browser_opened);
+        assert_eq!(opener.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn linear_oauth_browser_observer_rejects_untrusted_redirects() {
+        for url in [
+            "http://linear.app/oauth/authorize",
+            "https://linear.app.evil.test/oauth/authorize",
+            "https://user@linear.app/oauth/authorize",
+            "https://linear.app:444/oauth/authorize",
+        ] {
+            let state = std::sync::Mutex::new(LinearOAuthProbeState::default());
+            let opener = RecordingSystemOpener(AtomicUsize::new(0));
+            observe_linear_oauth_stderr("Please authorize this client by visiting:", &state, &opener).unwrap();
+            assert!(observe_linear_oauth_stderr(url, &state, &opener).is_err());
+            let state = state.lock().unwrap();
+            assert!(state.browser_launch_failed);
+            assert!(!state.browser_opened);
+        }
+    }
+
+    #[test]
+    fn linear_identity_uses_verified_user_and_keeps_workspace_optional() {
+        let user = linear_identity_record(serde_json::json!({
+            "user": {
+                "id": "user-1",
+                "displayName": "Developer",
+                "email": "developer@example.test"
+            }
+        }))
+        .unwrap();
+        assert_eq!(user["id"], "user-1");
+        assert!(user.get("workspace").is_none());
+
+        let nested = linear_identity_record(serde_json::json!({
+            "data": {
+                "id": "user-2",
+                "organization": { "id": "org-1", "name": "Workspace" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(nested["organization"]["name"], "Workspace");
+    }
 
     // T-B4 — concurrent-startup contention gets a distinct boundary stage so it
     // is not misreported as local data corruption (Sentry 135525166).

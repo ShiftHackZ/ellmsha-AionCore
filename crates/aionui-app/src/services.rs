@@ -18,7 +18,7 @@ use aionui_db::{
     SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
     SqliteSkillRepository, SqliteUserRepository,
 };
-use aionui_project::ProjectService;
+use aionui_project::{ManagedUploadStore, ProjectService};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
@@ -184,7 +184,9 @@ impl AppServices {
         // `resolve_existing` classifies auto workspaces as temp and
         // user-picked directories as standard.
         let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
-        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
+        let managed_uploads = ManagedUploadStore::new(data_dir.join("uploads"), conversation_repo.clone());
+        let project_service =
+            ProjectService::new(project_store, work_dir.join("conversations")).with_managed_uploads(managed_uploads);
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these

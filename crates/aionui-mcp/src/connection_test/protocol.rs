@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+use super::{McpStdioToolProbe, McpToolProbeCall};
+
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -138,6 +140,82 @@ pub(super) async fn run_stdio_protocol(
     }
 
     success_result(tools_resp.result)
+}
+
+pub(super) async fn run_stdio_tool_probe(
+    mut stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    calls: &[McpToolProbeCall],
+) -> Result<McpStdioToolProbe, String> {
+    let mut reader = BufReader::new(stdout);
+
+    write_jsonrpc_line(&mut stdin, &build_initialize_request(1))
+        .await
+        .map_err(|error| format!("failed to initialize Linear MCP: {error}"))?;
+    let init = read_jsonrpc_response(&mut reader).await?;
+    if let Some(error) = init.error {
+        return Err(format!(
+            "Linear MCP initialize failed: {} ({})",
+            error.message, error.code
+        ));
+    }
+
+    write_jsonrpc_line(&mut stdin, &build_initialized_notification())
+        .await
+        .map_err(|error| format!("failed to acknowledge Linear MCP initialization: {error}"))?;
+    write_jsonrpc_line(&mut stdin, &build_tools_list_request(2))
+        .await
+        .map_err(|error| format!("failed to list Linear MCP tools: {error}"))?;
+    let tools_response = read_jsonrpc_response(&mut reader).await?;
+    if let Some(error) = tools_response.error {
+        return Err(format!(
+            "Linear MCP tools/list failed: {} ({})",
+            error.message, error.code
+        ));
+    }
+    let tool_descriptors = parse_tools(tools_response.result)
+        .map_err(|error| format!("Linear MCP returned an invalid tool catalog: {error}"))?;
+    let tool_input_schemas = tool_descriptors
+        .iter()
+        .filter_map(|tool| tool.input_schema.clone().map(|schema| (tool.name.clone(), schema)))
+        .collect::<HashMap<_, _>>();
+    let tools = tool_descriptors.into_iter().map(|tool| tool.name).collect::<Vec<_>>();
+
+    let mut results = HashMap::new();
+    for (index, call) in calls.iter().enumerate() {
+        if !tools.iter().any(|name| name == &call.name) {
+            return Err(format!(
+                "Linear MCP does not expose the required '{}' identity tool",
+                call.name
+            ));
+        }
+        write_jsonrpc_line(
+            &mut stdin,
+            &build_tools_call_request(index as u64 + 3, &call.name, call.arguments.clone()),
+        )
+        .await
+        .map_err(|error| format!("failed to call Linear MCP tool '{}': {error}", call.name))?;
+        let response = read_jsonrpc_response(&mut reader).await?;
+        if let Some(error) = response.error {
+            return Err(format!(
+                "Linear MCP tool '{}' failed: {} ({})",
+                call.name, error.message, error.code
+            ));
+        }
+        let result = response
+            .result
+            .ok_or_else(|| format!("Linear MCP tool '{}' returned no result", call.name))?;
+        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Err(format!("Linear MCP tool '{}' reported an error", call.name));
+        }
+        results.insert(call.name.clone(), result);
+    }
+
+    Ok(McpStdioToolProbe {
+        tools,
+        tool_input_schemas,
+        results,
+    })
 }
 
 /// Write a JSON-RPC message as a newline-delimited line to stdin.
@@ -357,15 +435,34 @@ pub(super) fn build_tools_list_request(id: u64) -> JsonRpcRequest {
     }
 }
 
+fn build_tools_call_request(id: u64, name: &str, arguments: serde_json::Value) -> JsonRpcRequest {
+    JsonRpcRequest {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call".into(),
+        params: Some(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        })),
+    }
+}
+
+fn parse_tools(tools_value: Option<serde_json::Value>) -> Result<Vec<McpToolInfo>, serde_json::Error> {
+    tools_value
+        .map(serde_json::from_value::<ToolsListResult>)
+        .transpose()
+        .map(|result| result.map(|value| value.tools).unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Result builders
 // ---------------------------------------------------------------------------
 
 pub(super) fn success_result(tools_value: Option<serde_json::Value>) -> McpConnectionTestResult {
-    let tools = tools_value
-        .and_then(|v| serde_json::from_value::<ToolsListResult>(v).ok())
-        .map(|r| {
-            r.tools
+    let tools = parse_tools(tools_value)
+        .ok()
+        .map(|tools| {
+            tools
                 .into_iter()
                 .map(|t| McpToolResponse {
                     name: t.name,

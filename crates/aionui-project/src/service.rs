@@ -7,6 +7,7 @@ use chrono::{Datelike, Local};
 
 use crate::canonical::{self, Canonical};
 use crate::containment;
+use crate::managed_uploads::ManagedUploadStore;
 use crate::types::{
     AttachInput, FolderDto, ProjectDetail, ProjectError, ProjectExplorerEntry, ProjectExplorerView, ReferenceInput,
     ResolveOutput, ResolvedResource, RuntimeStatus,
@@ -19,11 +20,27 @@ use crate::types::{
 pub struct ProjectService {
     store: Arc<dyn IProjectStore>,
     temp_root: PathBuf,
+    managed_uploads: Option<ManagedUploadStore>,
 }
 
 impl ProjectService {
     pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf) -> Self {
-        Self { store, temp_root }
+        Self {
+            store,
+            temp_root,
+            managed_uploads: None,
+        }
+    }
+
+    pub fn with_managed_uploads(mut self, managed_uploads: ManagedUploadStore) -> Self {
+        self.managed_uploads = Some(managed_uploads);
+        self
+    }
+
+    pub(crate) fn managed_uploads(&self) -> Result<&ManagedUploadStore, ProjectError> {
+        self.managed_uploads
+            .as_ref()
+            .ok_or(ProjectError::UploadStorageUnavailable)
     }
 
     // ── creation / backfill ────────────────────────────────────────────

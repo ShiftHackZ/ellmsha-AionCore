@@ -36,7 +36,11 @@ pub fn resolve_extension_contributions(ext: &LoadedExtension) -> ResolvedContrib
 
     ResolvedContributions {
         acp_adapters: acp_adapter::resolve_acp_adapters(&contributes.acp_adapters, ext_name, ext_dir),
-        mcp_servers: mcp_server::resolve_mcp_servers(&contributes.mcp_servers, ext_name),
+        mcp_servers: mcp_server::resolve_mcp_servers(
+            &contributes.mcp_servers,
+            ext_name,
+            ext.source == crate::types::ExtensionSource::Builtin,
+        ),
         assistants: assistant::resolve_assistants(&contributes.assistants, ext_name, ext_dir),
         agents: agent::resolve_agents(&contributes.agents, ext_name, ext_dir),
         skills: skill::resolve_skills(&contributes.skills, ext_name, ext_dir),
@@ -142,6 +146,7 @@ mod tests {
                 contributes,
                 lifecycle: None,
                 i18n: None,
+                compatibility: None,
             },
             directory: "/tmp/ext".to_owned(),
             source: ExtensionSource::Local,
@@ -238,6 +243,7 @@ mod tests {
                     id: "mcp-a".into(),
                     name: "MCP A".into(),
                     description: None,
+                    auto_approve_in_unattended: true,
                     config: serde_json::json!({}),
                 }],
                 ..Default::default()
@@ -251,6 +257,7 @@ mod tests {
                     id: "mcp-b".into(),
                     name: "MCP B".into(),
                     description: None,
+                    auto_approve_in_unattended: true,
                     config: serde_json::json!({}),
                 }],
                 ..Default::default()

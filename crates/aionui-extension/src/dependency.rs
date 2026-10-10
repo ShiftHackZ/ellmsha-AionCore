@@ -311,6 +311,7 @@ fn make_extension(name: &str, version: &str, deps: &[(&str, &str)]) -> LoadedExt
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         },
         directory: format!("/extensions/{name}"),
         source: ExtensionSource::Local,

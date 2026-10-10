@@ -385,6 +385,12 @@ pub enum SessionEvent {
         kind: Option<SubagentTaskKind>,
     },
 
+    /// A backend event emitted by a real child thread on the same transport.
+    /// The outer ref is the backend child thread id. Consumers may persist or
+    /// display the nested event, but the parent session reducer must never fold
+    /// it into the parent's turn lifecycle.
+    SubagentStream { r#ref: String, event: Box<SessionEvent> },
+
     /// 009 R6b / §3 / H1: RICH per-agent workflow detail for the background-plane
     /// roster (claude `workflow_progress[].workflow_agent`). Distinct from
     /// `SubagentUpdate` (which carries only the lifecycle status for the FSM
@@ -906,6 +912,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | ConfigChanged { .. }
         | CatalogUpdated { .. }
         | SubagentUpdate { .. }
+        | SubagentStream { .. }
         | SubagentDetail { .. }
         | WorkflowPhase { .. }
         | Notice { .. }
@@ -940,7 +947,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
     match classify(event) {
         EventClass::OrchestrationLowered => PersistTier::Ephemeral,
         EventClass::BackendProduced => match event {
-            MessageDelta { .. } | ThoughtDelta { .. } => PersistTier::Ephemeral, // deltas folded → MessageFinalized
+            MessageDelta { .. } | ThoughtDelta { .. } | SubagentStream { .. } => PersistTier::Ephemeral, // deltas folded → MessageFinalized
             // live tool-output / turn-diff streams: never persisted — the durable
             // record is the completed ToolResult (full aggregatedOutput / per-file diff).
             ToolOutputDelta { .. } | TurnDiffUpdated { .. } => PersistTier::Ephemeral,

@@ -15,6 +15,36 @@ pub struct ExtensionSummaryResponse {
     pub description: Option<String>,
     pub enabled: bool,
     pub source: String,
+    pub package_format: String,
+    #[serde(default)]
+    pub supported_components: Vec<String>,
+    #[serde(default)]
+    pub unsupported_components: Vec<PluginCompatibilityNoticeResponse>,
+    #[serde(default)]
+    pub compatibility_warnings: Vec<PluginCompatibilityNoticeResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_provenance: Option<PluginSourceProvenanceResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCompatibilityNoticeResponse {
+    pub component: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginSourceProvenanceResponse {
+    pub source_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdirectory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_revision: Option<String>,
 }
 
 /// Response for `GET /api/hub/extensions`.
@@ -87,6 +117,143 @@ pub struct DisableExtensionRequest {
     pub reason: Option<String>,
 }
 
+/// User-visible state of one independently authenticated Linear connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinearConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    ReconnectRequired,
+    Error,
+}
+
+/// Identity returned by Linear after a successful MCP probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearVerifiedIdentity {
+    pub account_id: String,
+    pub account_name: String,
+    pub account_email: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_url: Option<String>,
+}
+
+/// Capabilities observed from the authenticated Linear MCP tool catalog.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearVerifiedCapabilities {
+    pub issues_read: bool,
+    pub issues_write: bool,
+    pub comments_read: bool,
+    pub comments_write: bool,
+    pub attachment_metadata: bool,
+    pub attachment_images: bool,
+}
+
+/// One Linear connection. OAuth tokens and auth-directory paths are never serialized here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearConnectionResponse {
+    pub id: String,
+    /// Stable, protocol-safe MCP server name assigned after identity verification.
+    #[serde(default)]
+    pub namespace: String,
+    pub label: String,
+    pub status: LinearConnectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<LinearVerifiedIdentity>,
+    #[serde(default)]
+    pub capabilities: LinearVerifiedCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub migrated: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Linear connection state for the current user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinearConnectionsResponse {
+    pub connections: Vec<LinearConnectionResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectLinearConnectionRequest {
+    #[serde(default)]
+    pub reconnect: bool,
+}
+
+/// Clockify data region selected for an API-key connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockifyRealm {
+    Global,
+    Eu,
+    Us,
+    Uk,
+    Au,
+}
+
+/// User-visible state of one independently authenticated Clockify connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockifyConnectionStatus {
+    Connected,
+    Disconnected,
+    ReconnectRequired,
+    Error,
+}
+
+/// Identity returned by Clockify after an API key is verified.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClockifyVerifiedIdentity {
+    pub account_id: String,
+    pub account_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_email: Option<String>,
+}
+
+/// One bounded workspace visible to the authenticated Clockify identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClockifyWorkspaceIdentity {
+    pub id: String,
+    pub name: String,
+}
+
+/// One Clockify connection. The encrypted API key is deliberately absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClockifyConnectionResponse {
+    pub id: String,
+    pub namespace: String,
+    pub label: String,
+    pub realm: ClockifyRealm,
+    pub status: ClockifyConnectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ClockifyVerifiedIdentity>,
+    #[serde(default)]
+    pub workspaces: Vec<ClockifyWorkspaceIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClockifyConnectionsResponse {
+    pub connections: Vec<ClockifyConnectionResponse>,
+}
+
+/// API keys are entered by the user and verified before a connection is saved.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectClockifyConnectionRequest {
+    pub api_key: String,
+    pub realm: ClockifyRealm,
+}
+
 /// Request body for `POST /api/extensions/permissions`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetPermissionsRequest {
@@ -135,11 +302,19 @@ mod tests {
             description: None,
             enabled: true,
             source: "env".into(),
+            package_format: "native".into(),
+            supported_components: vec![],
+            unsupported_components: vec![],
+            compatibility_warnings: vec![],
+            source_provenance: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["name"], "my-ext");
         assert_eq!(json["display_name"], "My Extension");
         assert_eq!(json["enabled"], true);
+        assert_eq!(json["supported_components"], json!([]));
+        assert_eq!(json["unsupported_components"], json!([]));
+        assert_eq!(json["compatibility_warnings"], json!([]));
         assert!(json.get("description").is_none());
     }
 

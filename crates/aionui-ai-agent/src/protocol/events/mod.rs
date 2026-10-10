@@ -90,6 +90,10 @@ pub enum AgentStreamEvent {
     /// Never counts as user-visible turn output (see `event_is_user_visible_output`):
     /// it is an out-of-band status refresh, not the turn "saying something".
     WorkflowProgress(WorkflowProgressData),
+    /// Internal-only child-thread frame. The conversation layer persists the
+    /// nested event under a read-only child conversation and forwards it with
+    /// that child's id; it never contributes to the parent turn lifecycle.
+    Subagent(SubagentEventData),
     /// Internal-only signal: the tolerant transport layer absorbed a CodeBuddy
     /// dialect notification (`session_end` / `compact-maxtoken`) that the stock
     /// ACP schema hard-rejects as `-32602`. Consumed by the empty-turn judgment
@@ -185,6 +189,19 @@ pub struct WorkflowProgressData {
     /// inserting for those would conjure junk cards.
     #[serde(default)]
     pub settle_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentEventData {
+    pub r#ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Box<AgentStreamEvent>>,
 }
 
 /// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.

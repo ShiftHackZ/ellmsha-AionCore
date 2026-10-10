@@ -36,6 +36,11 @@ pub struct SessionMcpServer {
     pub id: String,
     pub name: String,
     pub transport: SessionMcpTransport,
+    /// Server-side provenance: an enabled plugin contribution may run without a
+    /// separate MCP prompt when the conversation uses the built-in Auto mode.
+    /// Never deserialize or persist this bit; only the plugin registry may set it.
+    #[serde(skip)]
+    pub auto_approve_in_unattended: bool,
 }
 
 /// The fork spec a forked conversation carries in `conversations.extra.fork`
@@ -211,6 +216,24 @@ mod tests {
         assert!(
             serialized.get("max_tokens").is_none(),
             "legacy max_tokens must be ignored, not re-serialized"
+        );
+    }
+
+    #[test]
+    fn mcp_auto_approval_provenance_cannot_arrive_from_persisted_json() {
+        let server: SessionMcpServer = serde_json::from_value(serde_json::json!({
+            "id": "user-server",
+            "name": "user-server",
+            "transport": {"type": "stdio", "command": "node", "args": [], "env": {}},
+            "auto_approve_in_unattended": true
+        }))
+        .unwrap();
+        assert!(!server.auto_approve_in_unattended);
+        assert!(
+            serde_json::to_value(&server)
+                .unwrap()
+                .get("auto_approve_in_unattended")
+                .is_none()
         );
     }
 }

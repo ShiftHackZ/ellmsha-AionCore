@@ -43,6 +43,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 512;
 // treated as an AskUserQuestion answer label (Approved + `selected`).
 const PERM_ALLOW: &str = "allow";
 const PERM_ALLOW_ALWAYS: &str = "allow_always";
+const PERM_ALLOW_MCP_SESSION: &str = "allow_mcp_session";
+const PERM_ALLOW_MCP_ALWAYS: &str = "allow_mcp_always";
 const PERM_REJECT: &str = "reject";
 
 /// The `config_selections` key under which a claude session's chosen reasoning-effort
@@ -560,7 +562,7 @@ impl SessionAgentTask {
                     Vec::new()
                 };
                 let options = if options.is_empty() {
-                    default_permission_options()
+                    default_permission_options(p.input.as_ref())
                 } else {
                     options
                 };
@@ -569,7 +571,7 @@ impl SessionAgentTask {
                     call_id: p.request_id,
                     title: (!p.tool_name.is_empty()).then(|| p.tool_name.clone()),
                     action: None,
-                    description: String::new(),
+                    description: permission_input_description(p.input.as_ref()),
                     command_type: None,
                     options: options
                         .into_iter()
@@ -589,6 +591,7 @@ impl SessionAgentTask {
     /// The picked id maps to the answer:
     ///   - `reject`        → Denied
     ///   - `allow_always`  → AllowAlways
+    ///   - `allow_mcp_*`   → AllowAlways + the Codex persistence scope
     ///   - `allow`         → Approved
     ///   - anything else   → an AskUserQuestion answer LABEL → Approved + `selected`
     ///     (claude keys the AskUserQuestion answer by the chosen label — see
@@ -602,20 +605,8 @@ impl SessionAgentTask {
         data: serde_json::Value,
         always_allow: bool,
     ) -> Result<(), AgentError> {
-        use aionui_session::PermissionDecision;
         let picked = confirm_option_id(&data);
-        let (decision, selected) = if always_allow {
-            (PermissionDecision::AllowAlways, None)
-        } else {
-            match picked.as_deref() {
-                Some(PERM_REJECT) => (PermissionDecision::Denied, None),
-                Some(PERM_ALLOW_ALWAYS) => (PermissionDecision::AllowAlways, None),
-                Some(PERM_ALLOW) | None => (PermissionDecision::Approved, None),
-                // A question answer label (AskUserQuestion): approve and forward the
-                // label so claude records it as the chosen answer.
-                Some(label) => (PermissionDecision::Approved, Some(label.to_owned())),
-            }
-        };
+        let (decision, selected) = permission_decision_from_choice(picked.as_deref(), always_allow);
         let backend = self.backend.clone();
         let request_id = call_id.to_string();
         let conv_id = self.conversation_id.clone();
@@ -1841,8 +1832,8 @@ fn assemble_spawn_env(
 /// captured just before `open_session`. Symmetric with the ACP path's
 /// `build_acp_final_input_dump_value`: returns `{ "input", "resolved_context" }`.
 /// `SessionConfig` has no `Serialize`, so fields are mapped by hand. Contents
-/// are RAW (dev-only, `--dump-prompts`): secrets in `spawn_env` / MCP env are
-/// not redacted, matching the existing acp dump.
+/// are RAW (dev-only, `--dump-prompts`) except for private plugin credential
+/// environment values. Other secrets match the existing ACP dump behavior.
 fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::SessionConfig) -> serde_json::Value {
     use aionui_session::McpTransport;
     let mcp_servers: Vec<serde_json::Value> = cfg
@@ -1855,7 +1846,10 @@ fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::Sess
                     "type": "stdio",
                     "command": command,
                     "args": args,
-                    "env": env.iter().map(|(k, v)| serde_json::json!({ "name": k, "value": v })).collect::<Vec<_>>(),
+                    "env": env.iter().map(|(k, v)| serde_json::json!({
+                        "name": k,
+                        "value": if crate::dev_prompt_dump::is_private_plugin_env(k) { "<private>" } else { v },
+                    })).collect::<Vec<_>>(),
                 }),
                 McpTransport::Http { url, headers } => serde_json::json!({
                     "type": "http",
@@ -1927,6 +1921,7 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
     McpServerSpec {
         name: server.name.clone(),
         transport,
+        auto_approve_in_unattended: server.auto_approve_in_unattended,
     }
 }
 
@@ -1947,6 +1942,7 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
                 (C::ENV_SLOT_ID.to_owned(), cfg.slot_id.clone()),
             ],
         },
+        auto_approve_in_unattended: false,
     }
 }
 
@@ -2170,15 +2166,20 @@ fn codex_sandbox_for_mode(mode: Option<&str>) -> Option<&'static str> {
 
 /// Map a conversation's requested mode → the codex `approvalPolicy` string, or
 /// `None` to keep the default (`on-request`). Sibling of `codex_sandbox_for_mode`:
-/// a full-access / yolo agent runs unattended → `"never"`. Recognizes the legacy bare
-/// token `full-access` (the Plan B canonical value), the colon id `:danger-full-access`,
-/// and the legacy `yoloNoSandbox` alias. Verbatim port of clean-slate
-/// `session_runtime::codex_approval_for_mode`.
+/// Auto means Codex may act without asking inside the workspace sandbox, while
+/// full-access additionally removes that sandbox. Both therefore use `"never"`;
+/// the sandbox remains the authority for filesystem access. The session backend
+/// enables network independently for built-in profiles. Read-only and unknown/manual
+/// profiles retain Codex's on-request policy.
 fn codex_approval_for_mode(mode: Option<&str>) -> Option<&'static str> {
     match mode.map(str::trim) {
         // Recognizes the #608 canonical `agent-full-access` alongside the legacy
         // `full-access` / `:danger-full-access` / `yoloNoSandbox` (see codex_sandbox_for_mode).
         Some(":danger-full-access" | "agent-full-access" | "full-access" | "yoloNoSandbox") => Some("never"),
+        // The UI's Auto tier is the workspace sandbox with unattended execution.
+        // `default` / `autoEdit` are retained for old persisted Codex values even
+        // though `resolved_session_mode` normally normalizes them to `auto` first.
+        Some(":workspace" | "auto" | "default" | "autoEdit") => Some("never"),
         _ => None,
     }
 }
@@ -2209,6 +2210,7 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
                 SessionEvent::Plan { .. } => "Plan",
                 SessionEvent::Rewound { .. } => "Rewound",
                 SessionEvent::SubagentUpdate { .. } => "SubagentUpdate",
+                SessionEvent::SubagentStream { .. } => "SubagentStream",
                 SessionEvent::SubagentDetail { .. } => "SubagentDetail",
                 SessionEvent::Notice { .. } => "Notice",
                 SessionEvent::ToolOutputDelta { .. } => "ToolOutputDelta",
@@ -2289,6 +2291,13 @@ fn spawn_event_pump(
         // survives — mirroring the reference `BackendOutputSink::emit_tool_result`,
         // which re-sends the name on completion. Cleared per turn with `tool_output`.
         let mut tool_name: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut child_tool_names: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+            std::collections::HashMap::new();
+        let mut child_thread_refs = std::collections::HashSet::<String>::new();
+        let mut pending_child_metadata =
+            std::collections::HashMap::<String, crate::protocol::events::SubagentEventData>::new();
+        let mut message_items = std::collections::HashSet::<String>::new();
+        let mut child_message_items = std::collections::HashMap::<String, std::collections::HashSet<String>>::new();
         // Tool calls of the CURRENT turn still awaiting their terminal `ToolResult`
         // (call_id → name). If the turn ends without one — user cancel, process
         // crash, or the CLI dropping the result — the persisted tool_call row would
@@ -2592,6 +2601,95 @@ fn spawn_event_pump(
             // Project a running workflow's roster to the UI. Everything a workflow
             // does after launch arrives ONLY as these task frames, so without this
             // the conversation shows nothing at all for the whole flight.
+            // Child thread output is translated independently and wrapped before
+            // it reaches the conversation layer. It must not update any parent
+            // pump accumulator or terminal flag.
+            if let SessionEvent::SubagentStream { r#ref, event } = &env.event {
+                let first_stream_event = child_thread_refs.insert(r#ref.clone());
+                if first_stream_event && let Some(metadata) = pending_child_metadata.remove(r#ref) {
+                    let _ = runtime.tx.send(AgentStreamEvent::Subagent(metadata));
+                }
+                let item_ids = child_message_items.entry(r#ref.clone()).or_default();
+                if let SessionEvent::ItemStarted {
+                    item_id,
+                    kind: aionui_session::ItemKind::Text,
+                } = event.as_ref()
+                {
+                    item_ids.insert(item_id.clone());
+                }
+                let ends_message = matches!(
+                    event.as_ref(),
+                    SessionEvent::ItemCompleted { item_id, .. } if item_ids.remove(item_id)
+                );
+                for mut child_event in translate_event((**event).clone(), r#ref, false) {
+                    stamp_tool_name(child_tool_names.entry(r#ref.clone()).or_default(), &mut child_event);
+                    let _ = runtime
+                        .tx
+                        .send(AgentStreamEvent::Subagent(crate::protocol::events::SubagentEventData {
+                            r#ref: r#ref.clone(),
+                            label: None,
+                            parent_ref: None,
+                            status: None,
+                            event: Some(Box::new(child_event)),
+                        }));
+                }
+                if ends_message {
+                    let _ = runtime
+                        .tx
+                        .send(AgentStreamEvent::Subagent(crate::protocol::events::SubagentEventData {
+                            r#ref: r#ref.clone(),
+                            label: None,
+                            parent_ref: None,
+                            status: None,
+                            event: Some(Box::new(AgentStreamEvent::SegmentBreak)),
+                        }));
+                }
+                continue;
+            }
+
+            if let SessionEvent::SubagentUpdate {
+                r#ref,
+                label,
+                status,
+                parent_ref,
+                ..
+            } = &env.event
+            {
+                let status = match status {
+                    aionui_session::SubagentStatus::PendingInit => "pending_init",
+                    aionui_session::SubagentStatus::Running => "running",
+                    aionui_session::SubagentStatus::Interrupted => "interrupted",
+                    aionui_session::SubagentStatus::Completed => "completed",
+                    aionui_session::SubagentStatus::Errored => "errored",
+                    aionui_session::SubagentStatus::Shutdown => "shutdown",
+                };
+                let metadata = crate::protocol::events::SubagentEventData {
+                    r#ref: r#ref.clone(),
+                    label: label.clone(),
+                    parent_ref: parent_ref.clone(),
+                    status: Some(status.to_owned()),
+                    event: None,
+                };
+                if child_thread_refs.contains(r#ref) {
+                    let _ = runtime.tx.send(AgentStreamEvent::Subagent(metadata));
+                } else {
+                    pending_child_metadata.insert(r#ref.clone(), metadata);
+                }
+            }
+
+            if let SessionEvent::ItemStarted {
+                item_id,
+                kind: aionui_session::ItemKind::Text,
+            } = &env.event
+            {
+                message_items.insert(item_id.clone());
+            }
+            if let SessionEvent::ItemCompleted { item_id, .. } = &env.event
+                && message_items.remove(item_id)
+            {
+                let _ = runtime.tx.send(AgentStreamEvent::SegmentBreak);
+            }
+
             for data in update_workflow_cards(
                 &mut workflow_cards,
                 &tool_name,
@@ -3267,30 +3365,85 @@ fn confirm_option_id(data: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn permission_decision_from_choice(
+    picked: Option<&str>,
+    always_allow: bool,
+) -> (aionui_session::PermissionDecision, Option<String>) {
+    use aionui_session::PermissionDecision;
+    if always_allow {
+        return (PermissionDecision::AllowAlways, None);
+    }
+    match picked {
+        Some(PERM_REJECT) => (PermissionDecision::Denied, None),
+        Some(PERM_ALLOW_ALWAYS) => (PermissionDecision::AllowAlways, None),
+        Some(PERM_ALLOW_MCP_SESSION) => (PermissionDecision::AllowAlways, Some("session".into())),
+        Some(PERM_ALLOW_MCP_ALWAYS) => (PermissionDecision::AllowAlways, Some("always".into())),
+        Some(PERM_ALLOW) | None => (PermissionDecision::Approved, None),
+        // A question answer label is approved and forwarded so claude records it.
+        Some(label) => (PermissionDecision::Approved, Some(label.to_owned())),
+    }
+}
+
 /// Generic allow / allow-always / reject options for an ordinary tool-approval
 /// permission card. `confirm()` maps these option ids back to a `PermissionDecision`.
-fn default_permission_options() -> Vec<crate::protocol::events::AcpPermissionOptionData> {
+fn mcp_tool_approval_persist_scopes(input: Option<&serde_json::Value>) -> Option<(bool, bool)> {
+    let meta = input?.get("_meta")?;
+    if meta.get("codex_approval_kind").and_then(serde_json::Value::as_str) != Some("mcp_tool_call") {
+        return None;
+    }
+    let persist = meta.get("persist");
+    let supports = |scope: &str| {
+        persist.and_then(serde_json::Value::as_str) == Some(scope)
+            || persist
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(scope)))
+    };
+    Some((supports("session"), supports("always")))
+}
+
+fn default_permission_options(
+    input: Option<&serde_json::Value>,
+) -> Vec<crate::protocol::events::AcpPermissionOptionData> {
     use crate::protocol::events::{AcpPermissionOptionData, AcpPermissionOptionKind};
-    vec![
-        AcpPermissionOptionData {
-            option_id: PERM_ALLOW.to_owned(),
-            name: "Allow".to_owned(),
-            kind: AcpPermissionOptionKind::AllowOnce,
-            meta: None,
-        },
-        AcpPermissionOptionData {
+    let mut options = vec![AcpPermissionOptionData {
+        option_id: PERM_ALLOW.to_owned(),
+        name: "Allow".to_owned(),
+        kind: AcpPermissionOptionKind::AllowOnce,
+        meta: None,
+    }];
+    match mcp_tool_approval_persist_scopes(input) {
+        Some((allow_session, allow_always)) => {
+            if allow_session {
+                options.push(AcpPermissionOptionData {
+                    option_id: PERM_ALLOW_MCP_SESSION.to_owned(),
+                    name: "Allow for Session".to_owned(),
+                    kind: AcpPermissionOptionKind::AllowAlways,
+                    meta: None,
+                });
+            }
+            if allow_always {
+                options.push(AcpPermissionOptionData {
+                    option_id: PERM_ALLOW_MCP_ALWAYS.to_owned(),
+                    name: "Always Allow".to_owned(),
+                    kind: AcpPermissionOptionKind::AllowAlways,
+                    meta: None,
+                });
+            }
+        }
+        None => options.push(AcpPermissionOptionData {
             option_id: PERM_ALLOW_ALWAYS.to_owned(),
             name: "Allow Always".to_owned(),
             kind: AcpPermissionOptionKind::AllowAlways,
             meta: None,
-        },
-        AcpPermissionOptionData {
-            option_id: PERM_REJECT.to_owned(),
-            name: "Reject".to_owned(),
-            kind: AcpPermissionOptionKind::RejectOnce,
-            meta: None,
-        },
-    ]
+        }),
+    }
+    options.push(AcpPermissionOptionData {
+        option_id: PERM_REJECT.to_owned(),
+        name: "Reject".to_owned(),
+        kind: AcpPermissionOptionKind::RejectOnce,
+        meta: None,
+    });
+    options
 }
 
 /// Project an AskUserQuestion tool `input` into permission-card options the user can
@@ -3327,6 +3480,30 @@ fn ask_user_question_options(
             meta: None,
         })
         .collect()
+}
+
+/// Render the same actionable context a live permission card receives when the
+/// REST recovery path rebuilds an unanswered approval after reload.
+fn permission_input_description(input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+    if let Some(description) = input.get("description").and_then(serde_json::Value::as_str) {
+        return description.to_owned();
+    }
+    if input.as_object().is_some_and(|object| object.len() > 1) {
+        return serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+    }
+    if let Some(command) = input.get("command").and_then(serde_json::Value::as_str) {
+        return command.to_owned();
+    }
+    if let Some(command) = input.get("command").and_then(serde_json::Value::as_array) {
+        let parts = command.iter().filter_map(serde_json::Value::as_str).collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return parts.join(" ");
+        }
+    }
+    serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string())
 }
 
 /// Keep a tool's name alive across the multiple `AgentStreamEvent::ToolCall` frames
@@ -3891,7 +4068,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 Vec::new()
             };
             let options = if options.is_empty() {
-                default_permission_options()
+                default_permission_options(input.as_ref())
             } else {
                 options
             };
@@ -4236,10 +4413,15 @@ mod build_mapping_tests {
                 skills: vec!["writer".into()],
                 mcp_servers: vec![McpServerSpec {
                     name: "team".into(),
+                    auto_approve_in_unattended: false,
                     transport: McpTransport::Stdio {
                         command: "node".into(),
                         args: vec!["srv.js".into()],
-                        env: vec![("K".into(), "V".into())],
+                        env: vec![
+                            ("K".into(), "V".into()),
+                            ("MCP_REMOTE_CONFIG_DIR".into(), "/private/plugin-auth/linear/id".into()),
+                            ("ELLM_SHA_PRIVATE_CLOCKIFY_API_KEY".into(), "fixture-api-key".into()),
+                        ],
                     },
                 }],
                 resume: true,
@@ -4263,6 +4445,18 @@ mod build_mapping_tests {
         assert_eq!(v["resolved_context"]["spawn_env"][0]["value"], "raw-token");
         assert_eq!(v["resolved_context"]["mcp_servers"][0]["name"], "team");
         assert_eq!(v["resolved_context"]["mcp_servers"][0]["transport"]["type"], "stdio");
+        assert_eq!(
+            v["resolved_context"]["mcp_servers"][0]["transport"]["env"][0]["value"],
+            "V"
+        );
+        assert_eq!(
+            v["resolved_context"]["mcp_servers"][0]["transport"]["env"][1]["value"],
+            "<private>"
+        );
+        assert_eq!(
+            v["resolved_context"]["mcp_servers"][0]["transport"]["env"][2]["value"],
+            "<private>"
+        );
     }
 
     // Minimal catalog row for spec_mode_model's mode-normalize step. `backend` +
@@ -4550,19 +4744,22 @@ mod build_mapping_tests {
         assert_eq!(codex_sandbox_for_mode(None), None);
     }
 
-    /// Sibling of the sandbox map: a full-access / yolo mode drops approvals
-    /// (→ "never"); everything else stays at on-request (None). Ported verbatim.
+    /// Sibling of the sandbox map: Auto and full-access run without per-action
+    /// prompts. Auto remains workspace sandboxed; full-access is unsandboxed.
+    /// Read-only and unknown/manual modes keep on-request.
     #[test]
-    fn codex_approval_maps_only_full_access_modes() {
+    fn codex_approval_maps_auto_and_full_access_without_changing_manual_modes() {
         assert_eq!(codex_approval_for_mode(Some(":danger-full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("agent-full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("full-access")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("yoloNoSandbox")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some("  :danger-full-access  ")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some("auto")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some(":workspace")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some("default")), Some("never"));
+        assert_eq!(codex_approval_for_mode(Some("autoEdit")), Some("never"));
         assert_eq!(codex_approval_for_mode(Some(":read-only")), None);
-        assert_eq!(codex_approval_for_mode(Some(":workspace")), None);
         assert_eq!(codex_approval_for_mode(Some("plan")), None);
-        assert_eq!(codex_approval_for_mode(Some("default")), None);
         assert_eq!(codex_approval_for_mode(None), None);
     }
 
@@ -4580,8 +4777,10 @@ mod build_mapping_tests {
                 args: vec!["s.js".into()],
                 env: HashMap::from([("B".into(), "2".into()), ("A".into(), "1".into())]),
             },
+            auto_approve_in_unattended: true,
         });
         assert_eq!(stdio.name, "fs");
+        assert!(stdio.auto_approve_in_unattended);
         match stdio.transport {
             McpTransport::Stdio { command, env, .. } => {
                 assert_eq!(command, "/node");
@@ -4608,6 +4807,7 @@ mod build_mapping_tests {
                 id: "2".into(),
                 name: "h".into(),
                 transport: t,
+                auto_approve_in_unattended: false,
             });
             assert!(
                 matches!(spec.transport, McpTransport::Http { .. }),
@@ -4791,6 +4991,50 @@ mod translate_tests {
         assert_eq!(req.options.len(), 3);
         let ids: Vec<&str> = req.options.iter().map(|o| o.option_id.as_str()).collect();
         assert_eq!(ids, vec!["allow", "allow_always", "reject"]);
+    }
+
+    #[test]
+    fn codex_mcp_approval_options_match_advertised_persistence_scopes() {
+        let events = translate_event(
+            SessionEvent::Permission {
+                request_id: "elicit:23".into(),
+                kind: PermissionKind::Tool,
+                metadata: None,
+                tool_name: Some("Safe Echo".into()),
+                input: Some(serde_json::json!({
+                    "serverName": "plugin:sd07-live-qa:safe-echo",
+                    "_meta": {
+                        "codex_approval_kind": "mcp_tool_call",
+                        "persist": ["session", "always"]
+                    }
+                })),
+            },
+            "conv-1",
+            false,
+        );
+        let crate::protocol::events::AgentStreamEvent::AcpPermission(
+            crate::protocol::events::AcpPermissionEventData::Request(req),
+        ) = &events[0]
+        else {
+            panic!("expected AcpPermission Request");
+        };
+        let ids: Vec<&str> = req.options.iter().map(|option| option.option_id.as_str()).collect();
+        assert_eq!(ids, vec!["allow", "allow_mcp_session", "allow_mcp_always", "reject"]);
+
+        let one_time_only = default_permission_options(Some(&serde_json::json!({
+            "_meta": {"codex_approval_kind": "mcp_tool_call"}
+        })));
+        let ids: Vec<&str> = one_time_only.iter().map(|option| option.option_id.as_str()).collect();
+        assert_eq!(ids, vec!["allow", "reject"]);
+
+        assert_eq!(
+            permission_decision_from_choice(Some(PERM_ALLOW_MCP_SESSION), false),
+            (aionui_session::PermissionDecision::AllowAlways, Some("session".into()))
+        );
+        assert_eq!(
+            permission_decision_from_choice(Some(PERM_ALLOW_MCP_ALWAYS), false),
+            (aionui_session::PermissionDecision::AllowAlways, Some("always".into()))
+        );
     }
 
     // An AskUserQuestion permission must surface the QUESTION's own option labels as
@@ -6120,6 +6364,90 @@ mod pump_tests {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_only_call_id_never_becomes_a_child_stream() {
+        use aionui_session::SubagentStatus;
+        let real_ref = "01a120cc-child";
+        let frames = drain_script(vec![
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "call_070055264322442a9ffc26ff54b874c5".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("01a120cc-parent".into()),
+                kind: None,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: real_ref.into(),
+                label: Some("qa_alpha".into()),
+                status: SubagentStatus::Running,
+                parent_ref: Some("01a120cc-parent".into()),
+                kind: None,
+            }),
+            env(SessionEvent::SubagentStream {
+                r#ref: real_ref.into(),
+                event: Box::new(SessionEvent::MessageDelta {
+                    item_id: "child-message".into(),
+                    text: "QA_ALPHA_START".into(),
+                }),
+            }),
+        ])
+        .await;
+        let children: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Subagent(data) => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert!(!children.is_empty());
+        assert!(children.iter().all(|data| data.r#ref == real_ref));
+        assert!(children.iter().any(|data| data.label.as_deref() == Some("qa_alpha")));
+        assert!(children.iter().any(|data| matches!(
+            data.event.as_deref(),
+            Some(AgentStreamEvent::Text(text)) if text.content == "QA_ALPHA_START"
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_agent_messages_emit_segment_boundaries() {
+        let frames = drain_script(vec![
+            env(SessionEvent::ItemStarted {
+                item_id: "m1".into(),
+                kind: aionui_session::ItemKind::Text,
+            }),
+            env(SessionEvent::MessageDelta {
+                item_id: "m1".into(),
+                text: "commentary".into(),
+            }),
+            env(SessionEvent::ItemCompleted {
+                item_id: "m1".into(),
+                truncation: None,
+            }),
+            env(SessionEvent::ItemStarted {
+                item_id: "m2".into(),
+                kind: aionui_session::ItemKind::Text,
+            }),
+            env(SessionEvent::MessageDelta {
+                item_id: "m2".into(),
+                text: "final".into(),
+            }),
+            env(SessionEvent::ItemCompleted {
+                item_id: "m2".into(),
+                truncation: None,
+            }),
+        ])
+        .await;
+        let sequence: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Text(text) => Some(text.content.as_str()),
+                AgentStreamEvent::SegmentBreak => Some("<break>"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequence, vec!["commentary", "<break>", "final", "<break>"]);
     }
 
     // SessionTitle (claude generate_session_title, spec 2026-08-04) maps to the
@@ -7765,6 +8093,7 @@ mod pump_tests {
                     "options": [{"label": "A"}, {"label": "B"}]
                 }]
             })),
+            input: None,
         }));
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -7795,6 +8124,10 @@ mod pump_tests {
             request_id: "req-tool".into(),
             tool_name: "Bash".into(),
             questions: None,
+            input: Some(serde_json::json!({
+                "command": "git status --short",
+                "cwd": "/work"
+            })),
         }));
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -7806,6 +8139,11 @@ mod pump_tests {
         );
         let confs = task.get_confirmations();
         assert_eq!(confs.len(), 1);
+        assert!(confs[0].description.contains("git status --short"));
+        assert!(
+            confs[0].description.contains("/work"),
+            "recovered approval keeps command context as well as the command"
+        );
         let vals: Vec<String> = confs[0]
             .options
             .iter()

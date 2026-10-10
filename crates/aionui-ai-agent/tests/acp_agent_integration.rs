@@ -199,6 +199,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
         AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
         AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+        AgentStreamEvent::Subagent(_) => "Subagent",
     }
 }
 

@@ -89,6 +89,13 @@ pub(crate) fn data() -> Value {
                 no_input(&["skills", "market", "enable"], "Enable the skill market.", true),
                 no_input(&["skills", "market", "disable"], "Disable the skill market.", true),
             ]),
+            domain("plugins", &[
+                no_input(&["plugins", "list"], "List installed plugins and compatibility diagnostics.", false),
+                stdin(&["plugins", "install"], "Install or update a plugin from a local path or Git URL.", &["type", "path", "url"], &[], true, false),
+                stdin(&["plugins", "enable"], "Enable a plugin globally or for an existing project scope.", &["name", "scope", "project_id"], &[], true, false),
+                stdin(&["plugins", "disable"], "Disable a plugin globally or for an existing project scope.", &["name", "scope", "project_id"], &[], true, false),
+                stdin(&["plugins", "uninstall"], "Remove a persistent user plugin.", &["name"], &[], true, true),
+            ]),
             domain("mcp", &[
                 no_input_redacted(&["mcp", "servers", "list"], "List MCP servers.", false, &["transport.headers", "transport.env"]),
                 stdin_redacted(&["mcp", "servers", "get"], "Read one MCP server.", &["server_id"], &[], false, false, &["transport.headers", "transport.env"]),

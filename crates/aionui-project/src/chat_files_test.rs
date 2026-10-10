@@ -4,9 +4,9 @@ use aionui_common::constants::AIONUI_FILES_MARKER;
 use aionui_db::{IProjectStore, SqliteProjectStore, init_database_memory};
 use tempfile::TempDir;
 
-use crate::ProjectService;
 use crate::canonical::to_file_uri;
 use crate::types::ProjectError;
+use crate::{ManagedUploadStore, ProjectService};
 use aionui_api_types::ChatFileRef;
 
 /// Build a service with a tempdir standard project. Returns (service, pe_id,
@@ -14,19 +14,24 @@ use aionui_api_types::ChatFileRef;
 async fn setup() -> (Arc<ProjectService>, String, TempDir, TempDir) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
+    let upload_root = tempfile::tempdir().unwrap();
+    let legacy_root = tempfile::tempdir().unwrap();
+    let service = Arc::new(
+        ProjectService::new(Arc::clone(&store), std::env::temp_dir()).with_managed_uploads(
+            ManagedUploadStore::for_test(upload_root.path().to_path_buf(), legacy_root.path().to_path_buf()),
+        ),
+    );
     let dir = tempfile::tempdir().unwrap();
     let created = service
         .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
         .await
         .unwrap();
-    let upload_root = tempfile::tempdir().unwrap();
     (service, created.project_explorer.pe_id, dir, upload_root)
 }
 
 #[tokio::test]
 async fn resolves_project_file_and_inlines_marker() {
-    let (service, pe_id, dir, upload_root) = setup().await;
+    let (service, pe_id, dir, _upload_root) = setup().await;
     std::fs::write(dir.path().join("note.txt"), b"hi").unwrap();
 
     let out = service
@@ -37,7 +42,6 @@ async fn resolves_project_file_and_inlines_marker() {
                 pe_id: pe_id.clone(),
                 relative_path: "note.txt".into(),
             }],
-            upload_root.path(),
         )
         .await
         .unwrap();
@@ -54,7 +58,7 @@ async fn resolves_project_file_and_inlines_marker() {
 
 #[tokio::test]
 async fn resolves_project_directory_ref() {
-    let (service, pe_id, dir, upload_root) = setup().await;
+    let (service, pe_id, dir, _upload_root) = setup().await;
     std::fs::create_dir(dir.path().join("sub")).unwrap();
 
     // A folder attachment (tree right-click on a directory) must resolve, not
@@ -67,7 +71,6 @@ async fn resolves_project_directory_ref() {
                 pe_id,
                 relative_path: "sub".into(),
             }],
-            upload_root.path(),
         )
         .await
         .unwrap();
@@ -77,9 +80,9 @@ async fn resolves_project_directory_ref() {
 
 #[tokio::test]
 async fn empty_files_leaves_content_unchanged() {
-    let (service, _pe, _dir, upload_root) = setup().await;
+    let (service, _pe, _dir, _upload_root) = setup().await;
     let out = service
-        .resolve_chat_message("system_default_user", "hi", &[], upload_root.path())
+        .resolve_chat_message("system_default_user", "hi", &[])
         .await
         .unwrap();
     assert_eq!(out.content, "hi");
@@ -88,7 +91,7 @@ async fn empty_files_leaves_content_unchanged() {
 
 #[tokio::test]
 async fn missing_project_file_is_atomic_error() {
-    let (service, pe_id, _dir, upload_root) = setup().await;
+    let (service, pe_id, _dir, _upload_root) = setup().await;
     let err = service
         .resolve_chat_message(
             "system_default_user",
@@ -97,7 +100,6 @@ async fn missing_project_file_is_atomic_error() {
                 pe_id,
                 relative_path: "nope.txt".into(),
             }],
-            upload_root.path(),
         )
         .await
         .unwrap_err();
@@ -106,18 +108,14 @@ async fn missing_project_file_is_atomic_error() {
 
 #[tokio::test]
 async fn upload_under_root_is_accepted() {
-    let (service, _pe, _dir, upload_root) = setup().await;
-    let up = upload_root.path().join("u.png");
-    std::fs::write(&up, b"x").unwrap();
-    let path = up.to_string_lossy().into_owned();
+    let (service, _pe, _dir, _upload_root) = setup().await;
+    let path = service
+        .create_upload_file("system_default_user", "u.png", b"x", Some("conv"))
+        .await
+        .unwrap();
 
     let out = service
-        .resolve_chat_message(
-            "system_default_user",
-            "",
-            &[ChatFileRef::Upload { path: path.clone() }],
-            upload_root.path(),
-        )
+        .resolve_chat_message("system_default_user", "", &[ChatFileRef::Upload { path: path.clone() }])
         .await
         .unwrap();
     assert_eq!(out.files, vec![path]);
@@ -125,7 +123,7 @@ async fn upload_under_root_is_accepted() {
 
 #[tokio::test]
 async fn local_readable_file_resolves_and_inlines_marker() {
-    let (service, _pe, _dir, upload_root) = setup().await;
+    let (service, _pe, _dir, _upload_root) = setup().await;
     // A file anywhere on disk (outside the managed upload root) — `local` has no
     // managed-directory restriction, only existence + is-file.
     let outside = tempfile::tempdir().unwrap();
@@ -134,12 +132,7 @@ async fn local_readable_file_resolves_and_inlines_marker() {
     let path = f.to_string_lossy().into_owned();
 
     let out = service
-        .resolve_chat_message(
-            "system_default_user",
-            "see this",
-            &[ChatFileRef::Local { path }],
-            upload_root.path(),
-        )
+        .resolve_chat_message("system_default_user", "see this", &[ChatFileRef::Local { path }])
         .await
         .unwrap();
 
@@ -154,7 +147,7 @@ async fn local_readable_file_resolves_and_inlines_marker() {
 #[cfg(unix)]
 #[tokio::test]
 async fn local_canonicalizes_symlink_to_target_path() {
-    let (service, _pe, _dir, upload_root) = setup().await;
+    let (service, _pe, _dir, _upload_root) = setup().await;
     // A symlink whose name differs from its target, so we can prove the
     // resolved path is the *target* (canonicalized), not the link we were given.
     let d = tempfile::tempdir().unwrap();
@@ -171,7 +164,6 @@ async fn local_canonicalizes_symlink_to_target_path() {
             &[ChatFileRef::Local {
                 path: link_path.clone(),
             }],
-            upload_root.path(),
         )
         .await
         .unwrap();
@@ -196,12 +188,7 @@ async fn local_nonexistent_is_rejected() {
     let missing = upload_root.path().join("nope.txt").to_string_lossy().into_owned();
 
     let err = service
-        .resolve_chat_message(
-            "system_default_user",
-            "x",
-            &[ChatFileRef::Local { path: missing }],
-            upload_root.path(),
-        )
+        .resolve_chat_message("system_default_user", "x", &[ChatFileRef::Local { path: missing }])
         .await
         .unwrap_err();
     assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
@@ -209,18 +196,13 @@ async fn local_nonexistent_is_rejected() {
 
 #[tokio::test]
 async fn local_directory_is_rejected() {
-    let (service, _pe, _dir, upload_root) = setup().await;
+    let (service, _pe, _dir, _upload_root) = setup().await;
     // A real directory is not a regular file → rejected.
     let d = tempfile::tempdir().unwrap();
     let path = d.path().to_string_lossy().into_owned();
 
     let err = service
-        .resolve_chat_message(
-            "system_default_user",
-            "x",
-            &[ChatFileRef::Local { path }],
-            upload_root.path(),
-        )
+        .resolve_chat_message("system_default_user", "x", &[ChatFileRef::Local { path }])
         .await
         .unwrap_err();
     assert!(matches!(err, ProjectError::LocalPathNotReadable { .. }), "got {err:?}");
@@ -228,7 +210,7 @@ async fn local_directory_is_rejected() {
 
 #[tokio::test]
 async fn upload_outside_root_is_rejected() {
-    let (service, _pe, _dir, upload_root) = setup().await;
+    let (service, _pe, _dir, _upload_root) = setup().await;
     // A real file, but outside the managed upload dir.
     let outside = tempfile::tempdir().unwrap();
     let ext = outside.path().join("secret.txt");
@@ -241,7 +223,6 @@ async fn upload_outside_root_is_rejected() {
             &[ChatFileRef::Upload {
                 path: ext.to_string_lossy().into_owned(),
             }],
-            upload_root.path(),
         )
         .await
         .unwrap_err();

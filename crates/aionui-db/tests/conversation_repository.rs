@@ -155,6 +155,83 @@ async fn delete_conversation_cascades_messages() {
     assert_eq!(remaining, 0);
 }
 
+#[tokio::test]
+async fn delete_parent_conversation_removes_persisted_subagent_histories() {
+    let (repo, db) = setup().await;
+    let parent = make_conversation("parent");
+    repo.create(&parent).await.unwrap();
+    let mut child = make_conversation("child");
+    child.extra = serde_json::json!({
+        "subagent": {
+            "parent_conversation_id": parent.id.clone(),
+            "ref": "child-thread",
+            "status": "completed"
+        }
+    })
+    .to_string();
+    repo.create(&child).await.unwrap();
+    repo.insert_message(&child.user_id, &make_message(&child.id, "child result"))
+        .await
+        .unwrap();
+
+    repo.delete(&parent.user_id, &parent.id).await.unwrap();
+
+    assert!(repo.get(&child.user_id, &child.id).await.unwrap().is_none());
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(&child.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn reconcile_removes_only_empty_call_id_subagent_placeholders() {
+    let (repo, _db) = setup().await;
+    let parent = make_conversation("parent");
+    repo.create(&parent).await.unwrap();
+
+    let make_child = |child_ref: &str| {
+        let mut child = make_conversation("child");
+        child.id = format!("subagent:{}:{child_ref}", parent.id);
+        child.name = child_ref.to_owned();
+        child.status = Some("finished".to_owned());
+        child.name_source = Some("agent".to_owned());
+        child.extra = serde_json::json!({
+            "subagent": {
+                "parent_conversation_id": parent.id,
+                "parent_ref": "01a120cc-parent",
+                "ref": child_ref,
+                "status": "completed"
+            }
+        })
+        .to_string();
+        child
+    };
+
+    let phantom = make_child("call_070055264322442a9ffc26ff54b874c5");
+    let child_with_history = make_child("call_legitimate-history");
+    let real_thread = make_child("01a120cc-71b8-7c32-8d9b-689c855cceda");
+    for child in [&phantom, &child_with_history, &real_thread] {
+        repo.create(child).await.unwrap();
+    }
+    repo.insert_message(
+        USER_ID,
+        &make_message(&child_with_history.id, "must keep non-empty history"),
+    )
+    .await
+    .unwrap();
+
+    let removed = repo
+        .reconcile_empty_subagent_tool_placeholders(USER_ID, &parent.id)
+        .await
+        .unwrap();
+    assert_eq!(removed, vec![phantom.id.clone()]);
+    assert!(repo.get(USER_ID, &phantom.id).await.unwrap().is_none());
+    assert!(repo.get(USER_ID, &child_with_history.id).await.unwrap().is_some());
+    assert!(repo.get(USER_ID, &real_thread.id).await.unwrap().is_some());
+}
+
 // ── Cursor pagination ───────────────────────────────────────────────
 
 #[tokio::test]
@@ -873,7 +950,7 @@ async fn search_messages_across_conversations() {
     let msg3 = make_message(&c1.id, "unrelated content");
     repo.insert_message(&c1.user_id, &msg3).await.unwrap();
 
-    let result = repo.search_messages(USER_ID, "审查", 1, 20).await.unwrap();
+    let result = repo.search_messages(USER_ID, "审查", 1, 20, None, None).await.unwrap();
     assert_eq!(result.total, 2);
     assert_eq!(result.items.len(), 2);
 
@@ -893,7 +970,7 @@ async fn search_messages_empty_result() {
     repo.insert_message(&conv.user_id, &msg).await.unwrap();
 
     let result = repo
-        .search_messages(USER_ID, "nonexistent_keyword", 1, 20)
+        .search_messages(USER_ID, "nonexistent_keyword", 1, 20, None, None)
         .await
         .unwrap();
     assert!(result.items.is_empty());
@@ -913,16 +990,25 @@ async fn search_messages_pagination() {
         repo.insert_message(&conv.user_id, &msg).await.unwrap();
     }
 
-    let p1 = repo.search_messages(USER_ID, "searchable", 1, 2).await.unwrap();
+    let p1 = repo
+        .search_messages(USER_ID, "searchable", 1, 2, None, None)
+        .await
+        .unwrap();
     assert_eq!(p1.items.len(), 2);
     assert_eq!(p1.total, 5);
     assert!(p1.has_more);
 
-    let p2 = repo.search_messages(USER_ID, "searchable", 2, 2).await.unwrap();
+    let p2 = repo
+        .search_messages(USER_ID, "searchable", 2, 2, None, None)
+        .await
+        .unwrap();
     assert_eq!(p2.items.len(), 2);
     assert!(p2.has_more);
 
-    let p3 = repo.search_messages(USER_ID, "searchable", 3, 2).await.unwrap();
+    let p3 = repo
+        .search_messages(USER_ID, "searchable", 3, 2, None, None)
+        .await
+        .unwrap();
     assert_eq!(p3.items.len(), 1);
     assert!(!p3.has_more);
 }

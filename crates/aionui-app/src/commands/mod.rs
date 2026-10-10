@@ -5,6 +5,7 @@
 
 pub(crate) mod cmd_antigravity_hook;
 pub(crate) mod cmd_capabilities;
+pub(crate) mod cmd_clockify_stdio;
 pub(crate) mod cmd_config;
 pub(crate) mod cmd_diagnose;
 pub(crate) mod cmd_doctor;
@@ -20,6 +21,7 @@ pub(crate) mod team_capabilities;
 
 pub(crate) use cmd_antigravity_hook::run_antigravity_hook;
 pub(crate) use cmd_capabilities::run_capabilities;
+pub(crate) use cmd_clockify_stdio::run_clockify_stdio;
 pub(crate) use cmd_config::run_config;
 pub(crate) use cmd_diagnose::run_diagnose;
 pub(crate) use cmd_doctor::run_doctor;

@@ -123,6 +123,8 @@ pub(crate) enum Command {
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
+    /// MCP stdio server for one verified Clockify account.
+    McpClockifyStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
     /// and print a per-agent availability table. Useful when the user
     /// reports "no agent works" — running this from the same shell the
@@ -143,6 +145,7 @@ impl Command {
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
+            Self::McpClockifyStdio => "mcp-clockify-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
         }
@@ -306,6 +309,8 @@ pub(crate) enum ConfigCommand {
     Assistants(ConfigAssistantsArgs),
     /// Manage AionUi skills.
     Skills(ConfigSkillsArgs),
+    /// Inspect, install, bind, and remove plugins.
+    Plugins(ConfigPluginsArgs),
     /// Manage MCP servers and OAuth state.
     Mcp(ConfigMcpArgs),
     /// Manage model providers.
@@ -397,6 +402,21 @@ pub(crate) struct ConfigSkillsMarketArgs {
 pub(crate) enum ConfigSkillsMarketCommand {
     Enable,
     Disable,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct ConfigPluginsArgs {
+    #[command(subcommand)]
+    pub command: ConfigPluginsCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ConfigPluginsCommand {
+    List,
+    Install,
+    Enable,
+    Disable,
+    Uninstall,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -775,6 +795,11 @@ mod tests {
             &["aioncore", "config", "skills", "import"],
             &["aioncore", "config", "skills", "delete"],
             &["aioncore", "config", "skills", "scan"],
+            &["aioncore", "config", "plugins", "list"],
+            &["aioncore", "config", "plugins", "install"],
+            &["aioncore", "config", "plugins", "enable"],
+            &["aioncore", "config", "plugins", "disable"],
+            &["aioncore", "config", "plugins", "uninstall"],
             &["aioncore", "config", "mcp", "servers", "list"],
             &["aioncore", "config", "mcp", "servers", "get"],
             &["aioncore", "config", "mcp", "servers", "create"],

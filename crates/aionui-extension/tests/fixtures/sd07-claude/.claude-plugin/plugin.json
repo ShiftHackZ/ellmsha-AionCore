@@ -1,0 +1,17 @@
+{
+  "name": "sd07-claude-fixture",
+  "version": "2.0.0",
+  "displayName": "SD07 Claude Fixture",
+  "description": "Claude compatibility fixture based on the installed Mobile MCP package layout.",
+  "author": {
+    "name": "eLLMsha Test"
+  },
+  "mcpServers": {
+    "docs": {
+      "type": "streamable-http",
+      "url": "https://example.invalid/mcp"
+    }
+  },
+  "agents": ["./agents/reviewer.md"],
+  "lspServers": "./.lsp.json"
+}

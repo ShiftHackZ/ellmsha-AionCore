@@ -85,6 +85,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let servers = vec![McpServerSpec {
             name: "aionui-team".into(),
+            auto_approve_in_unattended: false,
             transport: McpTransport::Stdio {
                 command: "/opt/aionui/backend".into(),
                 args: vec!["mcp-team-stdio".into()],
@@ -109,6 +110,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let servers = vec![McpServerSpec {
             name: "remote".into(),
+            auto_approve_in_unattended: false,
             transport: McpTransport::Sse {
                 url: "https://api.example.com/sse".into(),
                 headers: vec![("Authorization".into(), "Bearer t".into())],
@@ -130,6 +132,7 @@ mod tests {
         let servers = vec![
             McpServerSpec {
                 name: "unsupported".into(),
+                auto_approve_in_unattended: false,
                 transport: McpTransport::Http {
                     url: "https://x/mcp".into(),
                     headers: vec![],
@@ -137,6 +140,7 @@ mod tests {
             },
             McpServerSpec {
                 name: "kept".into(),
+                auto_approve_in_unattended: false,
                 transport: McpTransport::Stdio {
                     command: "node".into(),
                     args: vec![],

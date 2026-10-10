@@ -426,6 +426,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         assert!(validate_manifest(&manifest).is_ok());
     }
@@ -449,6 +450,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -473,6 +475,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(
@@ -502,6 +505,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                compatibility: None,
             };
             assert!(
                 validate_manifest(&manifest).is_err(),
@@ -529,6 +533,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         assert!(validate_manifest(&manifest).is_err());
     }
@@ -552,6 +557,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::ManifestValidation(_)));
@@ -576,6 +582,7 @@ mod tests {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         };
         let err = validate_manifest(&manifest).unwrap_err();
         assert!(matches!(err, ExtensionError::InvalidVersion { .. }));
@@ -601,6 +608,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                compatibility: None,
             };
             assert!(
                 validate_manifest(&manifest).is_ok(),

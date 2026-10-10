@@ -36,7 +36,7 @@ use tracing::{info, warn};
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
-use crate::stream_persistence::StreamPersistenceAdapter;
+use crate::stream_persistence::{StreamPersistenceAdapter, SubagentTranscriptStore};
 use crate::stream_relay::StreamRelay;
 
 /// An orphan turn with NO frame for this long is presumed abandoned (a stray
@@ -85,6 +85,37 @@ impl BackgroundStreamWatcher {
         info!(
             conversation_id = %self.conversation_id,
             "background stream watcher started"
+        );
+        match self
+            .repo
+            .reconcile_empty_subagent_tool_placeholders(&self.user_id, &self.conversation_id)
+            .await
+        {
+            Ok(ids) => {
+                for id in ids {
+                    self.broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
+                        "conversation.listChanged",
+                        json!({
+                            "user_id": self.user_id,
+                            "conversation_id": id,
+                            "parent_conversation_id": self.conversation_id,
+                            "action": "deleted",
+                            "source": "subagent_reconciliation",
+                        }),
+                    ));
+                }
+            }
+            Err(err) => warn!(
+                conversation_id = %self.conversation_id,
+                error = %ErrorChain(&err),
+                "failed to reconcile empty subagent tool placeholders"
+            ),
+        }
+        let mut subagents = SubagentTranscriptStore::new(
+            self.user_id.clone(),
+            self.conversation_id.clone(),
+            self.repo.clone(),
+            self.broadcaster.clone(),
         );
         loop {
             let ev = match rx.recv().await {
@@ -144,6 +175,13 @@ impl BackgroundStreamWatcher {
             // Title-only watchers (ACP manager instances) stop here: orphan
             // turns and card refreshes are Session-instance semantics.
             if self.title_only {
+                continue;
+            }
+            // Child transcripts have one session-lifetime owner. Consume them
+            // regardless of the parent's active-turn state so a parent terminal
+            // cannot split or discard a child's buffered text/thinking.
+            if let AgentStreamEvent::Subagent(data) = &ev {
+                subagents.apply(data).await;
                 continue;
             }
             // While a user turn is active its own relay owns the stream.
@@ -348,7 +386,7 @@ mod tests {
     use aionui_ai_agent::protocol::events::tool_call::{
         ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
     };
-    use aionui_ai_agent::protocol::events::{FinishEventData, TextEventData};
+    use aionui_ai_agent::protocol::events::{FinishEventData, SubagentEventData, TextEventData};
     use aionui_common::now_ms;
     use aionui_db::models::ConversationRow;
     use aionui_db::{
@@ -753,5 +791,159 @@ mod tests {
             }
         }
         assert!(saw_name_updated, "nameUpdated must be broadcast");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_transcript_survives_parent_turn_boundary() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        let parent_claim = rig
+            .runtime_state
+            .try_claim_turn("conv-1", "parent-turn")
+            .expect("parent turn claimed");
+
+        for data in [
+            SubagentEventData {
+                r#ref: "child-thread".into(),
+                label: Some("reviewer".into()),
+                parent_ref: Some("root-thread".into()),
+                status: Some("running".into()),
+                event: None,
+            },
+            SubagentEventData {
+                r#ref: "child-thread".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Text(TextEventData {
+                    content: "before parent finish ".into(),
+                }))),
+            },
+        ] {
+            rig.tx.send(AgentStreamEvent::Subagent(data)).unwrap();
+        }
+        // The active parent relay consumes its own terminal; the permanent
+        // watcher must retain the child's unflushed buffer across that boundary.
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        drop(parent_claim);
+
+        for data in [
+            SubagentEventData {
+                r#ref: "child-thread".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Text(TextEventData {
+                    content: "after parent finish".into(),
+                }))),
+            },
+            SubagentEventData {
+                r#ref: "child-thread".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Finish(FinishEventData::default()))),
+            },
+        ] {
+            rig.tx.send(AgentStreamEvent::Subagent(data)).unwrap();
+        }
+
+        let child_id = "subagent:conv-1:child-thread";
+        let message = eventually(|| async {
+            let page = rig
+                .repo
+                .list_messages_page(
+                    &rig.user_id,
+                    child_id,
+                    &aionui_db::MessagePageParams {
+                        limit: 10,
+                        direction: aionui_db::MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .ok()?;
+            page.items.into_iter().find(|row| row.r#type == "text")
+        })
+        .await
+        .expect("child transcript persisted after its own terminal");
+        assert_eq!(message.status.as_deref(), Some("finish"));
+        assert!(message.content.contains("before parent finish after parent finish"));
+        let child_frames: Vec<_> = std::iter::from_fn(|| ws.try_recv().ok())
+            .filter(|event| event.name == "message.stream" && event.data["conversation_id"] == child_id)
+            .collect();
+        assert!(!child_frames.is_empty());
+        assert!(child_frames.iter().all(|event| event.data["user_id"] == rig.user_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_segment_break_persists_distinct_message_rows() {
+        let rig = rig().await;
+        for data in [
+            SubagentEventData {
+                r#ref: "child-boundaries".into(),
+                label: Some("qa_alpha".into()),
+                parent_ref: Some("root-thread".into()),
+                status: Some("running".into()),
+                event: None,
+            },
+            SubagentEventData {
+                r#ref: "child-boundaries".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Text(TextEventData {
+                    content: "commentary".into(),
+                }))),
+            },
+            SubagentEventData {
+                r#ref: "child-boundaries".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::SegmentBreak)),
+            },
+            SubagentEventData {
+                r#ref: "child-boundaries".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Text(TextEventData {
+                    content: "final".into(),
+                }))),
+            },
+            SubagentEventData {
+                r#ref: "child-boundaries".into(),
+                label: None,
+                parent_ref: None,
+                status: None,
+                event: Some(Box::new(AgentStreamEvent::Finish(FinishEventData::default()))),
+            },
+        ] {
+            rig.tx.send(AgentStreamEvent::Subagent(data)).unwrap();
+        }
+
+        let child_id = "subagent:conv-1:child-boundaries";
+        let messages = eventually(|| async {
+            let page = rig
+                .repo
+                .list_messages_page(
+                    &rig.user_id,
+                    child_id,
+                    &aionui_db::MessagePageParams {
+                        limit: 10,
+                        direction: aionui_db::MessagePageDirection::InitialLatest,
+                    },
+                )
+                .await
+                .ok()?;
+            let text: Vec<_> = page.items.into_iter().filter(|row| row.r#type == "text").collect();
+            (text.len() == 2).then_some(text)
+        })
+        .await
+        .expect("both child message segments persisted");
+        assert!(messages[0].content.contains("commentary"));
+        assert!(messages[1].content.contains("final"));
     }
 }

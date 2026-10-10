@@ -75,7 +75,7 @@ fn build_aionrs_final_input_dump_value(
     context: &AionrsFinalInputDumpContext,
     data: &SendMessageData,
 ) -> Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": "aionrs-final-input",
         "backend": "aionrs",
         "conversation_id": conversation_id,
@@ -98,7 +98,9 @@ fn build_aionrs_final_input_dump_value(
             "mcp_servers": serde_json::to_value(&context.mcp_servers).unwrap_or(Value::Null),
             "runtime_env": &context.runtime_env,
         },
-    })
+    });
+    crate::dev_prompt_dump::redact_private_plugin_values(&mut value);
+    value
 }
 
 pub struct AionrsAgentManager {

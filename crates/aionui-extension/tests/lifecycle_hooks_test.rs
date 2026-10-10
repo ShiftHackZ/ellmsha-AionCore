@@ -212,6 +212,19 @@ async fn lh6_missing_script_graceful() {
     }
 }
 
+#[tokio::test]
+async fn hook_path_cannot_escape_extension_directory() {
+    let parent = setup_ext_dir();
+    let extension = parent.path().join("extension");
+    fs::create_dir_all(&extension).unwrap();
+    write_script(parent.path(), "outside.sh", "exit 0");
+
+    let error = execute_hook(&extension, "../outside.sh", HookKind::OnActivate, "test-ext")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, aionui_extension::ExtensionError::PathTraversal(_)));
+}
+
 // ---------------------------------------------------------------------------
 // Additional: resolve_hook_path returns None when hook is not declared
 // ---------------------------------------------------------------------------

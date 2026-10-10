@@ -1,12 +1,12 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use aionui_ai_agent::protocol::events::{
-    ErrorEventData, TipType, TipsEventData,
+    AgentStreamEvent, ErrorEventData, SubagentEventData, TipType, TipsEventData,
     tool_call::{AcpToolCallStatus, ToolCallStatus},
 };
 use aionui_api_types::{ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
-use aionui_db::models::MessageRow;
+use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{ConversationRowUpdate, DbError, IConversationRepository, MessageRowUpdate};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -55,6 +55,334 @@ pub(crate) struct ThinkingSegmentState {
     pub id: String,
     pub buffer: String,
     pub started_at: i64,
+}
+
+struct SubagentTranscriptState {
+    conversation_id: String,
+    adapter: StreamPersistenceAdapter,
+    active_text: Option<TextSegmentState>,
+    active_thinking: Option<ThinkingSegmentState>,
+}
+
+/// Stores attributed child-thread output under a read-only conversation. The
+/// relation is persisted in `extra`; rows are created only from live child
+/// events, so historical mixed transcripts are never guessed.
+pub(crate) struct SubagentTranscriptStore {
+    user_id: String,
+    parent_conversation_id: String,
+    repo: Arc<dyn IConversationRepository>,
+    broadcaster: Arc<dyn EventBroadcaster>,
+    states: HashMap<String, SubagentTranscriptState>,
+}
+
+impl SubagentTranscriptStore {
+    pub(crate) fn new(
+        user_id: String,
+        parent_conversation_id: String,
+        repo: Arc<dyn IConversationRepository>,
+        broadcaster: Arc<dyn EventBroadcaster>,
+    ) -> Self {
+        Self {
+            user_id,
+            parent_conversation_id,
+            repo,
+            broadcaster,
+            states: HashMap::new(),
+        }
+    }
+
+    fn child_id(&self, child_ref: &str) -> String {
+        format!("subagent:{}:{}", self.parent_conversation_id, child_ref)
+    }
+
+    async fn ensure_conversation(&self, data: &SubagentEventData) -> Option<String> {
+        let child_id = self.child_id(&data.r#ref);
+        let existing = match self.repo.get(&self.user_id, &child_id).await {
+            Ok(row) => row,
+            Err(err) => {
+                log_persist_error(&err, "Failed to load subagent conversation");
+                return None;
+            }
+        };
+        let row_status = data.status.as_deref().map(|status| {
+            if matches!(status, "pending_init" | "running") {
+                "running"
+            } else {
+                "finished"
+            }
+        });
+        if let Some(row) = existing {
+            if data.label.is_some() || data.status.is_some() || data.parent_ref.is_some() {
+                let mut extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_else(|_| json!({}));
+                merge_subagent_extra(&mut extra, data, &self.parent_conversation_id);
+                let update = ConversationRowUpdate {
+                    name: data.label.clone(),
+                    name_source: data.label.as_ref().map(|_| "agent".to_owned()),
+                    status: row_status.map(str::to_owned),
+                    extra: Some(extra.to_string()),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                };
+                if let Err(err) = self.repo.update(&self.user_id, &child_id, &update).await {
+                    log_persist_error(&err, "Failed to update subagent conversation");
+                }
+                self.broadcast_list_change(&child_id, "updated");
+            }
+            return Some(child_id);
+        }
+
+        let parent = match self.repo.get(&self.user_id, &self.parent_conversation_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(err) => {
+                log_persist_error(&err, "Failed to load parent conversation for subagent");
+                return None;
+            }
+        };
+        let mut extra = serde_json::from_str::<serde_json::Value>(&parent.extra).unwrap_or_else(|_| json!({}));
+        if let Some(object) = extra.as_object_mut() {
+            for key in [
+                "backend_session_id",
+                "acp_session_id",
+                "acp_session_updated_at",
+                "session_id",
+                "cron_job_id",
+                "pinned",
+                "pinned_at",
+                "fork",
+            ] {
+                object.remove(key);
+            }
+        }
+        merge_subagent_extra(&mut extra, data, &self.parent_conversation_id);
+        let now = now_ms();
+        let row = ConversationRow {
+            id: child_id.clone(),
+            user_id: self.user_id.clone(),
+            name: data.label.clone().unwrap_or_else(|| data.r#ref.clone()),
+            r#type: parent.r#type,
+            extra: extra.to_string(),
+            model: parent.model,
+            status: Some(row_status.unwrap_or("running").to_owned()),
+            source: parent.source,
+            channel_chat_id: parent.channel_chat_id,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: parent.project_id,
+            folder_id: parent.folder_id,
+            name_source: Some("agent".to_owned()),
+        };
+        if let Err(err) = self.repo.create(&row).await {
+            if !matches!(err, DbError::Conflict(_)) {
+                log_persist_error(&err, "Failed to create subagent conversation");
+                return None;
+            }
+        }
+        self.broadcast_list_change(&child_id, "created");
+        Some(child_id)
+    }
+
+    fn broadcast_list_change(&self, child_id: &str, action: &str) {
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.listChanged",
+            json!({
+                "user_id": self.user_id,
+                "conversation_id": child_id,
+                "parent_conversation_id": self.parent_conversation_id,
+                "action": action,
+                "source": "subagent",
+            }),
+        ));
+    }
+
+    fn forward(
+        broadcaster: &Arc<dyn EventBroadcaster>,
+        user_id: &str,
+        child_id: &str,
+        msg_id: &str,
+        child_ref: &str,
+        event: &AgentStreamEvent,
+    ) {
+        let Ok(mut serialized) = serde_json::to_value(event) else {
+            return;
+        };
+        normalize_keys_to_snake_case(&mut serialized);
+        broadcaster.broadcast(WebSocketMessage::new(
+            "message.stream",
+            json!({
+                "user_id": user_id,
+                "conversation_id": child_id,
+                "msg_id": msg_id,
+                "turn_id": child_ref,
+                "type": serialized.get("type").cloned().unwrap_or(json!("unknown")),
+                "data": serialized.get("data").cloned().unwrap_or(json!({})),
+                "hidden": false,
+            }),
+        ));
+    }
+
+    pub(crate) async fn apply(&mut self, data: &SubagentEventData) {
+        let mut normalized = data.clone();
+        if normalized.status.is_none() {
+            normalized.status = match normalized.event.as_deref() {
+                Some(AgentStreamEvent::Finish(_)) => Some("completed".to_owned()),
+                Some(AgentStreamEvent::Error(_)) => Some("errored".to_owned()),
+                _ => None,
+            };
+        }
+        let data = &normalized;
+        let Some(child_id) = self.ensure_conversation(data).await else {
+            return;
+        };
+        let Some(event) = data.event.as_deref() else { return };
+        let broadcaster = self.broadcaster.clone();
+        let user_id = self.user_id.clone();
+        let state = self
+            .states
+            .entry(data.r#ref.clone())
+            .or_insert_with(|| SubagentTranscriptState {
+                conversation_id: child_id.clone(),
+                adapter: StreamPersistenceAdapter::new(
+                    self.user_id.clone(),
+                    child_id.clone(),
+                    ConversationService::mint_msg_id(),
+                    self.repo.clone(),
+                    None,
+                ),
+                active_text: None,
+                active_thinking: None,
+            });
+        let conversation_id = state.conversation_id.clone();
+        match event {
+            AgentStreamEvent::Text(text) => {
+                if let Some(thinking) = state.active_thinking.take() {
+                    let elapsed = now_ms().saturating_sub(thinking.started_at) as u64;
+                    state.adapter.persist_thinking_segment(thinking, elapsed).await;
+                }
+                let segment = state.active_text.get_or_insert_with(|| TextSegmentState {
+                    id: ConversationService::mint_msg_id(),
+                    buffer: String::new(),
+                    created_at: now_ms(),
+                    record_created: false,
+                    flush_counter: 0,
+                });
+                Self::forward(
+                    &broadcaster,
+                    &user_id,
+                    &conversation_id,
+                    &segment.id,
+                    &data.r#ref,
+                    event,
+                );
+                segment.buffer.push_str(&text.content);
+                segment.flush_counter += 1;
+                if segment.flush_counter >= 5 {
+                    state.adapter.flush_text_segment(segment).await;
+                    segment.flush_counter = 0;
+                }
+            }
+            AgentStreamEvent::Thinking(thinking) => {
+                if let Some(text) = state.active_text.take() {
+                    state.adapter.finalize_text_segment(text, "finish").await;
+                }
+                if thinking.status.as_deref() == Some("done") {
+                    if let Some(segment) = state.active_thinking.take() {
+                        let elapsed = now_ms().saturating_sub(segment.started_at) as u64;
+                        state.adapter.persist_thinking_segment(segment, elapsed).await;
+                    }
+                } else if !thinking.content.is_empty() || thinking.subject.is_some() {
+                    let segment = state.active_thinking.get_or_insert_with(|| ThinkingSegmentState {
+                        id: ConversationService::mint_msg_id(),
+                        buffer: String::new(),
+                        started_at: now_ms(),
+                    });
+                    segment.buffer.push_str(&thinking.content);
+                    Self::forward(
+                        &broadcaster,
+                        &user_id,
+                        &conversation_id,
+                        &segment.id,
+                        &data.r#ref,
+                        event,
+                    );
+                }
+            }
+            AgentStreamEvent::ToolCall(tool) => {
+                if let Some(text) = state.active_text.take() {
+                    state.adapter.finalize_text_segment(text, "finish").await;
+                }
+                let mut tool = tool.clone();
+                tool.call_id = format!("{}:{}", conversation_id, tool.call_id);
+                let wrapped = AgentStreamEvent::ToolCall(tool.clone());
+                Self::forward(
+                    &broadcaster,
+                    &user_id,
+                    &conversation_id,
+                    &tool.call_id,
+                    &data.r#ref,
+                    &wrapped,
+                );
+                state.adapter.persist_tool_call(&tool).await;
+            }
+            AgentStreamEvent::Tips(tip) => {
+                Self::forward(&broadcaster, &user_id, &conversation_id, "", &data.r#ref, event);
+                state.adapter.persist_tip(tip).await;
+            }
+            AgentStreamEvent::Error(error) => {
+                if let Some(text) = state.active_text.take() {
+                    state.adapter.finalize_text_segment(text, "error").await;
+                }
+                Self::forward(&broadcaster, &user_id, &conversation_id, "", &data.r#ref, event);
+                state.adapter.persist_error_tip(error).await;
+            }
+            AgentStreamEvent::Finish(_) => {
+                if let Some(thinking) = state.active_thinking.take() {
+                    let elapsed = now_ms().saturating_sub(thinking.started_at) as u64;
+                    state.adapter.persist_thinking_segment(thinking, elapsed).await;
+                }
+                if let Some(text) = state.active_text.take() {
+                    state.adapter.finalize_text_segment(text, "finish").await;
+                }
+            }
+            AgentStreamEvent::SegmentBreak => {
+                if let Some(thinking) = state.active_thinking.take() {
+                    let elapsed = now_ms().saturating_sub(thinking.started_at) as u64;
+                    state.adapter.persist_thinking_segment(thinking, elapsed).await;
+                }
+                if let Some(text) = state.active_text.take() {
+                    state.adapter.finalize_text_segment(text, "finish").await;
+                }
+            }
+            AgentStreamEvent::Permission(_) | AgentStreamEvent::AcpPermission(_) => {}
+            other => Self::forward(&broadcaster, &user_id, &conversation_id, "", &data.r#ref, other),
+        }
+    }
+}
+
+fn merge_subagent_extra(extra: &mut serde_json::Value, data: &SubagentEventData, parent_id: &str) {
+    if !extra.is_object() {
+        *extra = json!({});
+    }
+    let object = extra.as_object_mut().expect("object normalized above");
+    let mut metadata = object.remove("subagent").unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    let metadata = metadata.as_object_mut().expect("object normalized above");
+    metadata.insert("parent_conversation_id".to_owned(), json!(parent_id));
+    metadata.insert("ref".to_owned(), json!(data.r#ref));
+    if let Some(label) = &data.label {
+        metadata.insert("label".to_owned(), json!(label));
+    }
+    if let Some(parent_ref) = &data.parent_ref {
+        metadata.insert("parent_ref".to_owned(), json!(parent_ref));
+    }
+    if let Some(status) = &data.status {
+        metadata.insert("status".to_owned(), json!(status));
+    }
+    object.insert("subagent".to_owned(), serde_json::Value::Object(metadata.clone()));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

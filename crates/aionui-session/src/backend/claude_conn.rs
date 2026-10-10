@@ -2950,6 +2950,7 @@ impl SessionBackend for ClaudeSessionBackend {
                     request_id: request_id.clone(),
                     tool_name: perm.tool_name.clone(),
                     questions,
+                    input: None,
                 }
             })
             .collect()
@@ -3151,6 +3152,7 @@ mod tests {
             init: SessionInit {
                 mcp_servers: vec![McpServerSpec {
                     name: "fs".into(),
+                    auto_approve_in_unattended: false,
                     transport: McpTransport::Stdio {
                         command: "/usr/bin/mcp-fs".into(),
                         args: vec!["--root".into(), "/tmp".into()],
@@ -3297,6 +3299,7 @@ mod tests {
     fn build_claude_mcp_config_http_carries_type_and_headers() {
         let json_str = build_claude_mcp_config(&[McpServerSpec {
             name: "api".into(),
+            auto_approve_in_unattended: false,
             transport: McpTransport::Http {
                 url: "https://example.com/mcp".into(),
                 headers: vec![("Authorization".into(), "Bearer x".into())],
@@ -3321,6 +3324,7 @@ mod tests {
         let json_str = build_claude_mcp_config(&[
             McpServerSpec {
                 name: "fs".into(),
+                auto_approve_in_unattended: false,
                 transport: McpTransport::Stdio {
                     command: "/first".into(),
                     args: vec![],
@@ -3329,6 +3333,7 @@ mod tests {
             },
             McpServerSpec {
                 name: "fs".into(), // same name → collapses
+                auto_approve_in_unattended: false,
                 transport: McpTransport::Stdio {
                     command: "/second".into(),
                     args: vec![],

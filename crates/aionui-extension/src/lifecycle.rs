@@ -67,17 +67,22 @@ pub async fn execute_hook(
     kind: HookKind,
     extension_name: &str,
 ) -> Result<(), ExtensionError> {
-    let script = ext_dir.join(hook_path);
-
-    if !script.exists() {
-        warn!(
-            extension = extension_name,
-            hook = kind.label(),
-            path = %script.display(),
-            "lifecycle hook script not found, skipping"
-        );
-        return Err(ExtensionError::HookNotFound(script.display().to_string()));
-    }
+    let base = std::fs::canonicalize(ext_dir)?;
+    let script = match std::fs::canonicalize(ext_dir.join(hook_path)) {
+        Ok(script) if script.starts_with(&base) && script.is_file() => script,
+        Ok(_) => return Err(ExtensionError::PathTraversal(hook_path.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let script = ext_dir.join(hook_path);
+            warn!(
+                extension = extension_name,
+                hook = kind.label(),
+                path = %script.display(),
+                "lifecycle hook script not found, skipping"
+            );
+            return Err(ExtensionError::HookNotFound(script.display().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     let timeout_secs = kind.timeout_secs();
     let label = kind.label();

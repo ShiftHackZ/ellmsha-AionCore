@@ -235,6 +235,22 @@ fn test_ext_mcp_server_minimal() {
     let re_serialized = serde_json::to_value(&server).unwrap();
     assert_eq!(re_serialized["id"], "s1");
     assert_eq!(re_serialized["name"], "S1");
+    assert_eq!(re_serialized["auto_approve_in_unattended"], false);
+}
+
+#[test]
+fn test_ext_mcp_server_explicit_unattended_approval_roundtrip() {
+    let raw = json!({
+        "id": "s1",
+        "name": "S1",
+        "auto_approve_in_unattended": true
+    });
+    let server: ExtMcpServer = serde_json::from_value(raw).unwrap();
+    assert!(server.auto_approve_in_unattended);
+    assert_eq!(
+        serde_json::to_value(server).unwrap()["auto_approve_in_unattended"],
+        true
+    );
 }
 
 // -- Manifest --
@@ -286,6 +302,7 @@ fn test_manifest_full_roundtrip() {
             locales: vec!["en".into(), "zh-CN".into()],
             directory: "i18n".into(),
         }),
+        compatibility: None,
     };
     let json_str = serde_json::to_string(&manifest).unwrap();
     let parsed: ExtensionManifest = serde_json::from_str(&json_str).unwrap();
@@ -311,6 +328,7 @@ fn test_manifest_snake_case_keys() {
         contributes: None,
         lifecycle: None,
         i18n: None,
+        compatibility: None,
     };
     let json = serde_json::to_value(&manifest).unwrap();
     assert!(json.get("display_name").is_some());
@@ -508,6 +526,7 @@ fn test_loaded_extension_roundtrip() {
             contributes: None,
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         },
         directory: "/path/to/ext".into(),
         source: ExtensionSource::Env,

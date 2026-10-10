@@ -176,6 +176,21 @@ pub enum ProjectError {
     #[error("uploaded file path is outside the managed upload directory: {path}")]
     UploadPathOutsideRoot { path: String },
 
+    #[error("managed upload storage is not configured")]
+    UploadStorageUnavailable,
+
+    #[error("invalid managed upload identity")]
+    InvalidUploadIdentity,
+
+    #[error("invalid {field}")]
+    InvalidUploadName { field: String },
+
+    #[error("legacy upload ownership cannot be established")]
+    LegacyUploadOwnerUnknown,
+
+    #[error("managed upload storage failed: {message}")]
+    UploadStorageIo { message: String },
+
     #[error("attached file does not exist: {path}")]
     ChatFileMissing { path: String },
 
@@ -207,6 +222,11 @@ impl ProjectError {
             ProjectError::ResourceOutsideFolder { .. } => "resource_outside_folder",
             ProjectError::UnsupportedResourceScheme { .. } => "unsupported_resource_scheme",
             ProjectError::UploadPathOutsideRoot { .. } => "upload_path_outside_root",
+            ProjectError::UploadStorageUnavailable => "upload_storage_unavailable",
+            ProjectError::InvalidUploadIdentity => "invalid_upload_identity",
+            ProjectError::InvalidUploadName { .. } => "invalid_upload_name",
+            ProjectError::LegacyUploadOwnerUnknown => "legacy_upload_owner_unknown",
+            ProjectError::UploadStorageIo { .. } => "upload_storage_io",
             ProjectError::ChatFileMissing { .. } => "chat_file_missing",
             ProjectError::LocalPathNotReadable { .. } => "local_path_not_readable",
             ProjectError::Database(_) => "internal_db_error",

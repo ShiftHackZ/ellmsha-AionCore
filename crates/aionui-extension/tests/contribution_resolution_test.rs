@@ -31,6 +31,7 @@ fn make_loaded_extension(name: &str, dir: &str, contributes: ExtContributes) -> 
             contributes: Some(contributes),
             lifecycle: None,
             i18n: None,
+            compatibility: None,
         },
         directory: dir.to_owned(),
         source: ExtensionSource::Local,
@@ -63,6 +64,7 @@ fn make_loaded_extension_with_i18n(name: &str, dir: &str, i18n: I18nConfig) -> L
             contributes: None,
             lifecycle: None,
             i18n: Some(i18n),
+            compatibility: None,
         },
         directory: dir.to_owned(),
         source: ExtensionSource::Local,
@@ -136,6 +138,7 @@ fn cr2_mcp_server_resolved_as_opaque_config() {
             id: "sqlite-mcp".into(),
             name: "SQLite MCP".into(),
             description: Some("SQLite via MCP".into()),
+            auto_approve_in_unattended: true,
             config: serde_json::json!({
                 "command": "npx",
                 "args": ["-y", "@anthropic/mcp-server-sqlite"],

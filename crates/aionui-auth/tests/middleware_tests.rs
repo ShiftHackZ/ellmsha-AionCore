@@ -829,3 +829,38 @@ async fn csrf_exempts_requests_bearing_runtime_token_header() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn csrf_only_exempts_bootstrap_header_on_scoped_setup_routes() {
+    let cookie_config = Arc::new(CookieConfig {
+        secure: false,
+        same_site: "Lax",
+    });
+    let app = Router::new()
+        .route("/api/webui/reset-password", post(|| async { "reset" }))
+        .route("/api/thing", post(|| async { "ordinary" }))
+        .layer(middleware::from_fn_with_state(cookie_config, csrf_middleware));
+
+    let bootstrap = app
+        .clone()
+        .oneshot(
+            Request::post("/api/webui/reset-password")
+                .header("x-aioncore-bootstrap-secret", "process-only-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bootstrap.status(), StatusCode::OK);
+
+    let ordinary = app
+        .oneshot(
+            Request::post("/api/thing")
+                .header("x-aioncore-bootstrap-secret", "process-only-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::FORBIDDEN);
+}

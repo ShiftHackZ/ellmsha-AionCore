@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -316,25 +315,6 @@ fn write_file_sync(path: &Path, data: &[u8]) -> Result<bool, FileError> {
     std::fs::write(path, data)
         .map_err(|e| FileError::Internal(format!("cannot write file '{}': {e}", path.display())))?;
     Ok(true)
-}
-
-/// Split a file name into `(base, ext)` where `ext` includes the leading dot.
-///
-/// Uses the **last** `.` as the extension boundary (matching macOS Finder and
-/// Chrome download naming). If the file has no extension, or the only dot is at
-/// the very start (hidden files like `.env`), the entire name is treated as the
-/// base and `ext` is empty.
-///
-/// Examples:
-/// - `"image.png"` -> `("image", ".png")`
-/// - `"foo.tar.gz"` -> `("foo.tar", ".gz")`
-/// - `"README"` -> `("README", "")`
-/// - `".env"` -> `(".env", "")`
-fn split_base_ext(name: &str) -> (&str, &str) {
-    match name.rfind('.') {
-        Some(idx) if idx > 0 => name.split_at(idx),
-        _ => (name, ""),
-    }
 }
 
 /// Get file metadata synchronously.
@@ -714,94 +694,6 @@ impl crate::traits::IFileService for FileService {
         })
         .await
         .map_err(|e| FileError::Internal(format!("copy task failed: {e}")))?
-    }
-
-    async fn create_upload_file(
-        &self,
-        file_name: &str,
-        data: &[u8],
-        conversation_id: Option<&str>,
-    ) -> Result<String, FileError> {
-        if file_name.is_empty() {
-            return Err(FileError::BadRequest("file name must not be empty".to_owned()));
-        }
-        if has_traversal(file_name) {
-            return Err(FileError::BadRequest(format!(
-                "file name '{}' contains invalid traversal patterns",
-                file_name
-            )));
-        }
-        if file_name.contains('/') || file_name.contains('\\') {
-            return Err(FileError::BadRequest(format!(
-                "file name '{}' must not contain path separators",
-                file_name
-            )));
-        }
-
-        // Validate optional conversation_id: no separators / traversal.
-        let conv_id = match conversation_id {
-            Some(id) if !id.is_empty() => {
-                if has_traversal(id) || id.contains('/') || id.contains('\\') {
-                    return Err(FileError::BadRequest(format!(
-                        "conversation id '{}' contains invalid characters",
-                        id
-                    )));
-                }
-                Some(id.to_owned())
-            }
-            _ => None,
-        };
-
-        let name = file_name.to_owned();
-        let bytes = data.to_vec();
-
-        tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
-            if let Some(conv_id) = conv_id.as_deref() {
-                dir = dir.join(conv_id);
-            } else {
-                dir = dir.join("general");
-            }
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
-
-            let (base, ext) = split_base_ext(&name);
-            let mut candidate = name.clone();
-            let mut counter: u32 = 2;
-            loop {
-                let file_path = dir.join(&candidate);
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&file_path)
-                {
-                    Ok(mut f) => {
-                        f.write_all(&bytes).map_err(|e| {
-                            FileError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
-                        })?;
-                        return Ok(file_path.to_string_lossy().into_owned());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if counter > 1000 {
-                            return Err(FileError::Internal(format!(
-                                "too many name collisions for upload file '{}'",
-                                name
-                            )));
-                        }
-                        candidate = format!("{base}({counter}){ext}");
-                        counter += 1;
-                    }
-                    Err(e) => {
-                        return Err(FileError::Internal(format!(
-                            "cannot write upload file '{}': {e}",
-                            file_path.display()
-                        )));
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|e| FileError::Internal(format!("create upload file task failed: {e}")))?
     }
 
     async fn get_image_base64(&self, path: &str, extra_root: Option<&Path>) -> Result<String, FileError> {

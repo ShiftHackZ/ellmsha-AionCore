@@ -1868,9 +1868,8 @@ impl TeamSessionService {
             .ok_or_else(|| {
                 TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
             })?;
-        let upload_root = std::env::temp_dir().join("aionui");
         let resolved = project
-            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .resolve_chat_message(user_id, content, &files)
             .await
             .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
         Ok((resolved.content, Some(resolved.files)))

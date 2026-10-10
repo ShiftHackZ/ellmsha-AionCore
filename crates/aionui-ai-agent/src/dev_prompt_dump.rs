@@ -123,6 +123,37 @@ fn sanitize_segment(value: &str) -> String {
     if segment.is_empty() { "none".to_owned() } else { segment }
 }
 
+pub(crate) fn redact_private_plugin_values(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                redact_private_plugin_values(value);
+            }
+        }
+        Value::Object(values) => {
+            if values
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(is_private_plugin_env)
+            {
+                values.insert("value".into(), Value::String("<private>".into()));
+            }
+            for (key, value) in values {
+                if is_private_plugin_env(key) {
+                    *value = Value::String("<private>".into());
+                } else {
+                    redact_private_plugin_values(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn is_private_plugin_env(name: &str) -> bool {
+    name == "MCP_REMOTE_CONFIG_DIR" || name.starts_with("ELLM_SHA_PRIVATE_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +238,25 @@ mod tests {
             dump["resolved_context"]["mcp_servers"][0]["env"]["TOKEN"],
             "raw-token-value"
         );
+    }
+
+    #[test]
+    fn private_plugin_environment_values_are_redacted_in_supported_shapes() {
+        let mut value = serde_json::json!({
+            "map_env": {
+                "ELLM_SHA_PRIVATE_CLOCKIFY_API_KEY": "fixture-secret",
+                "VISIBLE": "visible"
+            },
+            "list_env": [
+                { "name": "MCP_REMOTE_CONFIG_DIR", "value": "/private/auth" },
+                { "name": "VISIBLE", "value": "visible" }
+            ]
+        });
+        redact_private_plugin_values(&mut value);
+        assert_eq!(value["map_env"]["ELLM_SHA_PRIVATE_CLOCKIFY_API_KEY"], "<private>");
+        assert_eq!(value["map_env"]["VISIBLE"], "visible");
+        assert_eq!(value["list_env"][0]["value"], "<private>");
+        assert_eq!(value["list_env"][1]["value"], "visible");
     }
 
     #[test]

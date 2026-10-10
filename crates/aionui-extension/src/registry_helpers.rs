@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use crate::dependency::{DependencyValidationResult, validate_dependencies};
 use crate::lifecycle::{HookKind, execute_hook, resolve_hook_path};
 use crate::loader::{ScanPath, filter_by_engine_compatibility, load_all};
-use crate::types::{ExtensionSource, ExtensionState, LoadedExtension};
+use crate::types::{ExtensionSource, ExtensionState, LoadedExtension, PluginCompatibility};
 
 // ---------------------------------------------------------------------------
 // ExtensionSummary
@@ -23,6 +23,7 @@ pub struct ExtensionSummary {
     pub description: Option<String>,
     pub enabled: bool,
     pub source: ExtensionSource,
+    pub compatibility: Option<PluginCompatibility>,
 }
 
 pub(crate) fn to_summary(ext: &LoadedExtension) -> ExtensionSummary {
@@ -33,6 +34,7 @@ pub(crate) fn to_summary(ext: &LoadedExtension) -> ExtensionSummary {
         description: ext.manifest.description.clone(),
         enabled: ext.state.enabled,
         source: ext.source,
+        compatibility: ext.manifest.compatibility.clone(),
     }
 }
 
@@ -127,7 +129,7 @@ pub(crate) fn build_state_map(extensions: &[LoadedExtension]) -> HashMap<String,
 /// Errors are logged but do not propagate.
 pub(crate) async fn run_deactivation_hooks(extensions: &[LoadedExtension]) {
     for ext in extensions {
-        if !ext.state.enabled {
+        if !ext.state.enabled || ext.source != ExtensionSource::Builtin {
             continue;
         }
 
@@ -177,6 +179,7 @@ mod tests {
                 contributes: None,
                 lifecycle: None,
                 i18n: None,
+                compatibility: None,
             },
             directory: format!("/tmp/ext/{name}"),
             source: ExtensionSource::Local,

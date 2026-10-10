@@ -93,20 +93,6 @@ pub trait IFileService: Send + Sync {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
 
-    /// Write `data` to a temporary file and return its absolute path.
-    ///
-    /// When `conversation_id` is provided, the file is placed under a
-    /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used.
-    ///
-    /// `file_name` must not contain path separators or traversal patterns.
-    async fn create_upload_file(
-        &self,
-        file_name: &str,
-        data: &[u8],
-        conversation_id: Option<&str>,
-    ) -> Result<String, FileError>;
-
     // -- Image processing --
 
     /// Read a local image and return a base64 Data URL

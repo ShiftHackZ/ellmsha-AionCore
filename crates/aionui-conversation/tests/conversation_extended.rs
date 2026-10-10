@@ -553,6 +553,8 @@ async fn t9_1_keyword_match() {
         keyword: "review".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 1);
@@ -580,6 +582,8 @@ async fn t9_2_no_match() {
         keyword: "xxxxnotexist".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert!(result.items.is_empty());
@@ -604,6 +608,8 @@ async fn t9_3_search_pagination() {
         keyword: "keyword".into(),
         page: Some(1),
         page_size: Some(2),
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 2);
@@ -619,6 +625,8 @@ async fn t9_4_empty_keyword() {
         keyword: "".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let err = svc.search_messages(USER_ID, query).await.unwrap_err();
     assert!(matches!(err, ConversationError::BadRequest { .. }));
@@ -647,6 +655,8 @@ async fn t9_5_preview_text_extracts_from_json_content() {
         keyword: "search".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 1);
@@ -681,6 +691,8 @@ async fn t9_6_search_result_includes_conversation_model() {
         keyword: "model test".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages(USER_ID, query).await.unwrap();
     assert_eq!(result.items.len(), 1);
@@ -704,6 +716,8 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
         keyword: "secret".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     let result = svc.search_messages("other_user_id", query).await.unwrap();
     assert!(result.items.is_empty());
@@ -785,6 +799,8 @@ async fn t12_4_search_sql_injection() {
         keyword: "'; DROP TABLE messages; --".into(),
         page: None,
         page_size: None,
+        before_created_at: None,
+        before_message_id: None,
     };
     // Should return empty results, not crash
     let result = svc.search_messages(USER_ID, query).await.unwrap();

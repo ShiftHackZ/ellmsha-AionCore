@@ -41,7 +41,8 @@ pub enum Command {
     /// is a single pick-one prompt: the ACP `optionId`, or a single-question claude
     /// `AskUserQuestion` label. `None` = a plain allow/deny (the claude adapter then
     /// falls back to the first option for an AskUserQuestion allow). Backends with a
-    /// pure accept/decline approval (codex/aionrs) ignore it.
+    /// Codex also accepts `session` / `always` here for MCP approval persistence;
+    /// other pure accept/decline approvals ignore it.
     ///
     /// `answers` carries the FULL claude `AskUserQuestion` answer set — one entry
     /// per question, multi-label for a `multiSelect:true` question (claude can ask
@@ -151,9 +152,7 @@ pub struct QuestionAnswer {
 
 /// Read-only snapshot of ONE currently-open (unanswered) permission request, for
 /// REST recovery (`GET /confirmations`) of a reloaded `waiting_confirmation`
-/// conversation. Transient adapter-side state — NOT reducer/FSM/persisted. Carries
-/// only the safe correlation + title surface (`request_id`/`tool_name`); the raw
-/// tool `input` (command body / args) is deliberately NOT exposed (TIO-13).
+/// conversation. Transient adapter-side state — NOT reducer/FSM/persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPermissionView {
     /// The control correlation key (claude `request_id`); the recovery card's
@@ -169,6 +168,10 @@ pub struct PendingPermissionView {
     /// AskUserQuestion carries `input` from the adapter, so this is `None` for every
     /// ordinary tool.
     pub questions: Option<serde_json::Value>,
+    /// The approval context shown by the live permission card. Recovery must carry
+    /// the same command/file/MCP context so a reloaded UI never asks the user to
+    /// approve an unnamed or blank action.
+    pub input: Option<serde_json::Value>,
 }
 
 /// Per-command metadata (§C1). `client_msg_id` is the pending-queue correlation

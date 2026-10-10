@@ -12,9 +12,10 @@ use crate::cli::{
     ConfigAssistantTextCommand, ConfigAssistantsArgs, ConfigAssistantsCommand, ConfigCommand, ConfigConversationArgs,
     ConfigConversationCommand, ConfigCronArgs, ConfigCronCommand, ConfigCronCurrentArgs, ConfigCronCurrentCommand,
     ConfigCronJobSkillCommand, ConfigCronJobsArgs, ConfigCronJobsCommand, ConfigMcpArgs, ConfigMcpCommand,
-    ConfigMcpOauthCommand, ConfigMcpServersCommand, ConfigProviderModelsCommand, ConfigProvidersArgs,
-    ConfigProvidersCommand, ConfigSettingsArgs, ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs,
-    ConfigSkillsCommand, ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
+    ConfigMcpOauthCommand, ConfigMcpServersCommand, ConfigPluginsArgs, ConfigPluginsCommand,
+    ConfigProviderModelsCommand, ConfigProvidersArgs, ConfigProvidersCommand, ConfigSettingsArgs,
+    ConfigSettingsClientCommand, ConfigSettingsCommand, ConfigSkillsArgs, ConfigSkillsCommand,
+    ConfigSkillsExternalPathsCommand, ConfigSkillsMarketCommand,
 };
 use crate::commands::config_capabilities;
 
@@ -42,11 +43,64 @@ async fn run(args: ConfigArgs) -> Result<(), ConfigError> {
         ConfigCommand::Conversation(args) => run_conversation(&client, args).await,
         ConfigCommand::Assistants(args) => run_assistants(&client, args).await,
         ConfigCommand::Skills(args) => run_skills(&client, args).await,
+        ConfigCommand::Plugins(args) => run_plugins(&client, args).await,
         ConfigCommand::Mcp(args) => run_mcp(&client, args).await,
         ConfigCommand::Providers(args) => run_providers(&client, args).await,
         ConfigCommand::Settings(args) => run_settings(&client, args).await,
         ConfigCommand::Agents(args) => run_agents(&client, args).await,
         ConfigCommand::Cron(args) => run_cron(&client, args).await,
+    }
+}
+
+async fn run_plugins(client: &reqwest::Client, args: ConfigPluginsArgs) -> Result<(), ConfigError> {
+    match args.command {
+        ConfigPluginsCommand::List => {
+            run_no_input_request(client, "config plugins list", Method::GET, "/api/extensions", false).await
+        }
+        ConfigPluginsCommand::Install => {
+            run_payload_request_with_collection_readback(
+                client,
+                "config plugins install",
+                Method::POST,
+                "/api/plugins/install",
+                "/api/extensions",
+                false,
+            )
+            .await
+        }
+        ConfigPluginsCommand::Enable => {
+            run_payload_request_with_collection_readback(
+                client,
+                "config plugins enable",
+                Method::POST,
+                "/api/plugins/enable",
+                "/api/extensions",
+                false,
+            )
+            .await
+        }
+        ConfigPluginsCommand::Disable => {
+            run_payload_request_with_collection_readback(
+                client,
+                "config plugins disable",
+                Method::POST,
+                "/api/plugins/disable",
+                "/api/extensions",
+                false,
+            )
+            .await
+        }
+        ConfigPluginsCommand::Uninstall => {
+            run_payload_request_with_collection_readback(
+                client,
+                "config plugins uninstall",
+                Method::POST,
+                "/api/plugins/uninstall",
+                "/api/extensions",
+                false,
+            )
+            .await
+        }
     }
 }
 

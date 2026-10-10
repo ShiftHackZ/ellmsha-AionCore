@@ -61,7 +61,7 @@ fn build_acp_final_input_dump_value(
     final_content: &str,
     resolved_context: Value,
 ) -> Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "kind": "acp-final-input",
         "backend": "acp",
         "conversation_id": conversation_id,
@@ -72,7 +72,9 @@ fn build_acp_final_input_dump_value(
             "content": final_content,
         },
         "resolved_context": resolved_context,
-    })
+    });
+    crate::dev_prompt_dump::redact_private_plugin_values(&mut value);
+    value
 }
 
 use super::config_option_catalog::{extract_models_from_value, extract_modes_from_value};
@@ -1783,7 +1785,11 @@ mod tests {
             },
             "preset_context": "Rule A",
             "skills": [],
-            "mcp_servers": [],
+            "mcp_servers": [{
+                "transport": {
+                    "env": { "ELLM_SHA_PRIVATE_CLOCKIFY_API_KEY": "fixture-secret" }
+                }
+            }],
         });
 
         let value = build_acp_final_input_dump_value(
@@ -1806,7 +1812,10 @@ mod tests {
         );
         assert_eq!(value["resolved_context"]["workspace"]["path"], "/tmp");
         assert_eq!(value["resolved_context"]["skills"], serde_json::json!([]));
-        assert!(value["resolved_context"]["mcp_servers"].is_array());
+        assert_eq!(
+            value["resolved_context"]["mcp_servers"][0]["transport"]["env"]["ELLM_SHA_PRIVATE_CLOCKIFY_API_KEY"],
+            "<private>"
+        );
     }
 
     #[test]

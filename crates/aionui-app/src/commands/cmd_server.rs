@@ -357,6 +357,10 @@ pub(crate) async fn run_server(
             .with_source(error)
         })?;
 
+    // Serving has ended, so stop extension filesystem monitoring before the
+    // remaining coordinators and persistence services are torn down.
+    drop(router_runtime);
+
     let shutdown_error = shutdown_error_rx.await.ok();
 
     // Wait for the scanner to observe the shutdown watch value and

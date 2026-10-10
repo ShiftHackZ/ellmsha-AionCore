@@ -106,9 +106,13 @@ pub use custom_agent::{
     SetAgentOverridesRequest, SetEnabledRequest,
 };
 pub use extension::{
-    DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
-    GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
-    InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
+    ClockifyConnectionResponse, ClockifyConnectionStatus, ClockifyConnectionsResponse, ClockifyRealm,
+    ClockifyVerifiedIdentity, ClockifyWorkspaceIdentity, ConnectClockifyConnectionRequest,
+    ConnectLinearConnectionRequest, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse,
+    GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse,
+    HubOperationResponse, HubUpdateInfo, InstallExtensionRequest, LinearConnectionResponse, LinearConnectionStatus,
+    LinearConnectionsResponse, LinearVerifiedCapabilities, LinearVerifiedIdentity, PermissionDetailResponse,
+    PermissionSummaryResponse, PluginCompatibilityNoticeResponse, PluginSourceProvenanceResponse,
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
@@ -131,7 +135,10 @@ pub use office::{
     PptSlideData, PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
 };
-pub use project::{AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, MemoryProjectRequest, MemoryProjectContext};
+pub use project::{
+    AttachFolderRequest, MemoryProjectContext, MemoryProjectRequest, ProjectDetailResponse, ProjectEntry,
+    ProjectExplorer,
+};
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, HealthStatus, KeyTestResult, ModelCapability,

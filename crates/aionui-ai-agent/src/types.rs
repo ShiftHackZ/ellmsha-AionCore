@@ -97,16 +97,31 @@ pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
+    /// Registry generation captured when project plugin bindings were applied.
+    /// A newer snapshot rebuilds the idle session before the next turn.
+    pub plugin_generation: Option<u64>,
+    /// Linear connection revision captured with the plugin snapshot. Account
+    /// reconnect, disconnect, and project rebind changes must rebuild an idle session.
+    pub linear_connection_revision: Option<u64>,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
-        match requested.conversation_runtime_context_version {
+        let runtime_context_satisfied = match requested.conversation_runtime_context_version {
             Some(version) => self
                 .conversation_runtime_context_version
                 .is_some_and(|actual| actual >= version),
             None => true,
-        }
+        };
+        let plugins_satisfied = match requested.plugin_generation {
+            Some(generation) => self.plugin_generation == Some(generation),
+            None => true,
+        };
+        let linear_satisfied = match requested.linear_connection_revision {
+            Some(revision) => self.linear_connection_revision == Some(revision),
+            None => true,
+        };
+        runtime_context_satisfied && plugins_satisfied && linear_satisfied
     }
 }
 
@@ -418,5 +433,22 @@ mod tests {
         });
         let extra: AionrsBuildExtra = serde_json::from_value(json).unwrap();
         assert_eq!(extra.skills, vec!["pdf".to_owned(), "cron".to_owned()]);
+    }
+
+    #[test]
+    fn linear_connection_revision_requires_runtime_rebuild() {
+        let active = RuntimeCapabilities {
+            plugin_generation: Some(4),
+            linear_connection_revision: Some(8),
+            ..Default::default()
+        };
+        let same = active.clone();
+        let rebound = RuntimeCapabilities {
+            plugin_generation: Some(4),
+            linear_connection_revision: Some(9),
+            ..Default::default()
+        };
+        assert!(active.satisfies(&same));
+        assert!(!active.satisfies(&rebound));
     }
 }

@@ -228,6 +228,9 @@ pub struct SearchMessagesQuery {
     pub keyword: String,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
+    /// Stable keyset continuation. Both fields must be provided together.
+    pub before_created_at: Option<TimestampMs>,
+    pub before_message_id: Option<String>,
 }
 
 // ── Response types ─────────────────────────────────────────────────
@@ -635,11 +638,19 @@ mod tests {
 
     #[test]
     fn deserialize_search_query() {
-        let raw = json!({ "keyword": "rust", "page": 1, "page_size": 20 });
+        let raw = json!({
+            "keyword": "rust",
+            "page": 1,
+            "page_size": 20,
+            "before_created_at": 1234,
+            "before_message_id": "msg-1"
+        });
         let q: SearchMessagesQuery = serde_json::from_value(raw).unwrap();
         assert_eq!(q.keyword, "rust");
         assert_eq!(q.page, Some(1));
         assert_eq!(q.page_size, Some(20));
+        assert_eq!(q.before_created_at, Some(1234));
+        assert_eq!(q.before_message_id.as_deref(), Some("msg-1"));
     }
 
     #[test]

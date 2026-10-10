@@ -41,10 +41,19 @@ pub async fn csrf_middleware(
     // cannot attach cross-site without a CORS preflight. The token itself is
     // still fully validated by the auth middleware behind this layer.
     let is_runtime_token_request = request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER);
+    // The host uses a process-only capability for first-run WebUI setup. The
+    // route handler validates the secret; CSRF only permits it to reach that
+    // check on the two exact state-changing bootstrap endpoints.
+    let is_webui_bootstrap_request = request.headers().contains_key("x-aioncore-bootstrap-secret")
+        && matches!(
+            path.as_str(),
+            "/api/webui/reset-password" | "/api/auth/internal/users/system/credentials"
+        );
     let is_exempt = path == "/login"
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
+        || is_webui_bootstrap_request
         || is_runtime_token_request;
 
     if needs_validation && !is_exempt {

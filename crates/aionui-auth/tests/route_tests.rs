@@ -1108,3 +1108,49 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
 }
+
+#[tokio::test]
+async fn webui_reset_password_requires_bootstrap_capability_outside_local_mode() {
+    let (app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+
+    let missing = app
+        .clone()
+        .oneshot(json_post("/api/webui/reset-password", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong = app
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/webui/reset-password",
+            "{}",
+            "wrong-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webui_bootstrap_password_allows_normal_authenticated_login() {
+    let (mut app, _ctx) = test_app_with_options(false, Some("bootstrap-secret")).await;
+    let reset = app
+        .clone()
+        .oneshot(json_post_with_bootstrap_secret(
+            "/api/webui/reset-password",
+            "{}",
+            "bootstrap-secret",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    let reset_json = body_json(reset).await;
+    let password = reset_json["data"]["new_password"].as_str().unwrap();
+
+    let (token, user_id) = login(&mut app, "admin", password).await;
+    assert!(!token.is_empty());
+    assert_eq!(user_id, "system_default_user");
+
+    let current_user = app.oneshot(get_with_token("/api/auth/user", &token)).await.unwrap();
+    assert_eq!(current_user.status(), StatusCode::OK);
+}

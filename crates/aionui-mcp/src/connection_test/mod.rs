@@ -16,6 +16,7 @@ use aionui_runtime::{
     resolve_command_path,
 };
 use serde::Serialize;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -32,6 +33,21 @@ use protocol::{
 // ---------------------------------------------------------------------------
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct McpToolProbeCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpStdioToolProbe {
+    pub tools: Vec<String>,
+    pub tool_input_schemas: HashMap<String, serde_json::Value>,
+    pub results: HashMap<String, serde_json::Value>,
+}
+
+pub type McpStderrObserver = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // McpConnectionTestService
@@ -92,6 +108,131 @@ impl McpConnectionTestService {
         };
         log_mcp_transport_result(mcp_server_id, transport_type, &result);
         result
+    }
+
+    /// Connect to a stdio MCP server, list its tools, then make bounded read-only
+    /// probe calls on the same authenticated session.
+    pub async fn probe_stdio_tools(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+        calls: &[McpToolProbeCall],
+    ) -> Result<McpStdioToolProbe, String> {
+        self.probe_stdio_tools_inner(command, args, env, user_id, runtime_scope_id, calls, None)
+            .await
+    }
+
+    /// Probe a stdio MCP server while privately observing its stderr stream.
+    ///
+    /// The observer receives each line in memory. Lines are never logged or
+    /// returned, which lets OAuth callers extract an authorization URL without
+    /// exposing it through application diagnostics.
+    pub async fn probe_stdio_tools_observing_stderr(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+        calls: &[McpToolProbeCall],
+        observer: McpStderrObserver,
+    ) -> Result<McpStdioToolProbe, String> {
+        self.probe_stdio_tools_inner(command, args, env, user_id, runtime_scope_id, calls, Some(observer))
+            .await
+    }
+
+    async fn probe_stdio_tools_inner(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+        calls: &[McpToolProbeCall],
+        stderr_observer: Option<McpStderrObserver>,
+    ) -> Result<McpStdioToolProbe, String> {
+        let reporter =
+            runtime_scope_id.map(|scope_id| self.runtime_reporter(user_id.map(str::to_owned), scope_id.to_owned()));
+        let mut cmd = match probe_runtime_command(command) {
+            RuntimeCommandProbe::NodeTool { .. } => {
+                let resolved = ensure_runtime_command_with_reporter(command, reporter.as_deref())
+                    .await
+                    .map_err(|error| runtime_resolution_error(&error.to_string()).to_string())?;
+                CmdBuilder::from_resolved(&resolved)
+            }
+            _ => CmdBuilder::new(resolve_stdio_command(command)),
+        };
+        let observe_stderr = stderr_observer.is_some();
+        cmd.args(args)
+            .envs(env.iter())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(if observe_stderr {
+                std::process::Stdio::piped()
+            } else {
+                // OAuth helpers may log authorization details; keep them out of app logs.
+                std::process::Stdio::null()
+            });
+
+        let mut child = cmd.spawn().map_err(|error| error.to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "MCP probe stdin was unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "MCP probe stdout was unavailable".to_string())?;
+        let mut observer_task = None;
+        let mut observer_errors = None;
+        if let Some(observer) = stderr_observer {
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "MCP probe stderr was unavailable".to_string())?;
+            let (error_tx, error_rx) = mpsc::unbounded_channel();
+            observer_errors = Some(error_rx);
+            observer_task = Some(tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Err(error) = observer(&line) {
+                        let _ = error_tx.send(error);
+                        break;
+                    }
+                }
+            }));
+        }
+        let protocol = protocol::run_stdio_tool_probe(stdin, stdout, calls);
+        let result = if let Some(mut errors) = observer_errors {
+            tokio::time::timeout(self.timeout, async move {
+                tokio::pin!(protocol);
+                tokio::select! {
+                    result = &mut protocol => result,
+                    error = errors.recv() => match error {
+                        Some(error) => Err(error),
+                        None => protocol.await,
+                    },
+                }
+            })
+            .await
+        } else {
+            tokio::time::timeout(self.timeout, protocol).await
+        };
+        if let Err(error) = kill_process_tree(&mut child).await {
+            warn!(%error, "failed to clean up MCP stdio identity probe process tree");
+        }
+        if let Some(task) = observer_task {
+            task.abort();
+        }
+        result.map_err(|_| {
+            format!(
+                "MCP authentication or identity verification timed out after {:?}",
+                self.timeout
+            )
+        })?
     }
 
     // -- Stdio transport --------------------------------------------------
@@ -662,6 +803,63 @@ mod tests {
         assert!(captured.contains("tool_count=0"), "{captured}");
         assert!(!captured.contains("secret-command"), "{captured}");
         assert!(!captured.contains("token abc"), "{captured}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_tool_probe_observes_oauth_stderr_without_returning_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("fake-mcp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' 'Please authorize this client by visiting:' >&2
+printf '%s\n' 'https://linear.app/oauth/authorize?state=private-test-value' >&2
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r _
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"get_user","inputSchema":{"type":"object","properties":{"query":{"type":"string"}}}}]}}'
+IFS= read -r _
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"{\"id\":\"user-1\"}"}]}}'
+"#,
+        )
+        .unwrap();
+        let saw_url = Arc::new(AtomicBool::new(false));
+        let observer_flag = saw_url.clone();
+        let observer: McpStderrObserver = Arc::new(move |line| {
+            if line.starts_with("https://linear.app/") {
+                observer_flag.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+        let service = McpConnectionTestService::new(reqwest::Client::new(), Arc::new(BroadcastEventBus::new(16)))
+            .with_timeout(Duration::from_secs(2));
+        let result = service
+            .probe_stdio_tools_observing_stderr(
+                "sh",
+                &[script.to_string_lossy().into_owned()],
+                &HashMap::new(),
+                None,
+                None,
+                &[McpToolProbeCall {
+                    name: "get_user".to_owned(),
+                    arguments: serde_json::json!({ "query": "me" }),
+                }],
+                observer,
+            )
+            .await
+            .unwrap();
+
+        assert!(saw_url.load(Ordering::SeqCst));
+        assert_eq!(result.tools, vec!["get_user"]);
+        assert_eq!(
+            result.tool_input_schemas["get_user"]["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(result.results["get_user"]["content"][0]["type"], "text");
     }
 
     #[cfg(unix)]

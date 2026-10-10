@@ -34,6 +34,16 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
+    /// Removes legacy SD-09 rows that were created from a Codex parent tool-call
+    /// id instead of a child thread id. Implementations may return an empty list.
+    async fn reconcile_empty_subagent_tool_placeholders(
+        &self,
+        _user_id: &str,
+        _parent_conversation_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Lists conversations with cursor-based pagination and optional filters.
     async fn list_paginated(
         &self,
@@ -201,6 +211,13 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Lists messages that may contain legacy OS-temp upload references.
+    /// Production repositories return every matching user/message so startup
+    /// migration can protect unopened history before temp cleanup occurs.
+    async fn list_legacy_upload_messages(&self) -> Result<Vec<LegacyUploadMessageRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Full-text search across messages, joining conversation name.
     async fn search_messages(
         &self,
@@ -208,6 +225,8 @@ pub trait IConversationRepository: Send + Sync {
         keyword: &str,
         page: u32,
         page_size: u32,
+        before_created_at: Option<TimestampMs>,
+        before_message_id: Option<&str>,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
 
     /// Returns persisted conversation artifacts ordered by `created_at`.
@@ -317,6 +336,12 @@ pub struct MessagePageResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleRuntimeMessageRow {
+    pub user_id: String,
+    pub message: MessageRow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyUploadMessageRow {
     pub user_id: String,
     pub message: MessageRow,
 }

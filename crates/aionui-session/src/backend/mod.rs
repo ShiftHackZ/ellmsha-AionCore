@@ -159,6 +159,9 @@ pub trait BackendConnection: Send + Sync {
 pub struct McpServerSpec {
     pub name: String,
     pub transport: McpTransport,
+    /// Trusted server-side contribution that may be auto-approved only when the
+    /// enclosing session already runs with the built-in unattended policy.
+    pub auto_approve_in_unattended: bool,
 }
 
 /// MCP transport variants (SDK-free mirror of the neutral session-snapshot shape).

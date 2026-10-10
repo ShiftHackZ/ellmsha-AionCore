@@ -2596,6 +2596,8 @@ mod tests {
                 _keyword: &str,
                 _page: u32,
                 _page_size: u32,
+                _before_created_at: Option<aionui_common::TimestampMs>,
+                _before_message_id: Option<&str>,
             ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
                 Ok(PaginatedResult {
                     items: vec![],
@@ -3095,6 +3097,8 @@ mod tests {
             _keyword: &str,
             _page: u32,
             _page_size: u32,
+            _before_created_at: Option<aionui_common::TimestampMs>,
+            _before_message_id: Option<&str>,
         ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
             Ok(PaginatedResult {
                 items: vec![],
@@ -3321,6 +3325,8 @@ mod tests {
             _keyword: &str,
             _page: u32,
             _page_size: u32,
+            _before_created_at: Option<aionui_common::TimestampMs>,
+            _before_message_id: Option<&str>,
         ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
             Ok(PaginatedResult {
                 items: vec![],

@@ -34,21 +34,15 @@ impl ProjectService {
     /// content. Atomic: any bad reference (unknown pe, escape, missing file,
     /// out-of-root upload, unreadable local path) fails the whole message.
     ///
-    /// `upload_root` is the managed upload directory (`temp_dir()/aionui`);
-    /// `Upload` paths must live under it.
     pub async fn resolve_chat_message(
         &self,
         user_id: &str,
         content: &str,
         files: &[ChatFileRef],
-        upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
-            paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
-                    .await?,
-            );
+            paths.push(self.resolve_chat_file_ref(user_id, file, FileOp::Read).await?);
         }
 
         let content = if paths.is_empty() {
@@ -67,7 +61,7 @@ impl ProjectService {
     /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
-    /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
+    /// - `Upload` → an existing regular file under this profile and user's managed upload root.
     /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
     ///   produced it already exposes the whole filesystem).
     ///
@@ -77,7 +71,6 @@ impl ProjectService {
         &self,
         user_id: &str,
         file: &ChatFileRef,
-        upload_root: &Path,
         op: FileOp,
     ) -> Result<String, ProjectError> {
         match file {
@@ -102,16 +95,7 @@ impl ProjectService {
                 }
                 Ok(abs)
             }
-            ChatFileRef::Upload { path } => {
-                let candidate = Path::new(path);
-                if !candidate.is_file() {
-                    return Err(ProjectError::ChatFileMissing { path: path.clone() });
-                }
-                if !path_within(upload_root, candidate) {
-                    return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
-                }
-                Ok(path.clone())
-            }
+            ChatFileRef::Upload { path } => self.managed_uploads()?.resolve(user_id, path).await,
             ChatFileRef::Local { path } => {
                 // A path the user explicitly picked in the host-file browser,
                 // which already exposes the whole filesystem. No managed-root
@@ -127,15 +111,59 @@ impl ProjectService {
             }
         }
     }
-}
 
-/// Whether `target` resolves inside `root` (both canonicalized, so `..` and
-/// symlinks cannot escape). `target` is expected to exist (checked before).
-fn path_within(root: &Path, target: &Path) -> bool {
-    let (Ok(root), Ok(target)) = (std::fs::canonicalize(root), std::fs::canonicalize(target)) else {
-        return false;
-    };
-    target.starts_with(root)
+    pub async fn create_upload_file(
+        &self,
+        user_id: &str,
+        file_name: &str,
+        data: &[u8],
+        conversation_id: Option<&str>,
+    ) -> Result<String, ProjectError> {
+        self.managed_uploads()?
+            .create(user_id, file_name, data, conversation_id)
+            .await
+    }
+
+    /// Replace still-existing legacy temp upload paths in the attachment tail
+    /// with their durable adopted paths. Missing or unauthorised legacy paths
+    /// remain in the message so history never silently loses an attachment.
+    pub async fn migrate_legacy_upload_paths(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<Option<String>, ProjectError> {
+        let uploads = self.managed_uploads()?;
+        let Some((user_text, metadata)) = content.rsplit_once(AIONUI_FILES_MARKER) else {
+            return Ok(None);
+        };
+        let mut changed = false;
+        let mut migrated = Vec::new();
+        for line in metadata.trim().lines() {
+            let path = line.trim();
+            if path.is_empty() || !uploads.is_legacy_path(path) {
+                migrated.push(line.to_owned());
+                continue;
+            }
+            match uploads.adopt_persisted(user_id, conversation_id, path).await {
+                Ok(durable) => {
+                    changed |= durable != path;
+                    migrated.push(durable);
+                }
+                Err(ProjectError::ChatFileMissing { .. })
+                | Err(ProjectError::LegacyUploadOwnerUnknown)
+                | Err(ProjectError::UploadPathOutsideRoot { .. }) => migrated.push(line.to_owned()),
+                Err(error) => return Err(error),
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{user_text}{AIONUI_FILES_MARKER}\n{}",
+            migrated.join("\n")
+        )))
+    }
 }
 
 #[cfg(test)]

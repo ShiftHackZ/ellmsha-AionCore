@@ -129,6 +129,10 @@ pub struct ExtMcpServer {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Only native eLLMsha plugins may opt into unattended approval. Imported
+    /// third-party formats are always normalized with this disabled.
+    #[serde(default)]
+    pub auto_approve_in_unattended: bool,
     #[serde(flatten)]
     pub config: serde_json::Value,
 }
@@ -340,6 +344,35 @@ pub struct LifecycleHooks {
     pub on_deactivate: Option<String>,
 }
 
+/// Source package convention recognized by the compatibility adapter.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPackageFormat {
+    Native,
+    AgentPlugin,
+    Codex,
+    Claude,
+}
+
+/// One compatibility notice retained for catalog and detail diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCompatibilityNotice {
+    pub component: String,
+    pub message: String,
+}
+
+/// Truthful mapping from an imported package to eLLMsha runtime components.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginCompatibility {
+    pub format: PluginPackageFormat,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_components: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_components: Vec<PluginCompatibilityNotice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<PluginCompatibilityNotice>,
+}
+
 /// Complete extension manifest parsed from `aion-extension.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExtensionManifest {
@@ -373,6 +406,8 @@ pub struct ExtensionManifest {
     pub lifecycle: Option<LifecycleHooks>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub i18n: Option<I18nConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<PluginCompatibility>,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +418,7 @@ pub struct ExtensionManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionSource {
+    Builtin,
     Local,
     Appdata,
     Env,
@@ -518,6 +554,8 @@ pub struct ResolvedMcpServer {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub auto_approve_in_unattended: bool,
     #[serde(flatten)]
     pub config: serde_json::Value,
 }

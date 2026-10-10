@@ -5,7 +5,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -298,12 +298,6 @@ async fn reveal_resolved(
 // Content endpoint (ChatFileRef identity) — handlers
 // ---------------------------------------------------------------------------
 
-/// Managed upload directory (`<tmp>/aionui`) used to validate `Upload`
-/// ChatFileRef variants — mirrors the chat send-boundary convention.
-fn content_upload_root() -> PathBuf {
-    std::env::temp_dir().join("aionui")
-}
-
 /// Parse the optional `If-Match` header as a last-modified-millisecond stamp.
 fn parse_if_match(headers: &axum::http::HeaderMap) -> Option<i64> {
     headers
@@ -327,12 +321,7 @@ async fn read_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref(&user.id, &req.file, aionui_project::FileOp::Read)
         .await
         .map_err(ApiError::from)?;
     let content = state
@@ -356,12 +345,7 @@ async fn write_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Write,
-        )
+        .resolve_chat_file_ref(&user.id, &req.file, aionui_project::FileOp::Write)
         .await
         .map_err(ApiError::from)?;
     let path = Path::new(&abs);
@@ -391,12 +375,7 @@ async fn content_metadata(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref(&user.id, &req.file, aionui_project::FileOp::Read)
         .await
         .map_err(ApiError::from)?;
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
@@ -423,12 +402,7 @@ async fn stream_file(
         .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &file_ref,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref(&user.id, &file_ref, aionui_project::FileOp::Read)
         .await
         .map_err(ApiError::from)?;
     // ServeFile owns Range/If-Range/Content-Type; the path is already
@@ -450,7 +424,7 @@ struct UploadMultipartFields {
 
 /// Strip any directory component from a file name and reject empty results.
 /// The returned name is guaranteed not to contain path separators; deeper
-/// traversal validation happens in [`IFileService::create_upload_file`].
+/// traversal validation happens in the managed upload store.
 fn sanitize_upload_filename(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -522,6 +496,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -531,9 +506,15 @@ async fn upload_file(
     })?;
 
     let path = state
-        .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
-        .await?;
+        .project
+        .create_upload_file(
+            &user.id,
+            &file_name,
+            &fields.file_data,
+            fields.conversation_id.as_deref(),
+        )
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(path)))
 }
 
