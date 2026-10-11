@@ -32,7 +32,11 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
     std::fs::write(ext_dir.join("assets/channel.png"), "channel").unwrap();
     std::fs::write(ext_dir.join("assistants/context.md"), "Assistant context from file.").unwrap();
     std::fs::write(ext_dir.join("agents/context.md"), "Agent context from file.").unwrap();
-    std::fs::write(ext_dir.join("skills/review.md"), "# review skill").unwrap();
+    std::fs::write(
+        ext_dir.join("skills/review.md"),
+        "---\nname: review-skill\ndescription: Review code using the legacy extension fixture.\n---\n# review skill\n",
+    )
+    .unwrap();
     std::fs::write(ext_dir.join("themes/dark.css"), ":root { --legacy-bg: #111; }").unwrap();
 
     std::fs::write(

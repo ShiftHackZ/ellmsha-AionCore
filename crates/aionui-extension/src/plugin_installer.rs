@@ -260,11 +260,9 @@ fn install_blocking(
     let target = target_root.join(&manifest.name);
     let backup = target_root.join(format!(".plugin-backup-{}-{nonce}", manifest.name));
     let had_previous = target.exists();
-    if had_previous {
-        if let Err(error) = std::fs::rename(&target, &backup) {
-            cleanup_staging(&staging, &repository_staging);
-            return Err(error.into());
-        }
+    if had_previous && let Err(error) = std::fs::rename(&target, &backup) {
+        cleanup_staging(&staging, &repository_staging);
+        return Err(error.into());
     }
 
     if let Err(error) = std::fs::rename(&staging, &target) {

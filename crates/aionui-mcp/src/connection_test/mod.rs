@@ -130,6 +130,7 @@ impl McpConnectionTestService {
     /// The observer receives each line in memory. Lines are never logged or
     /// returned, which lets OAuth callers extract an authorization URL without
     /// exposing it through application diagnostics.
+    #[allow(clippy::too_many_arguments)] // Mirrors the stdio probe API with one optional observation hook.
     pub async fn probe_stdio_tools_observing_stderr(
         &self,
         command: &str,
@@ -144,6 +145,7 @@ impl McpConnectionTestService {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Shared implementation keeps both public probe entry points aligned.
     async fn probe_stdio_tools_inner(
         &self,
         command: &str,

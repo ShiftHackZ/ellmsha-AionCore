@@ -1922,54 +1922,54 @@ async fn reader_task(
                         let params = frame.get("params").unwrap_or(&Value::Null);
                         let root_thread = thread_binding.lock().await.clone();
                         let request_thread = params.get("threadId").and_then(Value::as_str);
-                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), request_thread) {
-                            if thread_id != root {
-                                if m == "mcpServer/elicitation/request" {
-                                    // A spawned Codex child inherits the root thread's
-                                    // MCP inventory and approval policy. Its view is
-                                    // read-only, so route the approval to the writable
-                                    // parent conversation instead of rejecting it. The
-                                    // reverse-RPC id is connection-global; answering the
-                                    // parent card therefore resumes the exact child call.
-                                    handle_reverse_rpc(
-                                        m,
-                                        &frame,
-                                        &session_id,
-                                        &turn_gen,
-                                        &event_tx,
-                                        &pending_auth_id,
-                                        &pending_tool_approvals,
-                                        &stdin,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                // Child threads share the app-server JSON-RPC transport,
-                                // but the parent conversation is the only writable UI.
-                                // Unsupported child reverse-RPC classes remain rejected
-                                // without registering them in the parent's pending set.
-                                let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                                write_reverse_error(
+                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), request_thread)
+                            && thread_id != root
+                        {
+                            if m == "mcpServer/elicitation/request" {
+                                // A spawned Codex child inherits the root thread's
+                                // MCP inventory and approval policy. Its view is
+                                // read-only, so route the approval to the writable
+                                // parent conversation instead of rejecting it. The
+                                // reverse-RPC id is connection-global; answering the
+                                // parent card therefore resumes the exact child call.
+                                handle_reverse_rpc(
+                                    m,
+                                    &frame,
+                                    &session_id,
+                                    &turn_gen,
+                                    &event_tx,
+                                    &pending_auth_id,
+                                    &pending_tool_approvals,
                                     &stdin,
-                                    &id,
-                                    -32601,
-                                    "subagent approval is unavailable in the read-only child view",
                                 )
                                 .await;
-                                emit(
-                                    &event_tx,
-                                    &session_id,
-                                    turn_gen.load(Ordering::SeqCst),
-                                    SessionEvent::SubagentStream {
-                                        r#ref: thread_id.to_owned(),
-                                        event: Box::new(SessionEvent::AdapterSpecific {
-                                            tag: "codex_child_reverse_rpc_rejected".into(),
-                                            payload: json!({ "method": m, "id": id }),
-                                        }),
-                                    },
-                                );
                                 continue;
                             }
+                            // Child threads share the app-server JSON-RPC transport,
+                            // but the parent conversation is the only writable UI.
+                            // Unsupported child reverse-RPC classes remain rejected
+                            // without registering them in the parent's pending set.
+                            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                            write_reverse_error(
+                                &stdin,
+                                &id,
+                                -32601,
+                                "subagent approval is unavailable in the read-only child view",
+                            )
+                            .await;
+                            emit(
+                                &event_tx,
+                                &session_id,
+                                turn_gen.load(Ordering::SeqCst),
+                                SessionEvent::SubagentStream {
+                                    r#ref: thread_id.to_owned(),
+                                    event: Box::new(SessionEvent::AdapterSpecific {
+                                        tag: "codex_child_reverse_rpc_rejected".into(),
+                                        payload: json!({ "method": m, "id": id }),
+                                    }),
+                                },
+                            );
+                            continue;
                         }
                         // reverse-RPC (ServerRequest): infra → auto-reject to prevent
                         // deadlock (A2/A3); auth-refresh + approvals → surface as
@@ -1998,39 +1998,39 @@ async fn reader_task(
                         // notifications and thread.id on thread/started.
                         let root_thread = thread_binding.lock().await.clone();
                         let notification_thread = notification_thread_id(m, params);
-                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), notification_thread) {
-                            if thread_id != root {
-                                let resolves_parent_confirmation = m == "serverRequest/resolved"
-                                    && params
-                                        .get("request_id")
-                                        .or_else(|| params.get("requestId"))
-                                        .is_some_and(|id| {
-                                            has_pending_tool_approval(&pending_tool_approvals, &id.to_string())
-                                        });
-                                if !resolves_parent_confirmation {
-                                    let child_events = if m == "turn/completed" {
-                                        vec![map_turn_completed(params)]
-                                    } else {
-                                        map_notification(m, params)
-                                    };
-                                    for event in child_events {
-                                        emit(
-                                            &event_tx,
-                                            &session_id,
-                                            cur,
-                                            SessionEvent::SubagentStream {
-                                                r#ref: thread_id.to_string(),
-                                                event: Box::new(event),
-                                            },
-                                        );
-                                    }
-                                    continue;
+                        if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), notification_thread)
+                            && thread_id != root
+                        {
+                            let resolves_parent_confirmation = m == "serverRequest/resolved"
+                                && params
+                                    .get("request_id")
+                                    .or_else(|| params.get("requestId"))
+                                    .is_some_and(|id| {
+                                        has_pending_tool_approval(&pending_tool_approvals, &id.to_string())
+                                    });
+                            if !resolves_parent_confirmation {
+                                let child_events = if m == "turn/completed" {
+                                    vec![map_turn_completed(params)]
+                                } else {
+                                    map_notification(m, params)
+                                };
+                                for event in child_events {
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        SessionEvent::SubagentStream {
+                                            r#ref: thread_id.to_string(),
+                                            event: Box::new(event),
+                                        },
+                                    );
                                 }
-                                // The approval card lives in the writable parent
-                                // conversation even when the blocked MCP call is
-                                // running in a child. Let the normal resolved path
-                                // below clear that exact parent card/counter.
+                                continue;
                             }
+                            // The approval card lives in the writable parent
+                            // conversation even when the blocked MCP call is
+                            // running in a child. Let the normal resolved path
+                            // below clear that exact parent card/counter.
                         }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
@@ -9139,10 +9139,15 @@ mod tests {
             ..Default::default()
         };
         let frame = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
+        let mut expected_params = thread_start_params(&config).0;
+        expected_params["threadId"] = json!("th-1");
+        assert_eq!(frame["params"], expected_params);
         assert_eq!(frame["method"], "thread/resume");
         assert_eq!(frame["params"]["threadId"], "th-1");
         assert_eq!(frame["params"]["cwd"], "/work");
-        assert_eq!(frame["params"]["approvalPolicy"], "never");
+        // The untrusted MCP server retains its prompt boundary on resume,
+        // exactly as on fresh startup, while command approvals stay disabled.
+        assert_eq!(frame["params"]["approvalPolicy"], mcp_only_approval_policy());
         assert_eq!(frame["params"]["sandbox"], "danger-full-access");
         assert_eq!(
             frame["params"]["config"]["mcp_servers"]["fs"]["command"],

@@ -198,9 +198,20 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
         let runtime_capabilities = options.runtime_capabilities.clone();
+        crate::capability::tencent_memory::register_session(
+            options.context.conversation_id(),
+            options.memory_recall.clone(),
+        );
+        let registered_conversation_id = options.context.conversation_id().to_owned();
         let managed = slot
             .get_or_try_init(|| async move {
-                let agent = factory(options).await?;
+                let agent = match factory(options).await {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        crate::capability::tencent_memory::unregister_session(&registered_conversation_id);
+                        return Err(error);
+                    }
+                };
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
                     runtime_capabilities,
@@ -213,6 +224,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             self.invalidate_runtime_tokens(&id);
+            crate::capability::tencent_memory::unregister_session(&id);
             let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
@@ -238,6 +250,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             self.invalidate_runtime_tokens(&id);
+            crate::capability::tencent_memory::unregister_session(&id);
             let agent_type = slot.get().map(|managed| managed.agent.agent_type());
             if matches!(reason, Some(AgentKillReason::IdleTimeout)) {
                 info!(
@@ -278,6 +291,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
                 self.invalidate_runtime_tokens(&id);
+                crate::capability::tencent_memory::unregister_session(&id);
                 info!(conversation_id = %id, "Clearing agent task");
                 if let Some(managed) = slot.get() {
                     waits.push(managed.agent.kill_and_wait(None));

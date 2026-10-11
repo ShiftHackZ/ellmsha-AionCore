@@ -37,6 +37,12 @@ pub use crate::registry_helpers::ExtensionSummary;
 
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
+type MaterializedRevisions = (
+    Vec<LoadedExtension>,
+    HashMap<String, PathBuf>,
+    HashMap<String, Arc<RevisionLease>>,
+);
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -162,14 +168,7 @@ impl ExtensionRegistry {
         Ok(())
     }
 
-    fn materialize_revisions(
-        &self,
-        source_extensions: Vec<LoadedExtension>,
-    ) -> (
-        Vec<LoadedExtension>,
-        HashMap<String, PathBuf>,
-        HashMap<String, Arc<RevisionLease>>,
-    ) {
+    fn materialize_revisions(&self, source_extensions: Vec<LoadedExtension>) -> MaterializedRevisions {
         let mut revisions = Vec::with_capacity(source_extensions.len());
         let mut source_directories = HashMap::with_capacity(source_extensions.len());
         let mut revision_leases = HashMap::with_capacity(source_extensions.len());

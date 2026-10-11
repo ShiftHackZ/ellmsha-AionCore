@@ -129,6 +129,7 @@ fn acquire_lock(root: &Path, name: &str) -> Result<std::fs::File, CliRuntimeErro
     }
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -349,10 +350,11 @@ async fn validate_codex(path: &Path) -> Result<(), CliRuntimeError> {
     }
     let mut schema = String::new();
     for entry in walkdir::WalkDir::new(&schema_root).into_iter().filter_map(Result::ok) {
-        if entry.path().is_file() && entry.path().extension().and_then(|value| value.to_str()) == Some("json") {
-            if let Ok(text) = fs::read_to_string(entry.path()) {
-                schema.push_str(&text);
-            }
+        if entry.path().is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            && let Ok(text) = fs::read_to_string(entry.path())
+        {
+            schema.push_str(&text);
         }
     }
     let _ = fs::remove_dir_all(&schema_root);

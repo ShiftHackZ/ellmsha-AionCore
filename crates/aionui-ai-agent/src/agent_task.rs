@@ -221,12 +221,17 @@ impl AgentInstance {
         // The conversation has already persisted the user's original message.
         // Only the transient provider input receives retrieved memory, covering
         // ordinary, scheduled and conversation-backed delegated turns alike.
-        if let Some(memory) = crate::capability::tencent_memory::recall_from_env(self.workspace(), &data.content).await
+        if let Some(memory) =
+            crate::capability::tencent_memory::recall_from_env(self.conversation_id(), self.workspace(), &data.content)
+                .await
         {
             if memory.status == "ready" {
                 tracing::info!(
                     conversation_id = self.conversation_id(),
                     status = memory.status,
+                    intent = memory.intent,
+                    scope_mode = memory.scope_mode,
+                    evidence = memory.evidence_status,
                     sources = memory.source_count,
                     context_bytes = memory.text.len(),
                     "TencentDB turn recall completed"
@@ -235,6 +240,9 @@ impl AgentInstance {
                 tracing::warn!(
                     conversation_id = self.conversation_id(),
                     status = memory.status,
+                    intent = memory.intent,
+                    scope_mode = memory.scope_mode,
+                    evidence = memory.evidence_status,
                     sources = memory.source_count,
                     core_error = memory.core_error,
                     search_error = memory.search_error,

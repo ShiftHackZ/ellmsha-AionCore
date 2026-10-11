@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
-use aionui_ai_agent::types::BuildTaskOptions;
+use aionui_ai_agent::types::{BuildTaskOptions, MemoryRecallScope};
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
@@ -4120,6 +4120,7 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options(row, seed)
                 .await?;
+        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
     }
@@ -4135,8 +4136,54 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options_with_workspace_override(row, workspace_override, seed)
                 .await?;
+        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
+    }
+
+    async fn memory_recall_scope(&self, row: &ConversationRow, runtime_workspace: &str) -> MemoryRecallScope {
+        let mut scope = MemoryRecallScope {
+            project_id: row.project_id.clone(),
+            project_name: None,
+            workspace: runtime_workspace.to_owned(),
+            roots: vec![runtime_workspace.to_owned()],
+        };
+        let (Some(project_id), Some(project_service)) = (
+            row.project_id.as_deref(),
+            self.project_service.read().ok().and_then(|guard| guard.clone()),
+        ) else {
+            return scope;
+        };
+        let Ok(project) = project_service.get_project(&row.user_id, project_id).await else {
+            warn!(
+                conversation_id = %row.id,
+                project_id,
+                "Registered project scope unavailable for memory recall; using workspace scope"
+            );
+            return scope;
+        };
+        let mut project_workspace = None;
+        let roots = project
+            .explorer
+            .entries
+            .into_iter()
+            .filter_map(|entry| {
+                let path = canonical::uri_to_path(&entry.folder.resource_uri).ok()?;
+                let path = path.to_string_lossy().into_owned();
+                if entry.role == "workspace" {
+                    project_workspace = Some(path.clone());
+                }
+                Some(path)
+            })
+            .collect::<Vec<_>>();
+        scope.project_name = Some(project.name);
+        if !roots.is_empty() {
+            scope.roots = roots;
+        }
+        if let Some(project_workspace) = project_workspace {
+            scope.workspace = project_workspace;
+        }
+        scope
     }
 
     async fn include_managed_global_skills(&self, options: &mut BuildTaskOptions) {
@@ -4301,9 +4348,7 @@ impl ConversationService {
         build_opts: &mut BuildTaskOptions,
     ) -> Option<PluginRuntimeSnapshot> {
         let registry = self.plugin_registry.read().ok().and_then(|guard| guard.clone());
-        let Some(registry) = registry else {
-            return None;
-        };
+        let registry = registry?;
         let snapshot = registry.runtime_snapshot(&row.user_id, row.project_id.as_deref()).await;
 
         for skill in &snapshot.skills {

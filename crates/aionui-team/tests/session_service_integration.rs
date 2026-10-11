@@ -218,6 +218,8 @@ impl IConversationRepository for MockConversationRepo {
         _keyword: &str,
         _page: u32,
         _page_size: u32,
+        _before_created_at: Option<i64>,
+        _before_message_id: Option<&str>,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
         Ok(PaginatedResult {
             items: vec![],
@@ -596,6 +598,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 use_model: None,
             },
             skills: config.skills.clone(),
+            managed_skill_roots: Vec::new(),
             runtime_env: Vec::new(),
             team: team.clone(),
             kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {
@@ -1369,6 +1372,7 @@ fn test_acp_build_options(conversation_id: String, workspace: String) -> BuildTa
             use_model: None,
         },
         skills: Vec::new(),
+        managed_skill_roots: Vec::new(),
         runtime_env: Vec::new(),
         team: None,
         kind: AgentSessionKind::Acp(Box::new(AcpSessionBuildContext {

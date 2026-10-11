@@ -35,7 +35,7 @@ struct Inner {
     /// Per-user enabled/disabled overrides keyed by user id and extension name.
     user_states: Mutex<HashMap<String, HashMap<String, bool>>>,
     /// Project overrides keyed by user id, project id, and extension name.
-    project_states: Mutex<HashMap<String, HashMap<String, HashMap<String, bool>>>>,
+    project_states: Mutex<ProjectStates>,
     /// Notifier used to trigger a debounced write.
     write_notify: Notify,
     /// Whether the background writer task has been spawned.

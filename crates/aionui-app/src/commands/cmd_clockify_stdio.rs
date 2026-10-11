@@ -306,6 +306,8 @@ impl ClockifyStdioServer {
 #[rmcp::tool_handler(router = Self::tool_router())]
 impl rmcp::ServerHandler for ClockifyStdioServer {}
 
+type MutationLocks = HashMap<(String, String), Weak<Mutex<()>>>;
+
 #[derive(Clone)]
 struct ClockifyClient {
     http: reqwest::Client,
@@ -318,7 +320,7 @@ struct ClockifyClient {
     connection_id: String,
     realm: String,
     mutation_lock_dir: PathBuf,
-    mutation_locks: Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
+    mutation_locks: Arc<Mutex<MutationLocks>>,
 }
 
 #[derive(Debug)]
@@ -1405,7 +1407,9 @@ fn provider_report_range(
     start: DateTime<Utc>,
     exclusive_end: DateTime<Utc>,
 ) -> Result<(String, String), ClockifyError> {
-    if start.timestamp_subsec_nanos() % 1_000 != 0 || exclusive_end.timestamp_subsec_nanos() % 1_000 != 0 {
+    if !start.timestamp_subsec_nanos().is_multiple_of(1_000)
+        || !exclusive_end.timestamp_subsec_nanos().is_multiple_of(1_000)
+    {
         return Err(definite(
             "Clockify report interval boundaries support at most microsecond precision.",
         ));
@@ -1538,19 +1542,19 @@ fn bound_report_output(value: &mut serde_json::Value) {
         let Some(result) = value.get_mut("result").and_then(serde_json::Value::as_object_mut) else {
             break;
         };
-        if let Some(entries) = result.get_mut("entries").and_then(serde_json::Value::as_array_mut) {
-            if !entries.is_empty() {
-                entries.truncate(entries.len() / 2);
-                result.insert("details_truncated".into(), serde_json::Value::Bool(true));
-                continue;
-            }
+        if let Some(entries) = result.get_mut("entries").and_then(serde_json::Value::as_array_mut)
+            && !entries.is_empty()
+        {
+            entries.truncate(entries.len() / 2);
+            result.insert("details_truncated".into(), serde_json::Value::Bool(true));
+            continue;
         }
-        if let Some(groups) = result.get_mut("groups").and_then(serde_json::Value::as_array_mut) {
-            if !groups.is_empty() {
-                groups.truncate(groups.len() / 2);
-                result.insert("groups_truncated".into(), serde_json::Value::Bool(true));
-                continue;
-            }
+        if let Some(groups) = result.get_mut("groups").and_then(serde_json::Value::as_array_mut)
+            && !groups.is_empty()
+        {
+            groups.truncate(groups.len() / 2);
+            result.insert("groups_truncated".into(), serde_json::Value::Bool(true));
+            continue;
         }
         result.insert("completeness".into(), serde_json::Value::String("unavailable".into()));
         result.insert("reason".into(), serde_json::Value::String("output_limit".into()));
@@ -1564,14 +1568,14 @@ fn interval_json(start: DateTime<Utc>, end: DateTime<Utc>) -> serde_json::Value 
 
 fn parse_timestamp(value: &str, label: &str) -> Result<DateTime<Utc>, ClockifyError> {
     if value.len() > 100 || value.trim() != value {
-        return Err(definite(&format!(
+        return Err(definite(format!(
             "Clockify {label} must be an RFC 3339 timestamp with an explicit offset."
         )));
     }
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|_| {
-            definite(&format!(
+            definite(format!(
                 "Clockify {label} must be an RFC 3339 timestamp with an explicit offset."
             ))
         })
@@ -1595,7 +1599,7 @@ fn object<'a>(
 ) -> Result<&'a serde_json::Map<String, serde_json::Value>, ClockifyError> {
     value
         .as_object()
-        .ok_or_else(|| definite(&format!("Clockify returned an invalid {label}.")))
+        .ok_or_else(|| definite(format!("Clockify returned an invalid {label}.")))
 }
 
 fn required_string(
@@ -1604,7 +1608,7 @@ fn required_string(
     max_len: usize,
     label: &str,
 ) -> Result<String, ClockifyError> {
-    optional_string(value, keys, max_len).ok_or_else(|| definite(&format!("Clockify {label} is missing.")))
+    optional_string(value, keys, max_len).ok_or_else(|| definite(format!("Clockify {label} is missing.")))
 }
 
 fn optional_string(

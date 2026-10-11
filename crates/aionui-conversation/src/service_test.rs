@@ -6055,8 +6055,22 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
 
     assert_eq!(task_mgr.build_count(), 2);
     assert_eq!(task_mgr.kill_count(), 1);
-    assert_eq!(first.sent_contents(), vec!["Hello"]);
-    assert_eq!(second.sent_contents(), vec!["Hello"]);
+    let first_payloads = first.sent_contents();
+    let retry_payloads = second.sent_contents();
+    assert_eq!(first_payloads.len(), 1);
+    assert_eq!(retry_payloads.len(), 1);
+    // This no-memory-config fixture gets the same explicit unavailable context
+    // on each attempt, without nesting it around an already enriched payload.
+    assert_eq!(first_payloads, retry_payloads);
+    let payload = &first_payloads[0];
+    assert_eq!(payload.matches("<ellmsha_memory_context>").count(), 1);
+    assert_eq!(payload.matches("</ellmsha_memory_context>").count(), 1);
+    assert_eq!(
+        payload
+            .split_once("</ellmsha_memory_context>\n\n")
+            .map(|(_, user)| user),
+        Some("Hello")
+    );
 
     let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let users: Vec<_> = messages
@@ -6069,6 +6083,8 @@ async fn send_message_auto_replays_clean_retryable_acp_error_once() {
         .collect();
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert_eq!(users.len(), 1, "auto replay must not insert the user message again");
+    let user_content: serde_json::Value = serde_json::from_str(&users[0].content).unwrap();
+    assert_eq!(user_content["content"], "Hello");
     assert_eq!(assistants.len(), 1);
     assert_eq!(
         tips.len(),

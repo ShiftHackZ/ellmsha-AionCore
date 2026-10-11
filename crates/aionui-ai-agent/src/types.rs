@@ -30,6 +30,7 @@ pub struct SendMessageData {
 pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
     pub runtime_capabilities: RuntimeCapabilities,
+    pub memory_recall: MemoryRecallScope,
 }
 
 impl BuildTaskOptions {
@@ -37,6 +38,7 @@ impl BuildTaskOptions {
         Self {
             context,
             runtime_capabilities: RuntimeCapabilities::default(),
+            memory_recall: MemoryRecallScope::default(),
         }
     }
 
@@ -85,6 +87,18 @@ impl BuildTaskOptions {
         }
         self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
     }
+}
+
+/// Non-secret project identity used to constrain automatic durable-memory recall.
+/// The conversation domain resolves registered roots; the task manager keeps the
+/// resulting snapshot beside the active task without exposing database services to
+/// provider adapters.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoryRecallScope {
+    pub project_id: Option<String>,
+    pub project_name: Option<String>,
+    pub workspace: String,
+    pub roots: Vec<String>,
 }
 
 pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";

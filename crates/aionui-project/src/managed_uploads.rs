@@ -158,7 +158,7 @@ impl ManagedUploadStore {
         }
 
         let storage_root = self.root.clone();
-        let destination = self.scope_root(user_id, &scope);
+        let destination = self.scope_root(user_id, scope);
         let file_name = file_name.to_owned();
         tokio::task::spawn_blocking(move || {
             ensure_private_directory(&storage_root, &destination)?;

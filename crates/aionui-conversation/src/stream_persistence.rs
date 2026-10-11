@@ -174,11 +174,11 @@ impl SubagentTranscriptStore {
             folder_id: parent.folder_id,
             name_source: Some("agent".to_owned()),
         };
-        if let Err(err) = self.repo.create(&row).await {
-            if !matches!(err, DbError::Conflict(_)) {
-                log_persist_error(&err, "Failed to create subagent conversation");
-                return None;
-            }
+        if let Err(err) = self.repo.create(&row).await
+            && !matches!(err, DbError::Conflict(_))
+        {
+            log_persist_error(&err, "Failed to create subagent conversation");
+            return None;
         }
         self.broadcast_list_change(&child_id, "created");
         Some(child_id)

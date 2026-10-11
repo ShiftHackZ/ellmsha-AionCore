@@ -453,6 +453,8 @@ pub(crate) mod workspace_harness {
             _keyword: &str,
             _page: u32,
             _page_size: u32,
+            _before_created_at: Option<i64>,
+            _before_message_id: Option<&str>,
         ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
             Ok(PaginatedResult {
                 items: vec![],
