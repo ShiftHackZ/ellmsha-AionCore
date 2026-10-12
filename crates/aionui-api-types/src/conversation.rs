@@ -53,9 +53,40 @@ pub struct AssistantConversationRequest {
     pub conversation_overrides: Option<AssistantConversationOverridesRequest>,
 }
 
+/// Controls ambient tool/config attachment for a conversation. This is not an OS sandbox.
+/// `session_only` is a native integration-test scope: only explicitly supplied
+/// session MCP servers are attached, with no account plugins, ambient skills,
+/// global/project native configuration, or durable-memory reads/writes.
+/// External ACP runtimes cannot guarantee this contract and reject this mode.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationToolScope {
+    #[default]
+    Default,
+    SessionOnly,
+}
+
+impl ConversationToolScope {
+    pub fn is_session_only(self) -> bool {
+        self == Self::SessionOnly
+    }
+
+    pub fn from_extra(extra: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        extra
+            .get("tool_scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+}
+
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
+    /// Immutable trusted creation-time scope. Omitted preserves ordinary behavior.
+    #[serde(default)]
+    pub tool_scope: ConversationToolScope,
     #[serde(default)]
     pub r#type: Option<AgentType>,
     pub name: Option<String>,
@@ -382,6 +413,23 @@ mod tests {
     use serde_json::json;
 
     // ── CreateConversationRequest ───────────────────────────────────
+
+    #[test]
+    fn session_only_tool_scope_is_explicit_and_validated() {
+        let default: CreateConversationRequest = serde_json::from_value(serde_json::json!({"extra": {}})).unwrap();
+        assert_eq!(default.tool_scope, ConversationToolScope::Default);
+        let isolated: CreateConversationRequest =
+            serde_json::from_value(serde_json::json!({"tool_scope":"session_only","extra": {}})).unwrap();
+        assert!(isolated.tool_scope.is_session_only());
+        for invalid in [serde_json::json!(true), serde_json::json!("anything")] {
+            assert!(
+                serde_json::from_value::<CreateConversationRequest>(
+                    serde_json::json!({"tool_scope":invalid,"extra":{}})
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn deserialize_create_request_full() {

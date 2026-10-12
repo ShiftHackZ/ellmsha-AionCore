@@ -110,6 +110,8 @@ pub struct AcpBuildExtra {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AionrsBuildExtra {
     #[serde(default)]
+    pub tool_scope: crate::ConversationToolScope,
+    #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub preset_rules: Option<String>,

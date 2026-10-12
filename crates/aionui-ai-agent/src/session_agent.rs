@@ -1901,7 +1901,7 @@ fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::Sess
 /// Convert a neutral `SessionMcpServer` (already stdio-launch-resolved by
 /// `mcp_resolve`) into the crate-local `McpServerSpec`. Verbatim port of
 /// clean-slate `session_runtime::session_server_to_spec`.
-fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui_session::McpServerSpec {
+pub(crate) fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui_session::McpServerSpec {
     use aionui_api_types::SessionMcpTransport as T;
     use aionui_session::{McpServerSpec, McpTransport};
     let sorted = |m: &std::collections::HashMap<String, String>| -> Vec<(String, String)> {

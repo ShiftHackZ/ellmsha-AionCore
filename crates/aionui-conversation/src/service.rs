@@ -999,7 +999,26 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        let tool_scope = req.tool_scope;
         let mut extra = req.extra;
+        if extra.get("tool_scope").is_some() {
+            return Err(ConversationError::BadRequest {
+                reason: "tool_scope must be supplied at the top level when creating a conversation".into(),
+            });
+        }
+        if tool_scope.is_session_only() {
+            if !extra.is_object() {
+                return Err(ConversationError::BadRequest {
+                    reason: "session_only tool scope requires an object extra payload".into(),
+                });
+            }
+            if req.assistant.is_some() || extra.get("preset_assistant_id").is_some() {
+                return Err(ConversationError::BadRequest {
+                    reason: "session_only tool scope does not accept assistant presets".into(),
+                });
+            }
+            extra["tool_scope"] = serde_json::json!(tool_scope);
+        }
         strip_request_owner_user_id(&mut extra);
         // `extra.fork` is server-minted by the fork API only. A client-supplied
         // value would let anyone fork an arbitrary `parent_session_id` they do
@@ -1032,6 +1051,23 @@ impl ConversationService {
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+
+        if tool_scope.is_session_only() && effective_type != AgentType::Aionrs {
+            return Err(ConversationError::BadRequest {
+                reason: "session_only tool scope requires a native aionrs conversation".into(),
+            });
+        }
+        if tool_scope.is_session_only()
+            && TeamSessionBinding::from_extra_value(&extra)
+                .map_err(|error| ConversationError::BadRequest {
+                    reason: format!("Invalid Team runtime context: {error}"),
+                })?
+                .is_some()
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "session_only tool scope does not support team runtime attachment".into(),
+            });
+        }
 
         if !effective_type.supports_new_conversation() {
             info!(
@@ -1268,8 +1304,12 @@ impl ConversationService {
             None => (Vec::new(), Vec::new()),
         };
 
-        let auto_inject_names = self.skill_resolver.auto_inject_names().await;
-        let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
+        let initial_skills = if tool_scope.is_session_only() {
+            Vec::new()
+        } else {
+            let auto_inject_names = self.skill_resolver.auto_inject_names().await;
+            compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject)
+        };
 
         // Wire skill links into the runtime workspace so the agent CLI picks
         // them up via its native skills dir (e.g. `.claude/skills/`). This
@@ -1333,6 +1373,17 @@ impl ConversationService {
             }
             None => None,
         };
+        // Explicit session scope never falls back to account/user MCP rows.
+        let selected_mcp_server_ids = if tool_scope.is_session_only() {
+            if selected_mcp_server_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+                return Err(ConversationError::BadRequest {
+                    reason: "session_only tool scope accepts selected_session_mcp_servers, not stored MCP IDs".into(),
+                });
+            }
+            Some(Vec::new())
+        } else {
+            selected_mcp_server_ids
+        };
         let selected_session_mcp_servers = match extra.as_object_mut() {
             Some(obj) => match obj.remove("selected_session_mcp_servers") {
                 Some(value) => Some(serde_json::from_value::<Vec<SessionMcpServer>>(value).map_err(|e| {
@@ -1343,6 +1394,12 @@ impl ConversationService {
                 None => None,
             },
             None => None,
+        };
+
+        let selected_session_mcp_servers = if tool_scope.is_session_only() {
+            Some(selected_session_mcp_servers.unwrap_or_default())
+        } else {
+            selected_session_mcp_servers
         };
 
         let mcp_support = self
@@ -1431,7 +1488,7 @@ impl ConversationService {
         let row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
-            name: req.name.unwrap_or_default(),
+            name: crate::title_policy::safe_derived_title(&req.name.unwrap_or_default()),
             r#type: enum_to_db(&effective_type)?,
             extra: serde_json::to_string(&extra)
                 .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
@@ -2280,14 +2337,15 @@ impl ConversationService {
         // must not be re-shaped by PATCH. The frontend must clone the
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
-            && (incoming.get("skills").is_some()
+            && (incoming.get("tool_scope").is_some()
+                || incoming.get("skills").is_some()
                 || incoming.get("mcp_server_ids").is_some()
                 || incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "extra.tool_scope, skills and MCP snapshots are immutable post-creation".into(),
             });
         }
 
@@ -2376,7 +2434,13 @@ impl ConversationService {
         };
 
         let updates = ConversationRowUpdate {
-            name: req.name,
+            name: req.name.map(|name| {
+                if req.name_source.as_deref() == Some("auto") {
+                    crate::title_policy::safe_derived_title(&name)
+                } else {
+                    name
+                }
+            }),
             pinned: req.pinned,
             pinned_at,
             model: model_json,
@@ -2766,6 +2830,9 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
         if let Some(obj) = extra.as_object_mut() {
+            // A fork remints message IDs; reconstruct its brief from its own
+            // user messages instead of carrying invalid parent references.
+            obj.remove("task_context");
             obj.insert(
                 "fork".to_owned(),
                 serde_json::to_value(aionui_api_types::ForkSpec {
@@ -2789,7 +2856,13 @@ impl ConversationService {
         let row = aionui_db::models::ConversationRow {
             id: new_id.clone(),
             user_id: user_id.to_owned(),
-            name: explicit_name.unwrap_or_else(|| parent.name.clone()),
+            name: explicit_name.unwrap_or_else(|| {
+                if parent.name_source.as_deref() == Some("user") {
+                    parent.name.clone()
+                } else {
+                    crate::title_policy::safe_derived_title(&parent.name)
+                }
+            }),
             name_source,
             r#type: parent.r#type.clone(),
             extra: serde_json::to_string(&extra)
@@ -4120,7 +4193,11 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options(row, seed)
                 .await?;
-        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
+        if options.context.is_session_only() {
+            options.memory_recall.isolated_test = true;
+        } else {
+            options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
+        }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
     }
@@ -4136,13 +4213,18 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options_with_workspace_override(row, workspace_override, seed)
                 .await?;
-        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
+        if options.context.is_session_only() {
+            options.memory_recall.isolated_test = true;
+        } else {
+            options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
+        }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
     }
 
     async fn memory_recall_scope(&self, row: &ConversationRow, runtime_workspace: &str) -> MemoryRecallScope {
         let mut scope = MemoryRecallScope {
+            isolated_test: false,
             project_id: row.project_id.clone(),
             project_name: None,
             workspace: runtime_workspace.to_owned(),
@@ -4187,6 +4269,9 @@ impl ConversationService {
     }
 
     async fn include_managed_global_skills(&self, options: &mut BuildTaskOptions) {
+        if options.context.is_session_only() {
+            return;
+        }
         for name in self.skill_resolver.managed_global_names().await {
             if !options.context.skills.contains(&name) {
                 options.context.skills.push(name);
@@ -4237,6 +4322,9 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) -> Option<String> {
+        if build_opts.context.is_session_only() {
+            return None;
+        }
         let service = self.runtime_token_service.as_ref()?;
         // Every conversation gets a helper-scoped token so the in-conversation
         // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
@@ -4258,6 +4346,9 @@ impl ConversationService {
         build_opts: &mut BuildTaskOptions,
         plugin_snapshot: Option<&PluginRuntimeSnapshot>,
     ) {
+        if build_opts.context.is_session_only() {
+            return;
+        }
         let backend = context_backend_value(&build_opts.context);
         let is_codex = backend.as_ref().and_then(serde_json::Value::as_str) == Some("codex");
 
@@ -4347,6 +4438,9 @@ impl ConversationService {
         row: &ConversationRow,
         build_opts: &mut BuildTaskOptions,
     ) -> Option<PluginRuntimeSnapshot> {
+        if build_opts.context.is_session_only() {
+            return None;
+        }
         let registry = self.plugin_registry.read().ok().and_then(|guard| guard.clone());
         let registry = registry?;
         let snapshot = registry.runtime_snapshot(&row.user_id, row.project_id.as_deref()).await;
@@ -4558,6 +4652,9 @@ fn strip_request_owner_user_id(extra: &mut serde_json::Value) {
 /// See the call site in `create`: `extra.fork` may only be minted by the
 /// server-side fork API, never accepted from a client payload.
 fn strip_request_fork_spec(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut() {
+        obj.remove("task_context");
+    }
     if let Some(obj) = extra.as_object_mut()
         && obj.remove("fork").is_some()
     {
@@ -5239,6 +5336,7 @@ pub(crate) async fn apply_agent_title(
     conversation_id: &str,
     title: &str,
 ) -> Result<bool, ConversationError> {
+    let title = crate::title_policy::safe_derived_title(title);
     let Some(existing) = repo.get(user_id, conversation_id).await? else {
         debug!(conversation_id, "agent title dropped: conversation not found");
         return Ok(false);
@@ -5247,7 +5345,7 @@ pub(crate) async fn apply_agent_title(
         debug!(conversation_id, "agent title dropped: name is user-owned");
         return Ok(false);
     }
-    if existing.name == title {
+    if title.is_empty() || existing.name == title {
         return Ok(false);
     }
 

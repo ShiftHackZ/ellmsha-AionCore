@@ -592,7 +592,7 @@ async fn t11_3_delete_broadcasts_deleted() {
 // ── T12: Boundary scenarios ────────────────────────────────────────
 
 #[tokio::test]
-async fn t12_1_long_name() {
+async fn t12_1_long_derived_name_is_bounded() {
     let (svc, _, _task_mgr) = setup().await;
     let long_name = "x".repeat(1000);
 
@@ -603,7 +603,8 @@ async fn t12_1_long_name() {
     }))
     .unwrap();
     let resp = svc.create(USER_ID, req).await.unwrap();
-    assert_eq!(resp.name.len(), 1000);
+    // Create-time names follow the bounded automatic-title contract.
+    assert_eq!(resp.name, "x".repeat(120));
 }
 
 #[tokio::test]

@@ -78,7 +78,9 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let mut context = options.context;
-    tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await;
+    if !context.is_session_only() {
+        tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await;
+    }
     codex_home::isolate_legacy_memory(&mut context, &deps.data_dir).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();

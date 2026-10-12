@@ -625,11 +625,11 @@ impl ExtensionRegistry {
     /// Callers keep this immutable snapshot for the duration of a turn.
     pub async fn runtime_snapshot(&self, user_id: &str, project_id: Option<&str>) -> PluginRuntimeSnapshot {
         let _runtime_guard = self.reload_lock.lock().await;
-        let linear_enabled = self
+        let linear_extension = self
             .extensions_for_user(user_id)
             .await
             .into_iter()
-            .any(|extension| extension.state.enabled && extension.manifest.name == LINEAR_PLUGIN_NAME);
+            .find(|extension| extension.state.enabled && extension.manifest.name == LINEAR_PLUGIN_NAME);
         let clockify_enabled = self
             .extensions_for_user(user_id)
             .await
@@ -661,8 +661,12 @@ impl ExtensionRegistry {
             .into_iter()
             .filter_map(resolved_mcp_to_session)
             .collect();
-        if linear_enabled {
-            mcp_servers.extend(linear_servers);
+        if let Some(extension) = linear_extension {
+            mcp_servers.extend(
+                linear_servers
+                    .into_iter()
+                    .map(|server| crate::linear::with_image_normalization(server, Path::new(&extension.directory))),
+            );
         }
         if clockify_enabled {
             mcp_servers.extend(clockify_servers);

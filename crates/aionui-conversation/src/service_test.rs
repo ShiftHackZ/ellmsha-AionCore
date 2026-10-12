@@ -56,6 +56,10 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
+#[path = "service_test/task_context_test.rs"]
+mod task_context_test;
+#[path = "service_test/tool_scope_test.rs"]
+mod tool_scope_test;
 
 #[derive(Clone, Debug)]
 struct SkillLinkCall {
@@ -1632,6 +1636,28 @@ async fn seed_titled_conversation(
 async fn get_row(repo: &Arc<MockRepo>, user_id: &str, id: &str) -> ConversationRow {
     use aionui_db::IConversationRepository as _;
     repo.get(user_id, id).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn agent_title_hides_credentials_from_storage_and_events() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Fixture", None).await;
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    crate::service::apply_agent_title(
+        &repo_dyn,
+        &broadcaster_dyn,
+        "user_1",
+        &id,
+        "QA fixture password: example-secret",
+    )
+    .await
+    .unwrap();
+    assert_eq!(get_row(&repo, "user_1", &id).await.name, "New Chat");
+    for event in broadcaster.take_events() {
+        assert!(!event.data.to_string().contains("example-secret"));
+    }
 }
 
 #[tokio::test]

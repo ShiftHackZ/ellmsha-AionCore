@@ -88,6 +88,7 @@ impl ProviderHealthCheckService {
         };
 
         Ok(AionrsResolvedConfig {
+            tool_scope: Default::default(),
             provider,
             api_key,
             model: model_id.to_owned(),

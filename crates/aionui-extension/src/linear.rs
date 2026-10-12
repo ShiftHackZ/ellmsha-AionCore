@@ -24,6 +24,25 @@ const STORE_FILE: &str = "linear-connections.json";
 const AUTH_ROOT: &str = "plugin-auth";
 const MAX_ERROR_LEN: usize = 300;
 
+/// Use the installed plugin revision's input adapter without changing account
+/// identity, OAuth storage, or the upstream transport arguments. Older plugin
+/// revisions remain usable through their original transport.
+pub(crate) fn with_image_normalization(mut server: SessionMcpServer, plugin_dir: &Path) -> SessionMcpServer {
+    let adapter = plugin_dir.join("skills/linear-project-work/scripts/linear-mcp-adapter.mjs");
+    // Windows' npx.cmd requires shell resolution. Keep its existing launch
+    // path until the adapter is verified there; the skill fallback still works.
+    if cfg!(windows) || !adapter.is_file() {
+        return server;
+    }
+    if let SessionMcpTransport::Stdio { command, args, .. } = &mut server.transport {
+        let mut wrapped_args = vec![adapter.to_string_lossy().into_owned(), command.clone()];
+        wrapped_args.append(args);
+        *command = "node".into();
+        *args = wrapped_args;
+    }
+    server
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinearConnectionError {
     #[error("Linear connection not found")]
@@ -818,6 +837,48 @@ mod tests {
             panic!("Linear server must use stdio")
         };
         PathBuf::from(env.get("MCP_REMOTE_CONFIG_DIR").expect("isolated auth directory"))
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn image_adapter_preserves_account_binding_and_legacy_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = LinearConnectionManager::new(temp.path(), Arc::new(VerifiedProbe { legacy: false })).unwrap();
+        manager.connect_new("fixture-owner").await.unwrap();
+        let (_, servers) = manager.runtime_servers_snapshot("fixture-owner").await;
+        let server = servers.into_iter().next().unwrap();
+        let baseline = serde_json::to_value(&server).unwrap();
+        assert_eq!(
+            serde_json::to_value(with_image_normalization(server.clone(), temp.path())).unwrap(),
+            baseline
+        );
+
+        let adapter = temp
+            .path()
+            .join("skills/linear-project-work/scripts/linear-mcp-adapter.mjs");
+        std::fs::create_dir_all(adapter.parent().unwrap()).unwrap();
+        std::fs::write(&adapter, "// isolated transport fixture").unwrap();
+        let wrapped = with_image_normalization(server.clone(), temp.path());
+        assert_eq!(wrapped.id, server.id);
+        assert_eq!(wrapped.name, server.name);
+        assert_eq!(auth_dir(&wrapped), auth_dir(&server));
+        let SessionMcpTransport::Stdio {
+            command: before_command,
+            args: before_args,
+            env: before_env,
+            ..
+        } = server.transport
+        else {
+            panic!("expected stdio")
+        };
+        let SessionMcpTransport::Stdio { command, args, env, .. } = wrapped.transport else {
+            panic!("expected stdio")
+        };
+        assert_eq!(command, "node");
+        assert_eq!(args[0], adapter.to_string_lossy());
+        assert_eq!(args[1], before_command);
+        assert_eq!(&args[2..], before_args.as_slice());
+        assert_eq!(env, before_env);
     }
 
     #[tokio::test]

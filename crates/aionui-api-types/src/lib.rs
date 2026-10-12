@@ -29,6 +29,7 @@ mod runtime;
 mod shell;
 mod skill;
 mod system;
+mod task_context;
 mod team;
 mod team_mcp;
 mod team_tools;
@@ -90,9 +91,9 @@ pub use conversation::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    ConversationToolScope, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
@@ -174,6 +175,10 @@ pub use system::{
     ClientPreferencesResponse, FeedbackDiagnosticsContextResponse, FeedbackDiagnosticsPrivacyResponse,
     FeedbackDiagnosticsProfileResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse, SystemSettingsResponse,
     UpdateClientPreferencesRequest, UpdateSettingsRequest,
+};
+pub use task_context::{
+    TaskConstraint, TaskConstraintKind, TaskContext, TaskContextResponse, TaskEvidence, TaskEvidenceLevel,
+    TaskReportedResult, UpdateTaskContextRequest,
 };
 pub use team::{
     AddAgentRequest, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest, PauseTeamSlotRequest,

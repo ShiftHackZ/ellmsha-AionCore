@@ -199,7 +199,12 @@ impl AionrsAgentManager {
             project_dir: Some(PathBuf::from(&workspace)),
         };
 
-        let mut config = resolve_aionui_config(&cli_args)?;
+        let mut config = if config_extra.tool_scope.is_session_only() {
+            Config::resolve_isolated(&cli_args)
+                .map_err(|error| AgentError::internal(format!("Isolated config resolve failed: {error}")))?
+        } else {
+            resolve_aionui_config(&cli_args)?
+        };
 
         // Backend-specific overrides
         config.bedrock = config_extra.bedrock_config;

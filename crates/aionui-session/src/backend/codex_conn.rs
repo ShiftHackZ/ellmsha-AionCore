@@ -753,6 +753,33 @@ fn is_builtin_browser_mcp(server: &crate::backend::McpServerSpec, trusted_launch
             .all(|(key, _)| key == BROWSER_CDP_PORT_ENV || key == BROWSER_CDP_TOKEN_ENV)
 }
 
+/// Resolve live browser bridge coordinates for the exact app-owned launcher.
+/// Reused by native and Codex providers; credentials stay only in launch memory.
+pub fn builtin_browser_launch_env(server: &crate::backend::McpServerSpec) -> Vec<(String, String)> {
+    builtin_browser_launch_env_with(server, |key| std::env::var(key).ok())
+}
+
+fn builtin_browser_launch_env_with(
+    server: &crate::backend::McpServerSpec,
+    read_env: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let crate::backend::McpTransport::Stdio { env, .. } = &server.transport else {
+        return Vec::new();
+    };
+    let trusted_launcher = read_env(BUILTIN_BROWSER_MCP_PATH_ENV).filter(|value| !value.trim().is_empty());
+    if !is_builtin_browser_mcp(server, trusted_launcher.as_deref()) {
+        return env.clone();
+    }
+    let mut env = env.clone();
+    env.retain(|(key, _)| key != BROWSER_CDP_PORT_ENV && key != BROWSER_CDP_TOKEN_ENV);
+    for key in [BROWSER_CDP_PORT_ENV, BROWSER_CDP_TOKEN_ENV] {
+        if let Some(value) = read_env(key).filter(|value| !value.trim().is_empty()) {
+            env.push((key.to_owned(), value));
+        }
+    }
+    env
+}
+
 fn build_codex_mcp_servers_with_approval(servers: &[crate::backend::McpServerSpec], auto_approval: bool) -> Value {
     build_codex_mcp_servers_with_env_and_approval(servers, auto_approval, |key| std::env::var(key).ok())
 }
@@ -782,20 +809,12 @@ fn build_codex_mcp_servers_with_env_and_approval(
     for s in servers {
         let is_builtin_browser = is_builtin_browser_mcp(s, trusted_launcher.as_deref());
         let mut entry = match &s.transport {
-            McpTransport::Stdio { command, args, env } => {
-                let mut env_map: serde_json::Map<String, Value> =
-                    env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+            McpTransport::Stdio { command, args, .. } => {
+                let env_map: serde_json::Map<String, Value> = builtin_browser_launch_env_with(s, &read_env)
+                    .into_iter()
+                    .map(|(key, value)| (key, json!(value)))
+                    .collect();
                 if is_builtin_browser {
-                    // A catalog/session snapshot must never pin credentials from
-                    // an older renderer bridge. Replace both values atomically
-                    // from the current backend process environment.
-                    env_map.remove(BROWSER_CDP_PORT_ENV);
-                    env_map.remove(BROWSER_CDP_TOKEN_ENV);
-                    for key in [BROWSER_CDP_PORT_ENV, BROWSER_CDP_TOKEN_ENV] {
-                        if let Some(value) = read_env(key).filter(|value| !value.trim().is_empty()) {
-                            env_map.insert(key.to_owned(), json!(value));
-                        }
-                    }
                     tracing::info!(
                         server_name = %s.name,
                         bridge_port_present = env_map.contains_key(BROWSER_CDP_PORT_ENV),

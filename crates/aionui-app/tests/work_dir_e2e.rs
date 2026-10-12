@@ -20,6 +20,7 @@ async fn conversation_workspace_uses_work_dir() {
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {
+        tool_scope: Default::default(),
         r#type: Some(AgentType::Acp),
         name: Some("test".to_string()),
         model: None,
@@ -58,6 +59,7 @@ async fn user_specified_workspace_is_not_overridden() {
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {
+        tool_scope: Default::default(),
         r#type: Some(AgentType::Acp),
         name: Some("test".to_string()),
         model: None,
@@ -92,6 +94,7 @@ async fn workspace_defaults_to_data_dir_when_work_dir_equals_data_dir() {
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {
+        tool_scope: Default::default(),
         r#type: Some(AgentType::Acp),
         name: Some("test".to_string()),
         model: None,

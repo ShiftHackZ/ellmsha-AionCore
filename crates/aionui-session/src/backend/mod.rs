@@ -23,7 +23,9 @@ pub use antigravity::{
     AntigravityConnection, AntigravitySessionBackend, VersionDrift, antigravity_capabilities, version_drift,
 };
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
-pub use codex_conn::{CodexConnection, CodexSessionBackend, codex_capabilities, slash_command_name};
+pub use codex_conn::{
+    CodexConnection, CodexSessionBackend, builtin_browser_launch_env, codex_capabilities, slash_command_name,
+};
 pub use conversation_session::{ConversationSession, MsgStatus, PendingMessage};
 pub use orchestrator::Orchestrator;
 pub use rehydrate::rehydrate;

@@ -30,6 +30,26 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Latest visible human input, excluding hidden continuation/runtime messages.
+    async fn latest_user_message(&self, _user_id: &str, _id: &str) -> Result<Option<MessageRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Atomically replace the server-owned task brief if its revision and latest
+    /// human input still match. Must preserve all other conversation.extra fields.
+    async fn compare_and_set_task_context(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _expected_revision: u64,
+        _latest_user_message_id: &str,
+        _context: &str,
+    ) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "task context updates are unsupported by this repository".into(),
+        ))
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;

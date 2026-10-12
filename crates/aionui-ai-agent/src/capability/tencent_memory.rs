@@ -879,6 +879,9 @@ pub(crate) async fn recall_from_env(conversation_id: &str, workspace: &str, quer
             },
             recent_goal: Arc::new(Mutex::new(None)),
         });
+    if session.scope.isolated_test {
+        return None;
+    }
     let recent_goal = session.recent_goal.lock().ok().and_then(|goal| goal.clone());
     let plan = plan(query, recent_goal.as_deref());
     if should_remember_goal(query, &plan)
@@ -923,6 +926,24 @@ mod tests {
 
     fn empty_plan() -> RecallPlan {
         plan("ordinary question", None)
+    }
+
+    #[tokio::test]
+    async fn isolated_test_scope_skips_durable_memory_before_config_resolution() {
+        let id = "isolated-recall-contract";
+        register_session(
+            id,
+            MemoryRecallScope {
+                isolated_test: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            recall_from_env(id, "/tmp/synthetic", "fixture question")
+                .await
+                .is_none()
+        );
+        unregister_session(id);
     }
 
     #[test]
@@ -1191,6 +1212,7 @@ mod tests {
     #[test]
     fn aliases_cover_registered_root_nested_workspace_and_legacy_name() {
         let scope = MemoryRecallScope {
+            isolated_test: false,
             project_id: Some("project-1".into()),
             project_name: Some("DemoProject".into()),
             workspace: "/product/DemoProject".into(),
@@ -1211,6 +1233,7 @@ mod tests {
             ("a".repeat(161), "b".repeat(161)),
         ] {
             let scope = MemoryRecallScope {
+                isolated_test: false,
                 project_name: Some(name),
                 project_id: Some(id),
                 workspace: "/tmp/Проект".into(),

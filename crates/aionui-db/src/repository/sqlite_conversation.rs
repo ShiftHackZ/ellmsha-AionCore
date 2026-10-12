@@ -363,7 +363,10 @@ impl IConversationRepository for SqliteConversationRepository {
             binds.push(BindValue::OptStr(model.clone()));
         }
         if let Some(ref extra) = updates.extra {
-            set_parts.push("extra = ?".to_string());
+            // The working brief is server-owned and updated through a narrow CAS.
+            // Preserve its latest value even when another writer held stale extra.
+            set_parts.push("extra = CASE WHEN json_type(extra, '$.task_context') IS NOT NULL THEN json_set(json_remove(?, '$.task_context'), '$.task_context', json_extract(extra, '$.task_context')) ELSE json_remove(?, '$.task_context') END".to_string());
+            binds.push(BindValue::Str(extra.clone()));
             binds.push(BindValue::Str(extra.clone()));
         }
         if let Some(ref status) = updates.status {
@@ -727,6 +730,46 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn latest_user_message(&self, user_id: &str, id: &str) -> Result<Option<MessageRow>, DbError> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.type = 'text' \
+             AND m.position = 'right' AND m.hidden = 0 ORDER BY m.created_at DESC, m.id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn compare_and_set_task_context(
+        &self,
+        user_id: &str,
+        id: &str,
+        expected_revision: u64,
+        latest_user_message_id: &str,
+        context: &str,
+    ) -> Result<bool, DbError> {
+        let expected =
+            i64::try_from(expected_revision).map_err(|_| DbError::Init("task context revision is too large".into()))?;
+        let result = sqlx::query(
+            "UPDATE conversations SET extra = json_set(extra, '$.task_context', json(?)) \
+             WHERE user_id = ? AND id = ? AND COALESCE(json_extract(extra, '$.task_context.revision'), 0) = ? \
+             AND ? = (SELECT m.id FROM messages m WHERE m.conversation_id = conversations.id \
+             AND m.type = 'text' AND m.position = 'right' AND m.hidden = 0 \
+             ORDER BY m.created_at DESC, m.id DESC LIMIT 1)",
+        )
+        .bind(context)
+        .bind(user_id)
+        .bind(id)
+        .bind(expected)
+        .bind(latest_user_message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     // ── Message operations ──────────────────────────────────────────
 
     async fn list_messages_page(
@@ -966,6 +1009,7 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete_messages_by_conversation(&self, user_id: &str, conv_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM messages \
              WHERE conversation_id = ? \
@@ -976,8 +1020,17 @@ impl IConversationRepository for SqliteConversationRepository {
         )
         .bind(conv_id)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "UPDATE conversations SET extra = json_remove(extra, '$.task_context') WHERE user_id = ? AND id = ?",
+        )
+        .bind(user_id)
+        .bind(conv_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }

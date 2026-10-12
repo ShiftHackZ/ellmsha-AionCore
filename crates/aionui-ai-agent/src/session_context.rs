@@ -78,6 +78,10 @@ pub struct AionrsSessionBuildContext {
 }
 
 impl AgentSessionContext {
+    pub fn is_session_only(&self) -> bool {
+        matches!(&self.kind, AgentSessionKind::Aionrs(ctx) if ctx.config.tool_scope.is_session_only())
+    }
+
     pub fn conversation_id(&self) -> &str {
         &self.conversation.conversation_id
     }

@@ -1100,7 +1100,7 @@ async fn t10_4_associated_requires_auth() {
 // ── T12: Boundary scenarios ───────────────────────────────────────────
 
 #[tokio::test]
-async fn t12_1_long_name() {
+async fn t12_1_long_derived_name_is_bounded() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
@@ -1109,7 +1109,8 @@ async fn t12_1_long_name() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["name"].as_str().unwrap().len(), 1000);
+    // Automatic create-time titles follow the 120-character privacy/display contract.
+    assert_eq!(json["data"]["name"].as_str().unwrap(), "A".repeat(120));
 }
 
 #[tokio::test]

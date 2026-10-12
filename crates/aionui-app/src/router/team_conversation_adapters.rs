@@ -415,6 +415,7 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .create(
                 &request.user_id,
                 CreateConversationRequest {
+                    tool_scope: Default::default(),
                     r#type: request.agent_type,
                     name: Some(request.name),
                     model: request.top_level_model,

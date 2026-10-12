@@ -240,7 +240,7 @@ impl ConversationTurnOrchestrator {
         let mut last_outcome = None;
         let mut aggregate_summary = TurnAttemptSummary::default();
 
-        while let Some((current_send, msg_id)) = pending_send.take() {
+        while let Some((mut current_send, msg_id)) = pending_send.take() {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
                 && agent.agent_type() == AgentType::Acp
@@ -327,6 +327,12 @@ impl ConversationTurnOrchestrator {
                     }
                 }
             }
+            // Reload the bounded conversation brief on every dispatch, including
+            // continuation and replay. Provider compaction cannot erase this state.
+            current_send.content = self
+                .service
+                .with_task_context(&input.user_id, &input.conv_id, current_send.content)
+                .await;
             let send_agent = agent.clone();
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();

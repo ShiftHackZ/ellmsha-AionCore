@@ -720,3 +720,44 @@ to keep ANSI codes out of captured output.
 Do NOT manually re-implement these behaviours with raw
 `tokio::process::Command` — the centralised builder is the one place to
 update policies (e.g. future `CARGO_*` cleanup, sandbox flags).
+
+### Native isolated integration-test conversations
+
+`POST /api/conversations` accepts the immutable enum `tool_scope`: omitted or
+`"default"` preserves ordinary behavior; `"session_only"` selects explicit native
+integration-test isolation. Example (use an existing local provider and owned fixture):
+
+```json
+{
+  "type": "aionrs",
+  "tool_scope": "session_only",
+  "name": "Owned integration fixture",
+  "model": { "provider_id": "local-provider-id", "model": "local-model" },
+  "extra": {
+    "workspace": "/tmp/ellmsha-eval/workspace",
+    "selected_mcp_server_ids": [],
+    "selected_session_mcp_servers": [
+      {
+        "id": "qa-ledger",
+        "name": "qa-ledger",
+        "transport": { "type": "http", "url": "http://127.0.0.1:23456/mcp" }
+      }
+    ]
+  }
+}
+```
+
+The native runtime receives only these MCP snapshots. Account plugins, stored user
+MCPs, assistant presets, teams, ambient global/project configuration, hooks, skills,
+AGENTS guidance, and automatic durable-memory reads/writes are not attached. The
+scope and snapshots persist through resume and native children. Unsupported external
+agent types, stored MCP IDs, or attempts to change scope/snapshots after creation are
+rejected; create a new chat rather than converting a privileged existing session.
+Ordinary conversations retain their mandatory memory policy.
+
+This is tool/config isolation, **not an OS sandbox**: native workspace tools remain,
+selected MCP programs retain normal process permissions/environment, and an explicitly
+selected provider still uses its configured credentials. Use owned temporary fixtures
+and a local provider for synthetic QA. The built-in browser's live bridge environment
+is resolved only at launch using the existing exact trusted-launcher validation and is
+not persisted with the snapshot.

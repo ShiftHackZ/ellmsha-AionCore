@@ -64,7 +64,11 @@ pub fn row_to_response_with_extra(
 
     Ok(ConversationResponse {
         id: row.id,
-        name: row.name,
+        name: if row.name_source.as_deref() == Some("user") {
+            row.name
+        } else {
+            crate::title_policy::safe_derived_title(&row.name)
+        },
         name_source: row.name_source,
         r#type: agent_type,
         model,
@@ -374,6 +378,19 @@ mod tests {
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.source.is_none());
         assert!(resp.model.is_none());
+    }
+
+    #[test]
+    fn automatic_legacy_titles_are_private_but_explicit_renames_are_preserved() {
+        let mut row = make_row("acp", "pending", None, None, "{}");
+        row.name = "Fixture password: synthetic-secret".into();
+        assert_eq!(
+            row_to_response(row.clone(), Path::new("/tmp/fixture")).unwrap().name,
+            "New Chat"
+        );
+        row.name_source = Some("user".into());
+        let response = row_to_response(row, Path::new("/tmp/fixture")).unwrap();
+        assert_eq!(response.name, "Fixture password: synthetic-secret");
     }
 
     #[test]

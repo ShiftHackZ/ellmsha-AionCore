@@ -80,12 +80,36 @@ impl<'a> SessionContextBuilder<'a> {
         let agent_type: AgentType = string_to_enum(&row.r#type)?;
         reject_deprecated_runtime_kind(row, &agent_type)?;
         let extra = parse_extra(row)?;
+        let tool_scope = aionui_api_types::ConversationToolScope::from_extra(&extra).map_err(|error| {
+            ConversationError::BadRequest {
+                reason: format!("Invalid tool_scope: {error}"),
+            }
+        })?;
+        if tool_scope.is_session_only() && agent_type != AgentType::Aionrs {
+            return Err(ConversationError::BadRequest {
+                reason: "session_only tool scope requires a native aionrs conversation".into(),
+            });
+        }
         let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
         let model = provider_model_from_conversation_row(row);
         let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
             reason: format!("Invalid Team runtime context: {e}"),
         })?;
+        if tool_scope.is_session_only() && team.is_some() {
+            return Err(ConversationError::BadRequest {
+                reason: "session_only tool scope does not support team runtime attachment".into(),
+            });
+        }
+        if tool_scope.is_session_only() {
+            // The legacy native parser tolerates malformed extras by falling
+            // back to all defaults. That must never erase an isolation scope.
+            serde_json::from_value::<AionrsBuildExtra>(extra.clone()).map_err(|error| {
+                ConversationError::BadRequest {
+                    reason: format!("Invalid session_only runtime configuration: {error}"),
+                }
+            })?;
+        }
         let kind = self.build_kind(row, &agent_type, extra, team.clone(), seed).await?;
 
         Ok(AgentSessionContext {

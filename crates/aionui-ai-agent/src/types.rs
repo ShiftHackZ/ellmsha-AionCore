@@ -95,6 +95,8 @@ impl BuildTaskOptions {
 /// provider adapters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryRecallScope {
+    /// Explicit synthetic integration-test scope; no real durable knowledge is read or written.
+    pub isolated_test: bool,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub workspace: String,
@@ -151,6 +153,7 @@ pub struct AionrsCompatOverrides {
 /// Fully resolved Aionrs configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
+    pub tool_scope: aionui_api_types::ConversationToolScope,
     /// LLM provider name (anthropic, openai, bedrock, vertex).
     pub provider: String,
     /// Decrypted API key.

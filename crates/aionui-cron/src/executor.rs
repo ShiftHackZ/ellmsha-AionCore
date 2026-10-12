@@ -603,6 +603,7 @@ impl JobExecutor {
         let assistant = build_assistant_request(job);
 
         let req = CreateConversationRequest {
+            tool_scope: Default::default(),
             r#type: if assistant.is_some() { None } else { Some(agent_type) },
             name: Some(job.name.clone()),
             model,

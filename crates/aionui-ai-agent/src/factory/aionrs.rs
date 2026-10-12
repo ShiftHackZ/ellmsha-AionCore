@@ -48,8 +48,13 @@ pub(super) async fn build(
         });
     }
 
-    let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
-    if let Some(repo) = deps.mcp_server_repo.as_ref() {
+    let isolated = overrides.tool_scope.is_session_only();
+    let mut extra_mcp_servers = if isolated {
+        HashMap::new()
+    } else {
+        resolve_mcp_servers(&overrides)
+    };
+    if !isolated && let Some(repo) = deps.mcp_server_repo.as_ref() {
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
@@ -181,11 +186,19 @@ pub(super) async fn build(
     };
 
     let config = AionrsResolvedConfig {
+        tool_scope: overrides.tool_scope,
         provider,
         api_key,
         model: model_id,
         base_url,
-        system_prompt: overrides.system_prompt,
+        system_prompt: if isolated {
+            Some(format!(
+                "Isolated integration-test conversation. Only explicitly attached session MCPs are available. No ambient account plugins, skills, or durable memory are attached; do not read or write real project knowledge. This is tool/config isolation, not an operating-system sandbox.\n{}",
+                overrides.system_prompt.unwrap_or_default()
+            ))
+        } else {
+            overrides.system_prompt
+        },
         max_tokens: None,
         max_turns: overrides.max_turns,
         max_tool_call_malformed_turns: overrides.max_tool_call_malformed_turns,
@@ -601,11 +614,14 @@ async fn session_server_to_mcp_server_config(
     // discoverable there and avoid sending all 17 full schemas on every turn.
     let deferred = Some(server.id == "ellmsha-tencentdb-memory");
     match &server.transport {
-        SessionMcpTransport::Stdio { command, args, env } => {
+        SessionMcpTransport::Stdio { command, args, .. } => {
             if command.is_empty() {
                 return Err("stdio: missing command".to_owned());
             }
-            let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            // Validate the catalog-authored launcher before resolving node. Reuse
+            // Codex's exact trusted-launcher check, never persist live bridge keys.
+            let entries =
+                aionui_session::builtin_browser_launch_env(&crate::session_agent::session_server_to_spec(server));
             let (command, args, env) =
                 ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
