@@ -20,6 +20,7 @@ mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
+mod memory_artifact;
 mod office;
 mod project;
 mod provider;
@@ -34,6 +35,8 @@ mod team;
 mod team_mcp;
 mod team_tools;
 mod websocket;
+
+pub use memory_artifact::{MemoryArtifactQuery, MemoryArtifactResponse};
 
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, ConfigOptionConfirmation,
@@ -215,3 +218,6 @@ mod public_contract_tests {
         assert_eq!(resolution.target, Some(AgentErrorResolutionTarget::Feedback));
     }
 }
+
+pub mod mcp_approval;
+pub use mcp_approval::{McpApprovalResponse, RevokeMcpApprovalResponse};

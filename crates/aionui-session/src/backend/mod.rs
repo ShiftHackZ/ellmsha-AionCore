@@ -12,6 +12,7 @@ mod acp_conn;
 mod antigravity;
 mod claude_conn;
 mod codex_conn;
+mod codex_mcp_approval;
 mod conversation_session;
 mod orchestrator;
 mod rehydrate;
@@ -67,6 +68,12 @@ pub(crate) fn handshake_budget() -> std::time::Duration {
 /// frame writer (a microsecond byte-frame lock, not a per-turn lock).
 #[async_trait::async_trait]
 pub trait SessionBackend: Send + Sync {
+    /// Save host-owned permission before a synchronous REST confirmation is acknowledged.
+    /// Provider-owned backends keep their existing wire semantics by default.
+    fn prepare_permission(&self, _request_id: &str, _selected: Option<&str>) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Dispatch a command. FAST: returns a receipt the instant the adapter has
     /// accepted+queued it on the wire — does NOT block on turn completion (the
     /// turn flows up `events()`). Capability-gated: an unsupported command
@@ -230,6 +237,13 @@ pub struct SessionInit {
 /// `SessionConfig: Eq` (verified — no `HashSet`/`BTreeSet`/`==` use).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionConfig {
+    /// Hide a duplicate provider Linear app only when the host attached its own authenticated Linear integration.
+    pub prefer_managed_linear: bool,
+    /// Live-discovered provider app IDs, confined to this thread configuration.
+    pub disabled_provider_apps: Vec<String>,
+    /// Host-owned exact MCP consent store; absent outside app-managed sessions.
+    pub mcp_approval_bindings: std::collections::HashMap<String, String>,
+    pub mcp_approval_store: Option<aionui_common::mcp_approvals::McpApprovalStore>,
     /// Isolated stateless generation: no application MCP, skills, or tool workflow.
     pub generation_only: bool,
     /// Structured output for the generation-only Codex turn.

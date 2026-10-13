@@ -4229,6 +4229,20 @@ impl ConversationService {
             project_name: None,
             workspace: runtime_workspace.to_owned(),
             roots: vec![runtime_workspace.to_owned()],
+            recent_user_goals: self
+                .conversation_repo
+                .recent_user_messages(&row.user_id, &row.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .filter_map(|message| {
+                    let body: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+                    body.get("content")?
+                        .as_str()
+                        .map(|text| text.chars().take(8192).collect())
+                })
+                .collect(),
         };
         let (Some(project_id), Some(project_service)) = (
             row.project_id.as_deref(),
@@ -5573,6 +5587,7 @@ mod tests {
                     url: "https://example.com/mcp".into(),
                     headers: HashMap::new(),
                 },
+                approval_identity: None,
                 auto_approve_in_unattended: false,
             },
             McpSupportPolicy {
@@ -5597,6 +5612,7 @@ mod tests {
                     args: Vec::new(),
                     env: HashMap::new(),
                 },
+                approval_identity: None,
                 auto_approve_in_unattended: false,
             },
             McpSupportPolicy::AIONRS,
@@ -5615,6 +5631,7 @@ mod tests {
                 args: Vec::new(),
                 env: HashMap::new(),
             },
+            approval_identity: None,
             auto_approve_in_unattended: trusted,
         };
         let mut target = vec![server("user-mcp", false), server("plugin:fixture:old", true)];

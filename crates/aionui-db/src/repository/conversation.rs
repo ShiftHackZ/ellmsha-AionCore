@@ -35,6 +35,12 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// At most sixteen latest visible human messages, newest first, scoped to
+    /// the owning conversation. Runtime/tool/hidden messages are excluded.
+    async fn recent_user_messages(&self, user_id: &str, id: &str) -> Result<Vec<MessageRow>, DbError> {
+        Ok(self.latest_user_message(user_id, id).await?.into_iter().collect())
+    }
+
     /// Atomically replace the server-owned task brief if its revision and latest
     /// human input still match. Must preserve all other conversation.extra fields.
     async fn compare_and_set_task_context(

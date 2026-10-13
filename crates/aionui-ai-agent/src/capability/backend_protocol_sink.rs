@@ -18,6 +18,7 @@ use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCall
 pub struct BackendProtocolSink {
     event_tx: broadcast::Sender<AgentStreamEvent>,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
+    approval_manager: Option<Arc<aion_protocol::ToolApprovalManager>>,
 }
 
 impl BackendProtocolSink {
@@ -25,7 +26,13 @@ impl BackendProtocolSink {
         Self {
             event_tx,
             confirmations,
+            approval_manager: None,
         }
+    }
+
+    pub fn with_approval_manager(mut self, manager: Arc<aion_protocol::ToolApprovalManager>) -> Self {
+        self.approval_manager = Some(manager);
+        self
     }
 
     fn build_confirmation(call_id: &str, tool_name: &str, category: &ToolCategory, description: &str) -> Confirmation {
@@ -64,7 +71,34 @@ impl ProtocolEmitter for BackendProtocolSink {
     fn emit(&self, event: &ProtocolEvent) -> std::io::Result<()> {
         match event {
             ProtocolEvent::ToolRequest { call_id, tool, .. } => {
-                let confirmation = Self::build_confirmation(call_id, &tool.name, &tool.category, &tool.description);
+                let mut confirmation = Self::build_confirmation(call_id, &tool.name, &tool.category, &tool.description);
+                if tool.category == ToolCategory::Mcp {
+                    confirmation
+                        .options
+                        .retain(|option| option.value != json!("proceed_always"));
+                    confirmation.options.insert(
+                        1,
+                        ConfirmationOption {
+                            label: "Allow this tool for this chat".into(),
+                            value: json!("proceed_mcp_session"),
+                            params: None,
+                        },
+                    );
+                    if self
+                        .approval_manager
+                        .as_ref()
+                        .is_some_and(|manager| manager.pending_supports_persistence(call_id))
+                    {
+                        confirmation.options.insert(
+                            2,
+                            ConfirmationOption {
+                                label: "Always allow this tool (all chats)".into(),
+                                value: json!("proceed_mcp_always"),
+                                params: None,
+                            },
+                        );
+                    }
+                }
 
                 if let Ok(mut confs) = self.confirmations.write() {
                     confs.push(confirmation.clone());

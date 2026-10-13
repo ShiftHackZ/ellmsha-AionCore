@@ -1024,6 +1024,7 @@ fn resolved_mcp_to_session(server: crate::types::ResolvedMcpServer) -> Option<Se
         id: runtime_id.clone(),
         name: runtime_id,
         transport,
+        approval_identity: None,
         auto_approve_in_unattended: server.auto_approve_in_unattended,
     })
 }

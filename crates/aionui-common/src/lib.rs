@@ -2,6 +2,7 @@
 
 //! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
 pub mod constants;
+pub mod mcp_approvals;
 pub mod user_paths;
 
 mod case_convert;

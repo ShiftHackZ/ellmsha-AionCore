@@ -1,5 +1,6 @@
 mod content;
 mod error;
+mod mcp_approval;
 
 pub mod agent;
 pub mod history_sanitize;

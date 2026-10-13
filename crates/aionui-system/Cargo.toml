@@ -27,6 +27,7 @@ dirs.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 tower = { workspace = true }
 http-body-util.workspace = true
 reqwest.workspace = true

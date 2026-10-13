@@ -22,6 +22,7 @@
 //! `emit`) are now production-reachable via `open_session`'s live spawn (R4) and
 //! independently contract-tested via the `build_with_io` seam.
 
+use super::codex_mcp_approval::CodexMcpApprovals;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -461,6 +462,11 @@ fn mcp_tool_approval_persistence(input: Option<&Value>, requested_scope: Option<
 }
 
 fn mcp_elicitation_title(params: &Value) -> String {
+    if let Some(identity) = params.pointer("/_meta/ellmsha_exact_tool")
+        && let (Some(server), Some(tool)) = (identity["server"].as_str(), identity["tool"].as_str())
+    {
+        return format!("{server} · {tool}");
+    }
     let meta = params.get("_meta");
     let is_tool_approval = meta
         .and_then(|meta| meta.get("codex_approval_kind"))
@@ -605,6 +611,9 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
             params.as_object_mut().expect("thread params object").remove("sandbox");
             params["permissions"] = json!(profile);
         }
+    }
+    for app_id in &config.disabled_provider_apps {
+        params["config"]["apps"][app_id] = json!({"enabled": false});
     }
     if let Some(preset) = &config.init.preset_context {
         params["baseInstructions"] = json!(preset);
@@ -1054,6 +1063,8 @@ pub struct CodexSessionBackend {
     /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
     /// every post-wake reader via `reader_state`) shares the one registry.
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
+    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
     /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
     /// client: `turn/start` gets a synchronous response
@@ -1244,6 +1255,8 @@ struct CodexReaderState {
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
+    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1285,6 +1298,8 @@ fn start_codex_reader(
             state.active_turn_id,
             state.pending_auth_id,
             state.pending_tool_approvals,
+            state.mcp_approvals,
+            state.app_discovery,
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
@@ -1421,6 +1436,15 @@ impl CodexSessionBackend {
         let active_turn_id = Arc::new(Mutex::new(None));
         let pending_auth_id = Arc::new(Mutex::new(None));
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mcp_approvals = {
+            let config = wake.config.read().unwrap_or_else(|e| e.into_inner());
+            Arc::new(std::sync::Mutex::new(CodexMcpApprovals::new(
+                config.mcp_approval_store.clone(),
+                &config.init.mcp_servers,
+                &config.mcp_approval_bindings,
+            )))
+        };
+        let app_discovery = Arc::new(Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
@@ -1454,6 +1478,8 @@ impl CodexSessionBackend {
             active_turn_id: active_turn_id.clone(),
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
+            mcp_approvals: mcp_approvals.clone(),
+            app_discovery: app_discovery.clone(),
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
@@ -1518,6 +1544,8 @@ impl CodexSessionBackend {
             active_turn_id,
             pending_auth_id,
             pending_tool_approvals,
+            mcp_approvals,
+            app_discovery,
             current_model,
             pending_sends,
             pending_discovery,
@@ -1634,8 +1662,53 @@ impl CodexSessionBackend {
     /// so the reader fills `discovered`). Shared by `open_session` (the initial
     /// open) and `wake_handle` (an idle-wake re-attach), so the wire shape lives in
     /// one place.
+    /// Codex 0.162.1 AppInfo documents `apps.<id>.enabled`; discover IDs
+    /// from app/list rather than guessing an account's connector identifier.
+    async fn discover_linear_apps(&self) -> Result<Vec<String>, BackendError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut cursor = None::<String>;
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let id = self.next_rpc_id();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.app_discovery.lock().await.insert(id, sender);
+            let write = self.write_frame(json!({"jsonrpc":"2.0","id":id,"method":"app/list","params":{"limit":100,"cursor":cursor,"forceRefetch":false}})).await;
+            if let Err(error) = write {
+                self.app_discovery.lock().await.remove(&id);
+                return Err(error);
+            }
+            let reply = tokio::time::timeout_at(deadline, receiver).await;
+            self.app_discovery.lock().await.remove(&id);
+            let reply = reply.ok().and_then(Result::ok).ok_or_else(|| BackendError::SetupRejected("Could not verify the provider Linear catalog. Retry or explicitly enable the provider Linear integration for this chat.".into()))?;
+            let result = reply
+                .get("result")
+                .filter(|_| reply.get("error").is_none())
+                .ok_or_else(|| BackendError::SetupRejected("Provider Linear catalog request failed".into()))?;
+            let (page, next) =
+                super::codex_mcp_approval::linear_app_page(result).map_err(BackendError::SetupRejected)?;
+            ids.extend(page);
+            match next {
+                None => {
+                    ids.sort();
+                    ids.dedup();
+                    return Ok(ids);
+                }
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err(BackendError::SetupRejected(
+                        "Provider app catalog repeated its cursor".into(),
+                    ));
+                }
+            }
+        }
+        Err(BackendError::SetupRejected(
+            "Provider app catalog exceeded its page limit".into(),
+        ))
+    }
+
     async fn run_handshake(&self, mode: HandshakeMode<'_>) -> Result<(), BackendError> {
-        let config = self.wake.config_snapshot();
+        let mut config = self.wake.config_snapshot();
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
         *self.resume_poison.lock().await = None;
@@ -1647,6 +1720,27 @@ impl CodexSessionBackend {
         *self.resume_catalog_deadline.lock().await = None;
         self.write_frame(initialize_params().into_frame(self.next_rpc_id(), "initialize"))
             .await?;
+        if config.prefer_managed_linear && !config.generation_only {
+            match self.discover_linear_apps().await {
+                Ok(ids) => {
+                    config.disabled_provider_apps = ids.clone();
+                    self.wake
+                        .config
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .disabled_provider_apps = ids;
+                }
+                Err(_) => {
+                    tracing::warn!(conversation_id = %self.session_id, "Provider Linear collision protection degraded: app catalog unavailable; managed Linear remains preferred");
+                    let guidance = "[Integration routing] The connected eLLMsha account-scoped Linear MCP is the selected Linear route. Provider app catalog verification is currently unavailable, so a duplicate provider Linear app may still be visible. Use the eLLMsha Linear route; do not switch account/provider without the user's explicit request.";
+                    let preset = config.init.preset_context.get_or_insert_default();
+                    if !preset.contains(guidance) {
+                        preset.push_str("\n\n");
+                        preset.push_str(guidance);
+                    }
+                }
+            }
+        }
         if !config.init.managed_skill_roots.is_empty() {
             self.skill_roots_ready.store(false, Ordering::SeqCst);
             let request_id = self.next_rpc_id();
@@ -1820,6 +1914,8 @@ async fn reader_task(
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
+    mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
+    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1917,7 +2013,7 @@ async fn reader_task(
                 if line.is_empty() {
                     continue;
                 }
-                let Ok(frame): Result<Value, _> = serde_json::from_str(line) else {
+                let Ok(mut frame): Result<Value, _> = serde_json::from_str(line) else {
                     // unparseable line → opaque, never panic
                     emit(
                         &event_tx,
@@ -1934,6 +2030,18 @@ async fn reader_task(
                 // A server-initiated REQUEST has BOTH `method` and `id`
                 // (reverse-RPC). A notification has `method` but no `id`. A
                 // response to our request has `id` + (`result`|`error`), no method.
+                let auto_approved = mcp_approvals
+                    .lock()
+                    .map(|mut approvals| approvals.observe(&mut frame))
+                    .unwrap_or(false);
+                if auto_approved {
+                    write_reader_frame(
+                        &stdin,
+                        &json!({"jsonrpc":"2.0","id":frame["id"],"result":{"action":"accept","content":null}}),
+                    )
+                    .await;
+                    continue;
+                }
                 let method = frame.get("method").and_then(Value::as_str);
                 let has_id = frame.get("id").is_some();
                 match (method, has_id) {
@@ -2206,6 +2314,10 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            if let Some(reply) = app_discovery.lock().await.remove(&rid) {
+                                let _ = reply.send(frame.clone());
+                                continue;
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -4438,6 +4550,17 @@ fn extract_http_status_from_message(message: &str) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl SessionBackend for CodexSessionBackend {
+    fn prepare_permission(&self, request_id: &str, selected: Option<&str>) -> Result<(), BackendError> {
+        if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX) {
+            self.mcp_approvals
+                .lock()
+                .map_err(|_| BackendError::Transport("MCP approval lock unavailable".into()))?
+                .approve(raw_id, selected)
+                .map_err(BackendError::Transport)?;
+        }
+        Ok(())
+    }
+
     /// Force-kill path (`UserCancelTimeout`): delegate to the suspend
     /// controller's unconditional teardown (abort reader → group-kill the codex
     /// CLI process tree), so the process dies even while an orchestrator still
@@ -4950,7 +5073,17 @@ impl SessionBackend for CodexSessionBackend {
                         "action": if approved { "accept" } else { "decline" },
                         "content": if approved && !is_tool_approval { json!({}) } else { Value::Null }
                     });
-                    if matches!(decision, super::types::PermissionDecision::AllowAlways)
+                    let host_saved = if approved {
+                        self.mcp_approvals
+                            .lock()
+                            .map_err(|_| BackendError::Transport("MCP approval lock unavailable".into()))?
+                            .approve(raw_id, selected.as_deref())
+                            .map_err(BackendError::Transport)?
+                    } else {
+                        false
+                    };
+                    if !host_saved
+                        && matches!(decision, super::types::PermissionDecision::AllowAlways)
                         && let Some(scope) = mcp_tool_approval_persistence(
                             pending.as_ref().and_then(|pending| pending.input.as_ref()),
                             selected.as_deref(),
@@ -4975,6 +5108,11 @@ impl SessionBackend for CodexSessionBackend {
                 // approvals resolve on the child's thread id; keeping the entry lets
                 // the reader route that resolution back to the parent confirmation
                 // state instead of treating it as an unrelated child notification.
+                if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX)
+                    && let Ok(mut grants) = self.mcp_approvals.lock()
+                {
+                    grants.answered(raw_id);
+                }
                 mark_pending_tool_approval_answered(&self.pending_tool_approvals, &request_id);
                 Ok(CommandReceipt {
                     accepted: true,
@@ -8455,9 +8593,11 @@ mod tests {
 
     #[test]
     fn builtin_memory_auto_policy_preserves_sandbox_and_other_tool_policies() {
-        let mut config = SessionConfig::default();
-        config.mode = Some("auto".into());
-        config.approval_policy = Some("never".into());
+        let mut config = SessionConfig {
+            mode: Some("auto".into()),
+            approval_policy: Some("never".into()),
+            ..Default::default()
+        };
         config.init.mcp_servers = ["ellmsha-tencentdb-memory", "user-server"]
             .into_iter()
             .map(|name| crate::backend::McpServerSpec {
@@ -8943,7 +9083,7 @@ mod tests {
             },
         };
         let serialize = |auto_approval| {
-            build_codex_mcp_servers_with_env_and_approval(&[browser.clone()], auto_approval, |key| {
+            build_codex_mcp_servers_with_env_and_approval(std::slice::from_ref(&browser), auto_approval, |key| {
                 (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| launcher.into())
             })
         };
@@ -9020,9 +9160,10 @@ mod tests {
                 },
                 ..Default::default()
             };
-            let serialized = build_codex_mcp_servers_with_env_and_approval(&[candidate.clone()], true, |key| {
-                (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| trusted_launcher.into())
-            });
+            let serialized =
+                build_codex_mcp_servers_with_env_and_approval(std::slice::from_ref(&candidate), true, |key| {
+                    (key == BUILTIN_BROWSER_MCP_PATH_ENV).then(|| trusted_launcher.into())
+                });
             assert!(serialized[&candidate.name].get("tools").is_none());
             assert!(serialized[&candidate.name]["env"].get(BROWSER_CDP_TOKEN_ENV).is_none());
             assert!(serialized[&candidate.name]["env"].get(BROWSER_CDP_PORT_ENV).is_none());
@@ -11256,3 +11397,7 @@ mod memory_generation_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "codex_approval_wire_test.rs"]
+mod approval_wire_tests;

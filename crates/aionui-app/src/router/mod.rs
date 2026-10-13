@@ -4,6 +4,7 @@ mod antigravity_hook;
 mod fs_monitor;
 mod health;
 mod item_revealer;
+mod memory_artifact;
 mod memory_generation;
 mod routes;
 mod runtime_team_tools;

@@ -275,8 +275,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     };
 
     // System routes protected by auth middleware
-    let system_authenticated =
-        system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let system_authenticated = system_routes(states.system)
+        .merge(aionui_system::mcp_approval_routes(services.data_dir.clone()))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Conversation routes protected by auth middleware
     let conversation_authenticated = conversation_routes(states.conversation.clone())
@@ -284,6 +285,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    let memory_artifact_authenticated = super::memory_artifact::routes(super::memory_artifact::ArtifactState {
+        conversations: services.conversation_repo.clone(),
+        projects: services.project_service.clone(),
+    })
+    .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Remote agent routes protected by auth middleware
     let remote_agent_authenticated = remote_agent_routes(states.remote_agent)
@@ -381,6 +388,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
+        .merge(memory_artifact_authenticated)
         .merge(remote_agent_authenticated)
         .merge(agent_authenticated)
         .merge(connection_test_authenticated)

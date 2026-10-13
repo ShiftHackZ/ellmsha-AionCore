@@ -254,7 +254,16 @@ impl AionrsAgentManager {
             );
         }
 
-        let approval_manager = Arc::new(ToolApprovalManager::new());
+        let approval_manager = Arc::new(match config_extra.mcp_approval_store {
+            Some(store) => {
+                ToolApprovalManager::new().with_persistence(Arc::new(super::mcp_approval::NativeMcpApprovals::new(
+                    store,
+                    &config_extra.extra_mcp_servers,
+                    &config_extra.mcp_approval_bindings,
+                )))
+            }
+            None => ToolApprovalManager::new(),
+        });
 
         if let Some(mode_str) = &config_extra.session_mode {
             let mode = parse_session_mode(mode_str);
@@ -267,7 +276,8 @@ impl AionrsAgentManager {
         }
 
         let confirmations = Arc::new(RwLock::new(Vec::new()));
-        let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
+        let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone())
+            .with_approval_manager(approval_manager.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
         let slash_commands = engine
@@ -523,10 +533,6 @@ impl AionrsAgentManager {
 /// matches in the routes + services.
 impl AionrsAgentManager {
     pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AgentError> {
-        if let Ok(mut confs) = self.confirmations.write() {
-            confs.retain(|c| c.call_id != call_id);
-        }
-
         let value = data.get("value").and_then(|v| v.as_str()).unwrap_or("cancel");
 
         let is_cancel = value == "cancel";
@@ -547,12 +553,19 @@ impl AionrsAgentManager {
                 },
             );
         } else {
-            let scope = if always_allow {
+            let scope = if value == "proceed_mcp_session" {
+                ApprovalScope::Session
+            } else if always_allow || value == "proceed_mcp_always" {
                 ApprovalScope::Always
             } else {
                 ApprovalScope::Once
             };
-            self.approval_manager.approve(call_id, scope);
+            self.approval_manager
+                .approve_checked(call_id, scope)
+                .map_err(AgentError::internal)?;
+        }
+        if let Ok(mut confs) = self.confirmations.write() {
+            confs.retain(|c| c.call_id != call_id);
         }
         Ok(())
     }

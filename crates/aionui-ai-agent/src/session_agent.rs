@@ -45,6 +45,8 @@ const PERM_ALLOW: &str = "allow";
 const PERM_ALLOW_ALWAYS: &str = "allow_always";
 const PERM_ALLOW_MCP_SESSION: &str = "allow_mcp_session";
 const PERM_ALLOW_MCP_ALWAYS: &str = "allow_mcp_always";
+const PERM_ALLOW_APP_MCP_SESSION: &str = "allow_ellmsha_mcp_session";
+const PERM_ALLOW_APP_MCP_ALWAYS: &str = "allow_ellmsha_mcp_always";
 const PERM_REJECT: &str = "reject";
 
 /// The `config_selections` key under which a claude session's chosen reasoning-effort
@@ -607,6 +609,9 @@ impl SessionAgentTask {
     ) -> Result<(), AgentError> {
         let picked = confirm_option_id(&data);
         let (decision, selected) = permission_decision_from_choice(picked.as_deref(), always_allow);
+        self.backend
+            .prepare_permission(call_id, selected.as_deref())
+            .map_err(|error| AgentError::internal(error.to_string()))?;
         let backend = self.backend.clone();
         let request_id = call_id.to_string();
         let conv_id = self.conversation_id.clone();
@@ -1201,6 +1206,7 @@ impl SessionAgentTask {
 /// resolve_session_init + the per-backend spawn_env/sandbox/approval seams). Every
 /// field here has a 1:1 counterpart in that path.
 pub struct SessionBuildInputs<'a> {
+    pub mcp_approval_store: Option<aionui_common::mcp_approvals::McpApprovalStore>,
     /// The conversation this session belongs to (the clean-slate `session_id`).
     pub conversation_id: String,
     /// Owner Core user. Scopes every acp_session persistence write, the MCP
@@ -1399,6 +1405,7 @@ pub async fn build_antigravity_instance(
     use aionui_session::{AntigravityConnection, BackendConnection, McpServerSpec, SessionConfig, SessionInit};
 
     let SessionBuildInputs {
+        mcp_approval_store,
         conversation_id,
         user_id,
         workspace,
@@ -1454,6 +1461,15 @@ pub async fn build_antigravity_instance(
     };
 
     let mut session_config = SessionConfig {
+        mcp_approval_store,
+        mcp_approval_bindings: crate::mcp_approval::trusted_bindings(&neutral),
+        prefer_managed_linear: !config.allow_provider_linear
+            && neutral.iter().any(|server| {
+                server
+                    .approval_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("linear:"))
+            }),
         cwd: Some(workspace.clone()),
         model,
         mode,
@@ -1513,6 +1529,7 @@ pub async fn build_session_instance(
     };
 
     let SessionBuildInputs {
+        mcp_approval_store,
         conversation_id,
         user_id,
         workspace,
@@ -1576,6 +1593,15 @@ pub async fn build_session_instance(
     let cli_program = resolve_session_cli_program(backend_label, metadata)
         .map_err(|error| AgentError::bad_gateway(format!("{backend_label} runtime unavailable: {error}")))?;
     let mut session_config = SessionConfig {
+        mcp_approval_store,
+        mcp_approval_bindings: crate::mcp_approval::trusted_bindings(&neutral),
+        prefer_managed_linear: !config.allow_provider_linear
+            && neutral.iter().any(|server| {
+                server
+                    .approval_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("linear:"))
+            }),
         cwd: Some(workspace.clone()),
         model,
         mode,
@@ -3376,12 +3402,21 @@ fn permission_decision_from_choice(
     always_allow: bool,
 ) -> (aionui_session::PermissionDecision, Option<String>) {
     use aionui_session::PermissionDecision;
-    if always_allow {
+    if always_allow
+        && !matches!(
+            picked,
+            Some(
+                PERM_ALLOW_APP_MCP_SESSION | PERM_ALLOW_APP_MCP_ALWAYS | PERM_ALLOW_MCP_SESSION | PERM_ALLOW_MCP_ALWAYS
+            )
+        )
+    {
         return (PermissionDecision::AllowAlways, None);
     }
     match picked {
         Some(PERM_REJECT) => (PermissionDecision::Denied, None),
         Some(PERM_ALLOW_ALWAYS) => (PermissionDecision::AllowAlways, None),
+        Some(PERM_ALLOW_APP_MCP_SESSION) => (PermissionDecision::AllowAlways, Some("ellmsha_session".into())),
+        Some(PERM_ALLOW_APP_MCP_ALWAYS) => (PermissionDecision::AllowAlways, Some("ellmsha_always".into())),
         Some(PERM_ALLOW_MCP_SESSION) => (PermissionDecision::AllowAlways, Some("session".into())),
         Some(PERM_ALLOW_MCP_ALWAYS) => (PermissionDecision::AllowAlways, Some("always".into())),
         Some(PERM_ALLOW) | None => (PermissionDecision::Approved, None),
@@ -3417,6 +3452,30 @@ fn default_permission_options(
         kind: AcpPermissionOptionKind::AllowOnce,
         meta: None,
     }];
+    let host_identity = input.and_then(|input| input.pointer("/_meta/ellmsha_exact_tool"));
+    if host_identity.is_some_and(|identity| identity["server"].is_string() && identity["tool"].is_string()) {
+        options.extend([
+            AcpPermissionOptionData {
+                option_id: PERM_ALLOW_APP_MCP_SESSION.into(),
+                name: "Allow this tool for this chat".into(),
+                kind: AcpPermissionOptionKind::AllowAlways,
+                meta: None,
+            },
+            AcpPermissionOptionData {
+                option_id: PERM_ALLOW_APP_MCP_ALWAYS.into(),
+                name: "Always allow this tool (all chats)".into(),
+                kind: AcpPermissionOptionKind::AllowAlways,
+                meta: None,
+            },
+            AcpPermissionOptionData {
+                option_id: PERM_REJECT.into(),
+                name: "Reject".into(),
+                kind: AcpPermissionOptionKind::RejectOnce,
+                meta: None,
+            },
+        ]);
+        return options;
+    }
     match mcp_tool_approval_persist_scopes(input) {
         Some((allow_session, allow_always)) => {
             if allow_session {
@@ -4770,6 +4829,7 @@ mod build_mapping_tests {
                 args: vec!["s.js".into()],
                 env: HashMap::from([("B".into(), "2".into()), ("A".into(), "1".into())]),
             },
+            approval_identity: None,
             auto_approve_in_unattended: true,
         });
         assert_eq!(stdio.name, "fs");
@@ -4800,6 +4860,7 @@ mod build_mapping_tests {
                 id: "2".into(),
                 name: "h".into(),
                 transport: t,
+                approval_identity: None,
                 auto_approve_in_unattended: false,
             });
             assert!(
@@ -7677,8 +7738,7 @@ mod pump_tests {
         // watcher owns them.
         let last_turn_frame = frames
             .iter()
-            .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-            .next_back();
+            .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)));
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
@@ -7750,8 +7810,7 @@ mod pump_tests {
         assert!(
             frames
                 .iter()
-                .filter(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
-                .next_back()
+                .rfind(|f| !matches!(f, AgentStreamEvent::WorkflowProgress(_)))
                 .is_some_and(|f| matches!(f, AgentStreamEvent::Finish(_))),
             "the clean result's Finish must flow while a background bash is alive, got {seq:?}"
         );

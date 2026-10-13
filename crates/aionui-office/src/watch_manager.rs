@@ -959,6 +959,9 @@ mod tests {
     async fn auto_install_when_not_found() {
         let spawner = Arc::new(MockSpawner::new());
         spawner.installed.store(false, Ordering::SeqCst);
+        // Isolate the install retry from the independent allocate/rebind race.
+        // Real port readiness and collision retries have separate start tests.
+        spawner.start_listener.store(false, Ordering::SeqCst);
         let broadcaster = Arc::new(RecordingBroadcaster::new());
         let mgr = make_manager(Arc::clone(&spawner), Arc::clone(&broadcaster));
 
@@ -966,11 +969,17 @@ mod tests {
         let file = dir.path().join("test.docx");
         std::fs::write(&file, b"test").unwrap();
 
-        let port = mgr.start(file.to_str().unwrap(), DocType::Word).await.unwrap();
-        assert!(port > 0);
+        let process = mgr
+            .spawn_officecli_with_install("test-user", file.to_str().unwrap(), 0, DocType::Word)
+            .await
+            .unwrap();
+        assert!(process.is_alive());
         assert_eq!(spawner.install_count.load(Ordering::SeqCst), 1);
         // First spawn fails (not installed), then install, then second spawn succeeds
         assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);
+        let events = broadcaster.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["state"], "installing");
     }
 
     #[tokio::test]

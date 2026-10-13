@@ -27,3 +27,6 @@ pub use routes::{SystemRouterState, settings_routes, system_routes};
 pub use runtime_prepare::RuntimePrepareService;
 pub use settings::SettingsService;
 pub use version::VersionCheckService;
+
+pub mod mcp_approval;
+pub use mcp_approval::mcp_approval_routes;

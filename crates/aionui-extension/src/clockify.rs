@@ -354,6 +354,12 @@ impl ClockifyConnectionManager {
                 args: vec!["mcp-clockify-stdio".into()],
                 env,
             },
+            approval_identity: Some(format!(
+                "clockify:{}:{}:{}",
+                realm_name(connection.public.realm),
+                connection.public.id,
+                identity.account_id
+            )),
             auto_approve_in_unattended: false,
         })
     }

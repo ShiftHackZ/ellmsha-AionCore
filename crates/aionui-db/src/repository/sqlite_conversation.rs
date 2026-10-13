@@ -743,6 +743,18 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn recent_user_messages(&self, user_id: &str, id: &str) -> Result<Vec<MessageRow>, DbError> {
+        Ok(sqlx::query_as::<_, MessageRow>(
+            "SELECT m.* FROM messages m INNER JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.user_id = ? AND m.conversation_id = ? AND m.type = 'text' \
+             AND m.position = 'right' AND m.hidden = 0 ORDER BY m.created_at DESC, m.id DESC LIMIT 16",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn compare_and_set_task_context(
         &self,
         user_id: &str,
@@ -1672,6 +1684,44 @@ mod tests {
     }
 
     const SYSTEM_USER_ID: &str = "system_default_user";
+
+    #[tokio::test]
+    async fn recent_recall_seed_is_bounded_visible_and_conversation_owned() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        let foreign = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        repo.create(&foreign).await.unwrap();
+        for index in 0..20 {
+            let mut message = sample_message(&conv.id);
+            message.id = format!("visible-{index:02}");
+            message.created_at = index;
+            repo.insert_message(SYSTEM_USER_ID, &message).await.unwrap();
+        }
+        for kind in ["hidden", "assistant", "tool", "foreign"] {
+            let mut message = sample_message(if kind == "foreign" { &foreign.id } else { &conv.id });
+            message.id = kind.into();
+            message.created_at = 100;
+            message.hidden = kind == "hidden";
+            if kind == "assistant" {
+                message.position = Some("left".into());
+            }
+            if kind == "tool" {
+                message.r#type = "tool".into();
+            }
+            repo.insert_message(SYSTEM_USER_ID, &message).await.unwrap();
+        }
+        let rows = repo.recent_user_messages(SYSTEM_USER_ID, &conv.id).await.unwrap();
+        assert_eq!(rows.len(), 16);
+        assert_eq!(rows[0].id, "visible-19");
+        assert_eq!(rows[15].id, "visible-04");
+        assert!(
+            repo.recent_user_messages("other-user", &conv.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // ── Conversation CRUD tests ─────────────────────────────────────
 

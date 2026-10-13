@@ -15,6 +15,7 @@ pub mod factory;
 pub mod generation;
 pub(crate) mod idle_scanner;
 pub mod manager;
+mod mcp_approval;
 /// Neutral MCP resolution for the session-model port (claude/codex). Ported from
 /// clean-slate `aionui-agent-context::mcp_resolve` — the SSOT that turns a
 /// conversation's configured MCP servers into the SDK-free `SessionMcpServer`
@@ -45,6 +46,7 @@ pub use capability::skill_manager::{
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
     prepare_first_message_with_skills_index,
 };
+pub use capability::tencent_memory::read_project_memory_artifact;
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{

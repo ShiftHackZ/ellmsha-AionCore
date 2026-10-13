@@ -125,6 +125,10 @@ pub(super) async fn build(
 
     let instance = crate::session_agent::build_antigravity_instance(
         crate::session_agent::SessionBuildInputs {
+            mcp_approval_store: Some(aionui_common::mcp_approvals::McpApprovalStore::new(
+                &deps.data_dir,
+                &ctx.user_id,
+            )),
             conversation_id: ctx.conversation_id.clone(),
             user_id: ctx.user_id.clone(),
             workspace: ctx.workspace.clone(),

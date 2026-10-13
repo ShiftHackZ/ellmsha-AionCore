@@ -101,6 +101,9 @@ pub struct MemoryRecallScope {
     pub project_name: Option<String>,
     pub workspace: String,
     pub roots: Vec<String>,
+    /// Bounded recent human inputs, oldest first, used only to seed retrieval
+    /// identity after a session rebuild. They do not become rule authority.
+    pub recent_user_goals: Vec<String>,
 }
 
 pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
@@ -153,6 +156,9 @@ pub struct AionrsCompatOverrides {
 /// Fully resolved Aionrs configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
+    /// Host-owned exact MCP grants; absent for probes and isolated test chats.
+    pub mcp_approval_bindings: std::collections::HashMap<String, String>,
+    pub mcp_approval_store: Option<aionui_common::mcp_approvals::McpApprovalStore>,
     pub tool_scope: aionui_api_types::ConversationToolScope,
     /// LLM provider name (anthropic, openai, bedrock, vertex).
     pub provider: String,

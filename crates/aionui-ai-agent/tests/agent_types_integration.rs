@@ -91,6 +91,8 @@ impl IMockAgent for TypedMockAgent {}
 fn make_aionrs_config() -> AionrsResolvedConfig {
     AionrsResolvedConfig {
         tool_scope: Default::default(),
+        mcp_approval_store: None,
+        mcp_approval_bindings: Default::default(),
         provider: "anthropic".into(),
         api_key: "sk-test-key".into(),
         model: "claude-sonnet-4-20250514".into(),

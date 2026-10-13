@@ -445,6 +445,14 @@ impl LinearConnectionManager {
                 ],
                 env: HashMap::from([("MCP_REMOTE_CONFIG_DIR".into(), auth_dir.to_string_lossy().into_owned())]),
             },
+            approval_identity: connection.identity.as_ref().map(|identity| {
+                format!(
+                    "linear:{}:{}:{}",
+                    connection.id,
+                    identity.account_id,
+                    identity.workspace_id.as_deref().unwrap_or("")
+                )
+            }),
             auto_approve_in_unattended: false,
         })
     }

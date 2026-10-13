@@ -41,6 +41,9 @@ pub struct SessionMcpServer {
     /// Never deserialize or persist this bit; only the plugin registry may set it.
     #[serde(skip)]
     pub auto_approve_in_unattended: bool,
+    /// Trusted account identity. Reattached from the registry; client JSON cannot supply it.
+    #[serde(skip)]
+    pub approval_identity: Option<String>,
 }
 
 /// The fork spec a forked conversation carries in `conversations.extra.fork`
@@ -68,6 +71,10 @@ pub struct ForkSpec {
 /// ACP-specific fields extracted from `extra` in build task options.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AcpBuildExtra {
+    /// Opt in to the provider-owned Linear app alongside the connected eLLMsha account.
+    /// False prefers the managed account without changing unrelated integrations.
+    #[serde(default)]
+    pub allow_provider_linear: bool,
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default)]

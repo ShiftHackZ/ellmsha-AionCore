@@ -67,7 +67,7 @@ pub(super) async fn build(
             extra_mcp_servers.entry(name).or_insert(config);
         }
     }
-    merge_session_snapshot_mcp_servers(
+    let mcp_approval_bindings = merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
         &ctx.user_id,
@@ -186,6 +186,9 @@ pub(super) async fn build(
     };
 
     let config = AionrsResolvedConfig {
+        mcp_approval_bindings,
+        mcp_approval_store: (!isolated)
+            .then(|| aionui_common::mcp_approvals::McpApprovalStore::new(&deps.data_dir, &ctx.user_id)),
         tool_scope: overrides.tool_scope,
         provider,
         api_key,
@@ -689,10 +692,13 @@ async fn merge_session_snapshot_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) {
+) -> HashMap<String, String> {
+    let mut bindings = HashMap::new();
     for server in session_mcp_servers {
         match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
+                bindings.remove(&server.name);
+                bindings.extend(crate::mcp_approval::trusted_bindings(std::slice::from_ref(server)));
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
                         conversation_id = %conversation_id,
@@ -712,6 +718,7 @@ async fn merge_session_snapshot_mcp_servers(
             }
         }
     }
+    bindings
 }
 
 async fn ensure_stdio_launch(
@@ -1856,6 +1863,7 @@ mod tests {
                 url: mock.uri(),
                 headers: HashMap::new(),
             },
+            approval_identity: None,
             auto_approve_in_unattended: false,
         };
         let memory = session_server_to_mcp_server_config(&snapshot, "user-1", "chat-1", test_broadcaster())
@@ -1970,6 +1978,7 @@ mod tests {
                 args: vec!["new-server".into()],
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
+            approval_identity: None,
             auto_approve_in_unattended: false,
         }];
 

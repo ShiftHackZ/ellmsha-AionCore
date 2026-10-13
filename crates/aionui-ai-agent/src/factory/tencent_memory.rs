@@ -52,6 +52,7 @@ pub(super) async fn attach_runtime_memory(
             args,
             env,
         },
+        approval_identity: None,
         auto_approve_in_unattended: false,
     };
     let servers = match &mut context.kind {
@@ -105,6 +106,7 @@ async fn attach_chat_history(context: &mut AgentSessionContext) {
         },
         // The server exposes only bounded, authenticated GET requests and every
         // registered tool carries the MCP readOnlyHint.
+        approval_identity: None,
         auto_approve_in_unattended: true,
     };
     let servers = match &mut context.kind {
@@ -153,6 +155,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::from([("AIONUI_TDAI_MEMORY_WORKSPACE".into(), workspace.into())]),
             },
+            approval_identity: None,
             auto_approve_in_unattended: false,
         };
         let mut servers = vec![server("ellmsha-tencentdb-memory", "/old"), server("user-tool", "/user")];
