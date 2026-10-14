@@ -2641,6 +2641,24 @@ fn spawn_event_pump(
                 if first_stream_event && let Some(metadata) = pending_child_metadata.remove(r#ref) {
                     let _ = runtime.tx.send(AgentStreamEvent::Subagent(metadata));
                 }
+                // Child lifecycle belongs to the child, including resumed turns
+                // and waits. Generic translation intentionally drops TurnStarted
+                // for the root and flattens cancellation into Finish.
+                let status = child_stream_status(event);
+                let child_events = translate_event((**event).clone(), r#ref, false);
+                if child_events.is_empty()
+                    && let Some(status) = status
+                {
+                    let _ = runtime
+                        .tx
+                        .send(AgentStreamEvent::Subagent(crate::protocol::events::SubagentEventData {
+                            r#ref: r#ref.clone(),
+                            label: None,
+                            parent_ref: None,
+                            status: Some(status.to_owned()),
+                            event: None,
+                        }));
+                }
                 let item_ids = child_message_items.entry(r#ref.clone()).or_default();
                 if let SessionEvent::ItemStarted {
                     item_id,
@@ -2653,7 +2671,7 @@ fn spawn_event_pump(
                     event.as_ref(),
                     SessionEvent::ItemCompleted { item_id, .. } if item_ids.remove(item_id)
                 );
-                for mut child_event in translate_event((**event).clone(), r#ref, false) {
+                for mut child_event in child_events {
                     stamp_tool_name(child_tool_names.entry(r#ref.clone()).or_default(), &mut child_event);
                     let _ = runtime
                         .tx
@@ -2661,7 +2679,7 @@ fn spawn_event_pump(
                             r#ref: r#ref.clone(),
                             label: None,
                             parent_ref: None,
-                            status: None,
+                            status: status.map(str::to_owned),
                             event: Some(Box::new(child_event)),
                         }));
                 }
@@ -3964,6 +3982,39 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
         code: Some(code.to_owned()),
         params: None,
     })
+}
+
+/// Project child-only lifecycle evidence without changing the parent session FSM.
+fn child_stream_status(event: &SessionEvent) -> Option<&'static str> {
+    match event {
+        SessionEvent::TurnStarted { .. } => Some("running"),
+        SessionEvent::TurnResult { is_error, outcome, .. } => Some(match outcome {
+            aionui_session::TurnOutcome::Cancelled { .. } => "interrupted",
+            _ if *is_error => "errored",
+            _ => "completed",
+        }),
+        SessionEvent::AdapterSpecific { tag, payload } if tag == "codex_child_thread_status" => {
+            match payload.get("type").and_then(serde_json::Value::as_str) {
+                // As for the root, wait for turn/completed's rich outcome.
+                // An advisory idle must not overwrite an interrupted/failed turn.
+                Some("idle") => None,
+                Some("systemError") => Some("errored"),
+                Some("notLoaded") => Some("shutdown"),
+                Some("active") => {
+                    let flags = payload.get("activeFlags").and_then(serde_json::Value::as_array);
+                    if flags.is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnUserInput")) {
+                        Some("waiting_for_user")
+                    } else if flags.is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnApproval")) {
+                        Some("waiting_for_approval")
+                    } else {
+                        Some("running")
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// `terminal_result_seen`: did the current turn already reach a terminal
@@ -6418,6 +6469,76 @@ mod pump_tests {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_lifecycle_projects_wait_resume_and_terminal_outcomes() {
+        let child = |event| {
+            env(SessionEvent::SubagentStream {
+                r#ref: "child".into(),
+                event: Box::new(event),
+            })
+        };
+        let status = |value| SessionEvent::AdapterSpecific {
+            tag: "codex_child_thread_status".into(),
+            payload: value,
+        };
+        let terminal = |is_error, outcome| SessionEvent::TurnResult {
+            is_error,
+            result_text: String::new(),
+            api_error_status: None,
+            epoch: 1,
+            outcome,
+        };
+        let frames = drain_script(vec![
+            child(SessionEvent::TurnStarted { epoch: 1 }),
+            env(terminal(false, aionui_session::TurnOutcome::default())),
+            child(status(
+                serde_json::json!({"type":"active","activeFlags":["waitingOnUserInput"]}),
+            )),
+            child(status(
+                serde_json::json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+            )),
+            child(status(serde_json::json!({"type":"active","activeFlags":[]}))),
+            child(terminal(
+                false,
+                aionui_session::TurnOutcome::Cancelled {
+                    reason: aionui_session::CancelReason::UserCancel,
+                },
+            )),
+            child(SessionEvent::TurnStarted { epoch: 2 }),
+            child(terminal(true, aionui_session::TurnOutcome::Failed)),
+            child(status(serde_json::json!({"type":"idle"}))),
+        ])
+        .await;
+        let mut statuses: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Subagent(data) => data.status.as_deref(),
+                _ => None,
+            })
+            .collect();
+        statuses.dedup();
+        assert_eq!(
+            statuses,
+            vec![
+                "running",
+                "waiting_for_user",
+                "waiting_for_approval",
+                "running",
+                "interrupted",
+                "running",
+                "errored"
+            ]
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame, AgentStreamEvent::Finish(_)))
+                .count(),
+            1,
+            "only the parent terminal finishes the parent"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

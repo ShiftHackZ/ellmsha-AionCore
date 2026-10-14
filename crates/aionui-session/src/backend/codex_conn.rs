@@ -1955,6 +1955,9 @@ async fn reader_task(
     // authoritative `turn/completed`; the trailing `status→idle` is then absorbed.
     // Reset on `turn/started` so the NEXT turn can terminate once.
     let mut terminated = false;
+    // Each multiplexed child needs the same one-terminal-per-turn rule.
+    // A fatal error can precede its turn/completed notification.
+    let mut terminated_children = std::collections::HashSet::<String>::new();
     // R8/M3: codex sends `status→idle` BEFORE `turn/completed`. We DEFER on idle
     // (set this) and let the authoritative completed produce the rich terminal. If
     // the turn somehow ends with idle but no completed (defensive), this is flushed
@@ -2136,10 +2139,40 @@ async fn reader_task(
                                         has_pending_tool_approval(&pending_tool_approvals, &id.to_string())
                                     });
                             if !resolves_parent_confirmation {
-                                let child_events = if m == "turn/completed" {
-                                    vec![map_turn_completed(params)]
-                                } else {
-                                    map_notification(m, params)
+                                if m == "turn/started" {
+                                    terminated_children.remove(thread_id);
+                                } else if (m == "turn/completed"
+                                    || (m == "error" && params.get("willRetry").and_then(Value::as_bool) != Some(true)))
+                                    && !terminated_children.insert(thread_id.to_owned())
+                                {
+                                    continue;
+                                }
+                                let child_events = match m {
+                                    "turn/started" => vec![SessionEvent::TurnStarted { epoch: cur }],
+                                    "turn/completed" => vec![map_turn_completed(params)],
+                                    // Match the root's fatal-error handling below; a retry
+                                    // remains active, while a fatal error may have no later
+                                    // turn/completed notification.
+                                    "error" if params.get("willRetry").and_then(Value::as_bool) != Some(true) => {
+                                        let message = params
+                                            .get("error")
+                                            .and_then(|e| {
+                                                e.get("message").and_then(Value::as_str).or_else(|| e.as_str())
+                                            })
+                                            .unwrap_or("codex reported a fatal error")
+                                            .to_owned();
+                                        vec![synth_error_terminal(message)]
+                                    }
+                                    // The root FSM reconciles these notifications separately.
+                                    // Children have no writable session FSM; retain their own
+                                    // status for the transcript/UI projection, including waits.
+                                    // Verified: generated v2/ThreadStatusChangedNotification.json
+                                    // from codex app-server 0.162.0-alpha.17.2.
+                                    "thread/status/changed" => vec![SessionEvent::AdapterSpecific {
+                                        tag: "codex_child_thread_status".into(),
+                                        payload: params.get("status").cloned().unwrap_or(Value::Null),
+                                    }],
+                                    _ => map_notification(m, params),
                                 };
                                 for event in child_events {
                                     emit(
@@ -3727,11 +3760,14 @@ fn map_collab_status(s: &str) -> SubagentStatus {
     }
 }
 
-fn map_subagent_activity_status(kind: &str) -> SubagentStatus {
+fn map_subagent_activity_status(kind: &str) -> Option<SubagentStatus> {
     match kind {
-        "interrupted" => SubagentStatus::Interrupted,
-        "completed" => SubagentStatus::Completed,
-        _ => SubagentStatus::Running,
+        "started" => Some(SubagentStatus::Running),
+        "interrupted" => Some(SubagentStatus::Interrupted),
+        "completed" => Some(SubagentStatus::Completed),
+        // Interaction is not execution: a message to an idle child need not
+        // start a turn. A real child turn/started reactivates its indicator.
+        _ => None,
     }
 }
 
@@ -4010,6 +4046,9 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 return out;
             };
             let kind = item.get("kind").and_then(Value::as_str).unwrap_or("interacted");
+            let Some(status) = map_subagent_activity_status(kind) else {
+                return out;
+            };
             let label = item
                 .get("agentPath")
                 .and_then(Value::as_str)
@@ -4022,7 +4061,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             out.push(SessionEvent::SubagentUpdate {
                 r#ref: thread_id.to_owned(),
                 label: label.clone(),
-                status: map_subagent_activity_status(kind),
+                status,
                 parent_ref,
                 kind: None,
             });
@@ -6993,6 +7032,88 @@ mod tests {
             matches!(map_collab_status("someFutureCodexStatus"), SubagentStatus::Running),
             "unknown status → Running (active), never a wedged terminal"
         );
+    }
+
+    #[tokio::test]
+    async fn child_interaction_does_not_resurrect_completed_turn() {
+        // Sanitized replay of 2026-10-14: completed at 07:50:24Z,
+        // interacted at 07:50:25Z, next actual child turn at 08:16:18Z.
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"parent","item":{"type":"subAgentActivity","id":"done","kind":"completed","agentThreadId":"child","agentPath":"/root/reviewer"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"parent","item":{"type":"subAgentActivity","id":"message","kind":"interacted","agentThreadId":"child","agentPath":"/root/reviewer"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"child","turn":{"id":"next-turn"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"thread/status/changed","params":{"threadId":"child","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"next-turn","status":"interrupted"}}}"#,
+        ]).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::SubagentUpdate { status, .. } => Some(*status),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses, vec![SubagentStatus::Completed]);
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::SubagentStream { event, .. } if matches!(event.as_ref(), SessionEvent::TurnStarted { .. })
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::SubagentStream { event, .. } if matches!(event.as_ref(),
+                SessionEvent::AdapterSpecific { tag, payload } if tag == "codex_child_thread_status" && payload["activeFlags"][0] == "waitingOnUserInput")
+        )));
+        assert_eq!(
+            count_turn_results(&events),
+            0,
+            "child interruption cannot finish the parent"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_terminal_is_emitted_once_and_resets_for_the_next_turn() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"child","turn":{"id":"first"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"child","turnId":"first","willRetry":false,"error":{"message":"failed"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"first","status":"failed","error":{"message":"failed"}}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"sibling","turn":{"id":"sibling-turn","status":"completed"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"child","turn":{"id":"second"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"child","turn":{"id":"second","status":"completed"}}}"#,
+        ]).await;
+        let terminals: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::SubagentStream { r#ref, event } => match event.as_ref() {
+                    SessionEvent::TurnResult { is_error, .. } => Some((r#ref.as_str(), *is_error)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, vec![("child", true), ("sibling", false), ("child", false)]);
+        assert_eq!(count_turn_results(&events), 0);
+    }
+
+    #[tokio::test]
+    async fn child_fatal_error_settles_without_completing_parent_or_settling_retries() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"parent"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"child","willRetry":true,"error":{"message":"retry"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"threadId":"child","willRetry":false,"error":{"message":"failed"}}}"#,
+        ]).await;
+        let terminals: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::SubagentStream { event, .. } => match event.as_ref() {
+                    SessionEvent::TurnResult {
+                        is_error, result_text, ..
+                    } => Some((*is_error, result_text.as_str())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminals, vec![(true, "failed")]);
+        assert_eq!(count_turn_results(&events), 0);
     }
 
     /// A FakeAgentIo that emits a `thread/started{thread.id=tid}` (so the reader

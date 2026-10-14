@@ -878,6 +878,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_lifecycle_changes_persist_and_broadcast_without_parent_changes() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        let mut store =
+            SubagentTranscriptStore::new(rig.user_id.clone(), "conv-1".into(), rig.repo.clone(), rig.bus.clone());
+        for status in [
+            "running",
+            "waiting_for_user",
+            "waiting_for_approval",
+            "running",
+            "interrupted",
+            "running",
+            "errored",
+            "completed",
+            "shutdown",
+        ] {
+            store
+                .apply(&SubagentEventData {
+                    r#ref: "child".into(),
+                    label: None,
+                    parent_ref: None,
+                    status: Some(status.into()),
+                    event: matches!(status, "interrupted" | "errored" | "completed")
+                        .then(|| Box::new(AgentStreamEvent::Finish(FinishEventData::default()))),
+                })
+                .await;
+            let child = rig
+                .repo
+                .get(&rig.user_id, "subagent:conv-1:child")
+                .await
+                .unwrap()
+                .unwrap();
+            let extra: serde_json::Value = serde_json::from_str(&child.extra).unwrap();
+            assert_eq!(extra["subagent"]["status"], status);
+        }
+        let updates: Vec<_> = std::iter::from_fn(|| ws.try_recv().ok())
+            .filter(|e| e.name == "conversation.listChanged")
+            .collect();
+        assert_eq!(updates.len(), 9);
+        let parent = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
+        assert_eq!(parent.status.as_deref(), Some("running"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_segment_break_persists_distinct_message_rows() {
         let rig = rig().await;
         for data in [
