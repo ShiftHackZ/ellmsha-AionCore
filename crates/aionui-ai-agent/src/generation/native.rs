@@ -8,7 +8,7 @@ use aion_types::tool::ToolDef;
 use super::types::*;
 use crate::AgentError;
 
-pub(super) async fn complete(
+pub(crate) async fn complete(
     provider: Arc<dyn LlmProvider>,
     request: &GenerationRequest,
 ) -> Result<Completion, AgentError> {

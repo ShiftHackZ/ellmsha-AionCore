@@ -19,6 +19,9 @@ impl ConversationService {
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
+        if self.is_routed(user_id, conversation_id).await.unwrap_or(true) {
+            return;
+        }
         if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
             return;
         }
@@ -139,6 +142,9 @@ impl ConversationService {
         conversation_id: &str,
         error_code: Option<AgentErrorCode>,
     ) {
+        if self.is_routed(user_id, conversation_id).await.unwrap_or(true) {
+            return;
+        }
         if error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound) {
             return;
         }

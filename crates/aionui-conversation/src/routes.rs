@@ -14,7 +14,7 @@ use aionui_api_types::{
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AuthIdentityMode, CurrentUser};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -127,12 +127,53 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
         .route("/api/conversations/{id}/approvals/check", get(check_approval))
         .route("/api/conversations/active-count", get(active_count))
+        .route("/api/conversations/{id}/routing/outcome", post(record_router_outcome))
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn record_router_outcome(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Extension(identity_mode): Extension<AuthIdentityMode>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<aionui_api_types::RouterOutcomeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::RouterOutcomeResponse>>, ApiError> {
+    if ["x-aionui-runtime-token", "x-aionui-user-id", "x-aionui-conversation-id"]
+        .iter()
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(ApiError::Forbidden(
+            "Router acceptance requires the user session, not agent helper credentials".into(),
+        ));
+    }
+    let header = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty());
+    let cookie = headers.get("cookie").and_then(|v| v.to_str().ok()).and_then(|v| {
+        v.split(';')
+            .find_map(|part| part.trim().strip_prefix("aionui-csrf-token="))
+    });
+    // Embedded desktop uses the existing local-user channel and has no CSRF
+    // cookie. This is an explicit local review, not proof of human presence;
+    // processes with the same local access remain inside that trust boundary.
+    if identity_mode != AuthIdentityMode::Local && (header.is_none() || header != cookie) {
+        return Err(ApiError::CsrfInvalid("User review requires a valid CSRF token".into()));
+    }
+    let Json(request) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .record_router_outcome(&user.id, &id, request)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,

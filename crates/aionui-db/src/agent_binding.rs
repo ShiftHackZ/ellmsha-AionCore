@@ -46,7 +46,7 @@ pub fn resolve_agent_binding_from_rows(rows: &[AgentMetadataRow], value: &str) -
         })
         .or_else(|| {
             rows.iter()
-                .filter(|row| row.agent_type == value)
+                .filter(|row| row.agent_type == value && row.backend.as_deref() != Some("auto-router"))
                 .min_by_key(|row| agent_match_rank(row))
         })
         .map(binding_resolution_for_agent)

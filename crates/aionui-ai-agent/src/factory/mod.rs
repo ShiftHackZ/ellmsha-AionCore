@@ -27,6 +27,7 @@ use crate::types::BuildTaskOptions;
 
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
+    pub router: Option<Arc<crate::routing::RouterService>>,
     pub generation_service: Option<Arc<crate::generation::GenerationService>>,
     pub skill_manager: Arc<AcpSkillManager>,
     pub provider_repo: Arc<dyn IProviderRepository>,
@@ -77,6 +78,8 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+    let routing = options.routing;
+    let routing_scope = options.memory_recall.clone();
     let mut context = options.context;
     if !context.is_session_only() {
         tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await;
@@ -85,8 +88,10 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
     match context.kind {
-        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx).await,
-        AgentSessionKind::Aionrs(aionrs_context) => aionrs::build(deps, *aionrs_context, model, ctx).await,
+        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx, routing).await,
+        AgentSessionKind::Aionrs(aionrs_context) => {
+            aionrs::build(deps, *aionrs_context, model, ctx, routing, routing_scope).await
+        }
         AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
     }
 }

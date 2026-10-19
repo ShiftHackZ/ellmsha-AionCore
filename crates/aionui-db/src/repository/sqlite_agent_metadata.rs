@@ -856,13 +856,17 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 39 ACP vendors + 2 non-ACP builtins + 1 internal = 42.
-        assert_eq!(rows.len(), 43, "seed rows: 42 pre-existing + antigravity");
+        // 39 ACP vendors + 2 non-ACP builtins + 2 internal + Antigravity = 44.
+        assert_eq!(rows.len(), 44, "seed rows: 43 pre-existing + virtual Auto Router");
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")
         );
         assert!(rows.iter().any(|r| r.name == "Ollama" && r.agent_source == "internal"));
+        assert!(
+            rows.iter()
+                .any(|r| r.id == "auto-router" && r.backend.as_deref() == Some("auto-router"))
+        );
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));
         assert!(rows.iter().any(|r| r.name == "OpenClaw"
@@ -971,7 +975,7 @@ mod tests {
         let rows = repo.list_all().await.unwrap();
         let aionrs = rows
             .iter()
-            .find(|row| row.agent_type == "aionrs" && row.agent_source == "internal")
+            .find(|row| row.agent_type == "aionrs" && row.agent_source == "internal" && row.backend.is_none())
             .expect("seeded aion cli row");
         assert_eq!(aionrs.icon.as_deref(), Some("/api/assets/logos/ai-major/ollama.png"));
         let aionrs_modes: serde_json::Value =

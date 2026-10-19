@@ -854,6 +854,7 @@ async fn exec_spawn_agent(
     let requested_name = input.name.clone();
 
     let req = SpawnAgentRequest {
+        initial_task: input.initial_task,
         name: requested_name.clone(),
         assistant_id: Some(assistant_id),
     };

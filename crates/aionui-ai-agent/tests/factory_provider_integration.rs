@@ -81,6 +81,7 @@ fn make_factory(
         aionui_process::local_machine_id(tmp.path()),
     ));
     build_agent_factory(AgentFactoryDeps {
+        router: None,
         generation_service: None,
         skill_manager: AcpSkillManager::new(skill_paths),
         provider_repo,

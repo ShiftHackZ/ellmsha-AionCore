@@ -420,6 +420,8 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
             })
             .await?;
         Ok(TeamConversationCreateResult {
+            resolved_backend: None,
+            resolved_model: None,
             conversation_id: id,
             workspace,
         })
@@ -2320,6 +2322,7 @@ fn setup_with_metadata_rows(rows: Vec<AgentMetadataRow>) -> Arc<TeamSessionServi
 fn two_agent_input() -> Vec<TeamAgentInput> {
     vec![
         TeamAgentInput {
+            initial_task: None,
             name: "Lead".into(),
             role: "lead".into(),
             backend: Some("acp".into()),
@@ -2328,6 +2331,7 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             conversation_id: None,
         },
         TeamAgentInput {
+            initial_task: None,
             name: "Worker".into(),
             role: "teammate".into(),
             backend: Some("acp".into()),
@@ -2350,6 +2354,7 @@ fn aionrs_two_agent_input() -> Vec<TeamAgentInput> {
 
 fn team_agent_input(name: &str, role: &str, model: &str) -> TeamAgentInput {
     TeamAgentInput {
+        initial_task: None,
         name: name.into(),
         role: role.into(),
         backend: Some("acp".into()),
@@ -2573,6 +2578,7 @@ async fn create_team_rejects_existing_conversation_id_request_side_adoption() {
             CreateTeamRequest {
                 name: "No Adoption".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -2770,6 +2776,7 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
             CreateTeamRequest {
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -2840,6 +2847,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
             CreateTeamRequest {
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -2926,6 +2934,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
             CreateTeamRequest {
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some(String::new()),
@@ -3012,6 +3021,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
             CreateTeamRequest {
                 name: "Assistant Lead".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("gemini".into()),
@@ -3070,6 +3080,7 @@ async fn team_preset_assistant_snapshot_is_frozen() {
             CreateTeamRequest {
                 name: "Preset Team".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -3133,6 +3144,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
             &created.id,
             &lead_slot_id,
             SpawnAgentRequest {
+                initial_task: None,
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
             },
@@ -3166,6 +3178,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
             CreateTeamRequest {
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -3184,6 +3197,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
             "user1",
             &team.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Coder".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -3259,6 +3273,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             CreateTeamRequest {
                 name: "Alpha".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -3277,6 +3292,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             "user1",
             &team.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some(String::new()),
@@ -3353,6 +3369,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("claude".into()),
@@ -3371,6 +3388,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             "user1",
             &team.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("gemini".into()),
@@ -3393,6 +3411,7 @@ async fn tc2_create_single_agent_team() {
             CreateTeamRequest {
                 name: "Solo".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -3420,6 +3439,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
+                        initial_task: None,
                         name: "Worker".into(),
                         role: "teammate".into(),
                         backend: Some("acp".into()),
@@ -3428,6 +3448,7 @@ async fn create_team_uses_explicit_leader_role_when_leader_is_not_first() {
                         conversation_id: None,
                     },
                     TeamAgentInput {
+                        initial_task: None,
                         name: "Lead".into(),
                         role: "lead".into(),
                         backend: Some("acp".into()),
@@ -3458,6 +3479,7 @@ async fn create_team_rejects_zero_leaders() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Worker".into(),
                     role: "teammate".into(),
                     backend: Some("acp".into()),
@@ -3483,6 +3505,7 @@ async fn create_team_rejects_multiple_leaders() {
                 name: "T".into(),
                 agents: vec![
                     TeamAgentInput {
+                        initial_task: None,
                         name: "Lead A".into(),
                         role: "lead".into(),
                         backend: Some("acp".into()),
@@ -3491,6 +3514,7 @@ async fn create_team_rejects_multiple_leaders() {
                         conversation_id: None,
                     },
                     TeamAgentInput {
+                        initial_task: None,
                         name: "Lead B".into(),
                         role: "leader".into(),
                         backend: Some("acp".into()),
@@ -3516,6 +3540,7 @@ async fn create_team_rejects_unknown_role() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "captain".into(),
                     backend: Some("acp".into()),
@@ -3644,6 +3669,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
             CreateTeamRequest {
                 name: "With Confirmations".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -3816,6 +3842,7 @@ async fn aa1_add_agent_to_team() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -3834,6 +3861,7 @@ async fn aa1_add_agent_to_team() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -3864,6 +3892,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -3883,6 +3912,7 @@ async fn manual_add_without_active_run_opens_system_lifecycle_run() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -3946,6 +3976,7 @@ async fn add_agent_rejects_leader_role() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Second Leader".into(),
                 role: "lead".into(),
                 backend: Some("acp".into()),
@@ -3986,6 +4017,7 @@ async fn add_agent_allows_same_assistant_id_multiple_times() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: name.into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4031,6 +4063,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4053,6 +4086,7 @@ async fn manual_add_agent_active_session_attaches_runtime_in_background_without_
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4109,6 +4143,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4132,6 +4167,7 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4284,6 +4320,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
             CreateTeamRequest {
                 name: "Re-ensure with broken teammate".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4303,6 +4340,7 @@ async fn reensure_with_failed_teammate_keeps_team_usable_and_inline() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Broken".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4398,6 +4436,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
             CreateTeamRequest {
                 name: "Failed member removal".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4420,6 +4459,7 @@ async fn failed_member_stays_inline_and_removal_restores_ready() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Broken".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4495,6 +4535,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
             CreateTeamRequest {
                 name: "Remove attaching member".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4514,6 +4555,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Attaching".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4575,6 +4617,7 @@ async fn aa_add_agent_inherits_team_workspace() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4593,6 +4636,7 @@ async fn aa_add_agent_inherits_team_workspace() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4621,6 +4665,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
             CreateTeamRequest {
                 name: "Legacy".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4645,6 +4690,7 @@ async fn add_agent_backfills_empty_team_workspace_from_leader_workspace() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4675,6 +4721,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
             CreateTeamRequest {
                 name: "Legacy Empty".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4701,6 +4748,7 @@ async fn add_agent_uses_team_temp_workspace_when_team_and_leader_workspaces_are_
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4736,6 +4784,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
             CreateTeamRequest {
                 name: "Writeback Failure".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4758,6 +4807,7 @@ async fn add_agent_does_not_create_teammate_when_workspace_writeback_fails() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4786,6 +4836,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
             CreateTeamRequest {
                 name: "Patch Failure".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -4815,6 +4866,7 @@ async fn add_agent_continues_when_team_temp_leader_patch_fails() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4878,6 +4930,7 @@ async fn provisioning_writes_typed_team_binding_for_create_and_add_agent() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Extra".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -4922,6 +4975,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
             CreateTeamRequest {
                 name: "Metadata ACP".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("future-acp".into()),
@@ -4966,6 +5020,7 @@ async fn aa4_add_agent_to_nonexistent_team() {
             "user1",
             "nonexistent",
             AddAgentRequest {
+                initial_task: None,
                 name: "X".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -5308,6 +5363,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
         .expect("created team should have a lead slot");
 
     let req = SpawnAgentRequest {
+        initial_task: None,
         name: "Helper".into(),
         assistant_id: Some("assistant-worker".into()),
     };
@@ -5366,6 +5422,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
             &created.id,
             created.leader_assistant_id.as_deref().unwrap(),
             SpawnAgentRequest {
+                initial_task: None,
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
             },
@@ -5523,6 +5580,7 @@ async fn spawn_agent_in_session_aborts_lease_when_persistence_fails() {
 
     let lead_slot_id = created.leader_assistant_id.clone().unwrap();
     let req = SpawnAgentRequest {
+        initial_task: None,
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
     };
@@ -5569,6 +5627,7 @@ async fn spawn_agent_in_session_compensates_when_welcome_mailbox_write_fails() {
 
     let lead_slot_id = created.leader_assistant_id.clone().unwrap();
     let req = SpawnAgentRequest {
+        initial_task: None,
         name: "Helper".into(),
         assistant_id: Some("word-creator".into()),
     };
@@ -6184,6 +6243,7 @@ async fn manual_add_then_immediate_ensure_joins_attach_without_rebuilding_sessio
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -6320,6 +6380,7 @@ async fn stopped_session_rejects_late_attach_completion() {
             "user1",
             &created.id,
             AddAgentRequest {
+                initial_task: None,
                 name: "Worker".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
@@ -6546,6 +6607,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -6574,6 +6636,7 @@ async fn ensure_session_serializes_manual_add_until_rebuild_completes() {
                 "user1",
                 &add_team_id,
                 AddAgentRequest {
+                    initial_task: None,
                     name: "Worker".into(),
                     role: "teammate".into(),
                     backend: Some("acp".into()),
@@ -6721,6 +6784,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
             CreateTeamRequest {
                 name: "T".into(),
                 agents: vec![TeamAgentInput {
+                    initial_task: None,
                     name: "Lead".into(),
                     role: "lead".into(),
                     backend: Some("acp".into()),
@@ -6742,6 +6806,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 "user1",
                 &team_id_a,
                 AddAgentRequest {
+                    initial_task: None,
                     name: "WorkerA".into(),
                     role: "teammate".into(),
                     backend: Some("acp".into()),
@@ -6760,6 +6825,7 @@ async fn w4_d23_concurrent_add_agent_preserves_every_insertion() {
                 "user1",
                 &team_id_b,
                 AddAgentRequest {
+                    initial_task: None,
                     name: "WorkerB".into(),
                     role: "teammate".into(),
                     backend: Some("acp".into()),
@@ -7244,6 +7310,7 @@ async fn agent_triggered_attach_failure_notifies_leader() {
             &created.id,
             &lead_slot_id,
             SpawnAgentRequest {
+                initial_task: None,
                 name: "Writer".into(),
                 assistant_id: Some("word-creator".into()),
             },

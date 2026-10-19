@@ -4571,6 +4571,92 @@ async fn command_ack_does_not_persist_assistant_preference_in_core_service() {
 }
 
 #[tokio::test]
+async fn routed_runtime_updates_conversation_snapshot_without_changing_assistant_preferences() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo, definition_repo, _overlay_repo, preference_repo) =
+        make_service_with_mock_task_manager_and_assistant_support(task_mgr.clone()).await;
+    upsert_test_assistant_definition(
+        &definition_repo,
+        "routed-source",
+        "routed-source",
+        "codex",
+        "auto",
+        "auto",
+    )
+    .await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "routed-source").await;
+    let before = preference_repo
+        .get_for_user("user_1", "routed-source")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    extra["routing"] = serde_json::to_value(aionui_api_types::RouterSnapshot {
+        config: Default::default(),
+        decision: aionui_api_types::RouterDecision {
+            id: "fixture-decision".into(),
+            target: aionui_api_types::RouterTarget::Agent {
+                agent_id: "codex".into(),
+                model: "fixture-model".into(),
+            },
+            requirements: Default::default(),
+            reasons: vec![],
+            evidence_count: 0,
+            elapsed_ms: 0,
+            managed_children: false,
+            scope_workspace: conv.extra["workspace"].as_str().unwrap().into(),
+        },
+    })
+    .unwrap();
+    row.extra = extra.to_string();
+    repo.update(
+        "user_1",
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(row.extra),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    task_mgr.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id).with_config_options(vec![
+            AcpConfigOptionDto {
+                id: "mode".into(),
+                name: None,
+                label: None,
+                description: None,
+                category: Some("mode".into()),
+                option_type: "select".into(),
+                current_value: Some("default".into()),
+                options: vec![],
+            },
+        ]))),
+    );
+    svc.set_config_option(
+        "user_1",
+        &conv.id,
+        "mode",
+        SetConfigOptionRequest { value: "plan".into() },
+    )
+    .await
+    .unwrap();
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
+    assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("plan"));
+    let after = preference_repo
+        .get_for_user("user_1", "routed-source")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(before).unwrap(),
+        serde_json::to_value(after).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn set_config_option_persists_runtime_model_into_assistant_preference_when_observed() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, repo, definition_repo, overlay_repo, preference_repo) =
@@ -8087,6 +8173,73 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
     assert_eq!(calls[0].workspace, workspace);
     assert_eq!(calls[0].rel_dirs, vec![".aionrs/skills"]);
     assert_eq!(calls[0].skill_names, vec!["cron"]);
+}
+
+#[tokio::test]
+async fn routed_auto_workspace_recovers_selected_cli_skills_and_rejects_outside_root() {
+    let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
+    let links = resolver.links.clone();
+    let metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(ClaudeNativeSkillMetadataRepo);
+    let (svc, _broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_agent_metadata_repo(resolver, metadata_repo.clone());
+    let req = serde_json::from_value(json!({"type":"acp","extra":{"backend":"claude"}})).unwrap();
+    let created = svc.create("user-1", req).await.unwrap();
+    let original = PathBuf::from(created.extra["workspace"].as_str().unwrap());
+    let routed = original
+        .parent()
+        .unwrap()
+        .join(format!("auto-router-temp-{}", created.id));
+    std::fs::rename(&original, &routed).unwrap();
+    let mut row = repo.get("user-1", &created.id).await.unwrap().unwrap();
+    let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    extra["workspace"] = json!(routed);
+    extra["routing"] = serde_json::to_value(aionui_api_types::RouterSnapshot {
+        config: Default::default(),
+        decision: aionui_api_types::RouterDecision {
+            id: "fixture-decision".into(),
+            target: aionui_api_types::RouterTarget::Agent {
+                agent_id: "claude".into(),
+                model: "fixture".into(),
+            },
+            requirements: Default::default(),
+            reasons: vec![],
+            evidence_count: 0,
+            elapsed_ms: 0,
+            managed_children: false,
+            scope_workspace: routed.to_string_lossy().into_owned(),
+        },
+    })
+    .unwrap();
+    row.extra = extra.to_string();
+    let mut options = crate::session_context::SessionContextBuilder::new(
+        &std::env::temp_dir(),
+        &metadata_repo,
+        svc.acp_session_repo(),
+    )
+    .build_options(&row, None)
+    .await
+    .unwrap();
+    assert!(!options.context.workspace.is_custom);
+    std::fs::remove_dir_all(&routed).unwrap();
+    links.lock().unwrap().clear();
+    svc.ensure_workspace_skill_links(&row, &mut options, None).await;
+    assert!(routed.join(".claude/skills/cron").is_dir());
+    assert_eq!(links.lock().unwrap()[0].rel_dirs, vec![".claude/skills"]);
+    assert_eq!(
+        svc.auto_workspace_to_delete_for_row(&row, &row.id),
+        Some(std::fs::canonicalize(routed).unwrap())
+    );
+
+    let outside = tempfile::tempdir().unwrap();
+    let outside_workspace = outside.path().join(format!("auto-router-temp-{}", created.id));
+    extra["workspace"] = json!(outside_workspace);
+    row.extra = extra.to_string();
+    options.context.workspace.path = outside_workspace.to_string_lossy().into_owned();
+    options.context.workspace.is_custom = false;
+    links.lock().unwrap().clear();
+    svc.ensure_workspace_skill_links(&row, &mut options, None).await;
+    assert!(links.lock().unwrap().is_empty());
+    assert!(!outside_workspace.exists());
 }
 
 #[tokio::test]

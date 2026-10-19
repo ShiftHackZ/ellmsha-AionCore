@@ -30,6 +30,8 @@ pub(super) async fn build(
     build_context: AionrsSessionBuildContext,
     model: ProviderWithModel,
     ctx: FactoryContext,
+    routing: Option<aionui_api_types::RouterSnapshot>,
+    routing_scope: crate::types::MemoryRecallScope,
 ) -> Result<AgentInstance, AgentError> {
     let mut overrides = build_context.config;
     let resolved_skills = overrides.skills.clone();
@@ -185,6 +187,15 @@ pub(super) async fn build(
         }
     };
 
+    let child_router = match (routing, deps.router.as_ref()) {
+        (Some(snapshot), Some(service)) => Some(Arc::new(crate::routing::RoutedChildren {
+            service: service.clone(),
+            user_id: ctx.user_id.clone(),
+            config: snapshot.config,
+            scope: routing_scope,
+        }) as Arc<dyn aion_agent::spawner::ChildRouter>),
+        _ => None,
+    };
     let config = AionrsResolvedConfig {
         mcp_approval_bindings,
         mcp_approval_store: (!isolated)
@@ -248,7 +259,9 @@ pub(super) async fn build(
         }
     }
 
-    let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
+    let agent =
+        AionrsAgentManager::new_routed(ctx.conversation_id, ctx.workspace, config, resume_session, child_router)
+            .await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
 }
 

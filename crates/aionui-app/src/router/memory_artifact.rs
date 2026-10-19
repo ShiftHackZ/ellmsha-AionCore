@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 //! Composition boundary for authenticated, conversation-scoped memory previews.
 use std::sync::Arc;
 

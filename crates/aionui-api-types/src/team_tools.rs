@@ -463,6 +463,7 @@ fn tool_specs() -> Vec<TeamToolSpec> {
                 "additionalProperties": false,
                 "properties": {
                     "name": { "type": "string", "description": "Agent display name" },
+                    "initial_task": { "type": "string", "description": "Actual initial assignment, required for Auto Router or children of a routed lead. Used for routing before warmup and delivered once to the teammate." },
                     "assistant_id": { "type": "string", "description": "Assistant ID to spawn. Call team_list_assistants when you need candidates; the runtime backend is derived from this assistant." }
                 },
                 "required": ["name", "assistant_id"]

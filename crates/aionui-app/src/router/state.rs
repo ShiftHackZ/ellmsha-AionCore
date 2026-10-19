@@ -424,6 +424,21 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 }
 
 /// Build the default `SystemRouterState` from application services.
+struct RouterSettingsValidator(aionui_ai_agent::routing::RouterService);
+
+#[async_trait::async_trait]
+impl aionui_system::client_pref::RouterConfigValidator for RouterSettingsValidator {
+    async fn validate(
+        &self,
+        user_id: &str,
+        config: &aionui_api_types::RouterConfig,
+    ) -> Result<(), aionui_system::SystemError> {
+        self.0.validate_configuration(user_id, config).await.map_err(|_| {
+            aionui_system::SystemError::BadRequest("Router configuration references an unavailable target".into())
+        })
+    }
+}
+
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let pool = services.database.pool().clone();
@@ -431,12 +446,19 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let http_client = reqwest::Client::new();
 
     let client_pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let router_settings_validator = Arc::new(RouterSettingsValidator(aionui_ai_agent::routing::RouterService::new(
+        provider_repo.clone(),
+        client_pref_repo.clone(),
+        services.agent_registry.clone(),
+        encryption_key,
+    )));
     let keep_awake_controller = Arc::new(aionui_system::SystemKeepAwakeController::new());
     let client_pref_service = if services.identity_mode.is_local() {
         ClientPrefService::with_keep_awake_controller(client_pref_repo, keep_awake_controller, "system_default_user")
     } else {
         ClientPrefService::with_keep_awake_controller_without_restore(client_pref_repo, keep_awake_controller)
-    };
+    }
+    .with_router_config_validator(router_settings_validator);
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),

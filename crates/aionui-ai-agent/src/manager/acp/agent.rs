@@ -525,6 +525,10 @@ pub struct AcpAgentManager {
 }
 
 impl AcpAgentManager {
+    pub(crate) async fn require_routed_model(&self, model: String) {
+        self.session.write().await.require_routed_model(ModelId::new(model));
+    }
+
     /// Create a new ACP agent manager by spawning a CLI subprocess and
     /// establishing an ACP protocol connection.
     ///

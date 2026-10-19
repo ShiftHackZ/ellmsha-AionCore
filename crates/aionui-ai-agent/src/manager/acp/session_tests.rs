@@ -13,6 +13,54 @@ fn make_session() -> AcpSession {
 }
 
 #[test]
+fn routed_model_requires_fresh_observation_and_rejects_dropped_seed() {
+    let mut session = AcpSession::new(None, Some(ModelId::new("wanted")), HashMap::new());
+    session.apply_observed_model(ModelId::new("wanted"));
+    session.require_routed_model(ModelId::new("wanted"));
+    assert!(
+        session.verify_routed_model().is_err(),
+        "cached observation cannot confirm a new runtime"
+    );
+    session.seed_pending_startup_config(SessionConfigOptionCategory::Model, ConfigValue::new("wanted"));
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "other",
+            vec![SessionConfigSelectOption::new("other", "Other")],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+    session.resolve_pending_startup_config_seeds();
+    assert!(session.desired_model().is_none());
+    assert!(session.verify_routed_model().is_err());
+    session.apply_observed_model(ModelId::new("wanted"));
+    assert!(session.verify_routed_model().is_ok());
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "other",
+            vec![
+                SessionConfigSelectOption::new("other", "Other"),
+                SessionConfigSelectOption::new("wanted", "Wanted"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+    assert!(
+        session.verify_routed_model().is_err(),
+        "desired model cannot mask actual model drift"
+    );
+    session.clear_session_id();
+    assert!(session.verify_routed_model().is_err());
+    assert!(
+        make_session().verify_routed_model().is_ok(),
+        "ordinary sessions retain best-effort behavior"
+    );
+}
+
+#[test]
 fn assign_session_id_emits_event() {
     let mut session = make_session();
     session.set_session_id(SessionId::new("sess-1"));

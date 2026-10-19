@@ -1056,6 +1056,23 @@ async fn recall(config: &MemoryConfig, workspace: &str, scope: &MemoryRecallScop
         })
 }
 
+/// Router recall preserves the host-supplied project binding and never broadens it
+/// based on untrusted task text. Strict-local routing skips this service because
+/// a loopback gateway alone cannot prove the locality of its embedding/model calls.
+pub(crate) async fn recall_for_router(
+    scope: &MemoryRecallScope,
+    query: &str,
+    local_only: bool,
+) -> Option<RecallContext> {
+    if scope.isolated_test || local_only || scope.workspace.is_empty() {
+        return None;
+    }
+    let config = load_config()?;
+    let mut plan = plan(query, None);
+    plan.scope_mode = "current_project";
+    Some(recall(&config, &scope.workspace, scope, &plan).await)
+}
+
 pub(crate) async fn recall_from_env(conversation_id: &str, workspace: &str, query: &str) -> Option<RecallContext> {
     let session = SESSION_RECALL
         .get(conversation_id)

@@ -57,6 +57,8 @@ pub struct SendMessageInput {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnAgentInput {
+    /// Required for routed members; delivered once as the initial assignment.
+    pub initial_task: Option<String>,
     pub name: String,
     #[serde(default)]
     #[serde(alias = "assistantId")]

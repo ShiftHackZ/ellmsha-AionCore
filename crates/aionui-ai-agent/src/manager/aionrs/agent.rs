@@ -148,6 +148,16 @@ impl AionrsAgentManager {
         config_extra: AionrsResolvedConfig,
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
+        Self::new_routed(conversation_id, workspace, config_extra, resume_session, None).await
+    }
+
+    pub(crate) async fn new_routed(
+        conversation_id: String,
+        workspace: String,
+        config_extra: AionrsResolvedConfig,
+        resume_session: Option<Session>,
+        child_router: Option<Arc<dyn aion_agent::spawner::ChildRouter>>,
+    ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
@@ -229,31 +239,6 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
-        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
-        if let Some(session) = resume_session {
-            info!(
-                conversation_id = %conversation_id,
-                session_id = %session.id,
-                message_count = session.messages.len(),
-                "Resuming aionrs session"
-            );
-            bootstrap = bootstrap.resume(session);
-        }
-
-        let result = bootstrap
-            .build()
-            .await
-            .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
-
-        let mut engine = result.engine;
-        if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
-            error!(
-                conversation_id = %conversation_id,
-                error = %ErrorChain(&*e),
-                "Failed to init session, continuing without persistence"
-            );
-        }
-
         let approval_manager = Arc::new(match config_extra.mcp_approval_store {
             Some(store) => {
                 ToolApprovalManager::new().with_persistence(Arc::new(super::mcp_approval::NativeMcpApprovals::new(
@@ -278,8 +263,41 @@ impl AionrsAgentManager {
         let confirmations = Arc::new(RwLock::new(Vec::new()));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone())
             .with_approval_manager(approval_manager.clone());
-        engine.set_approval_manager(approval_manager.clone());
-        engine.set_protocol_writer(Arc::new(protocol_sink));
+        if child_router.is_some() {
+            // The live shared manager owns mode changes; a startup yolo flag
+            // must not permanently bypass later default-mode approvals.
+            config.tools.auto_approve = false;
+        }
+        let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .runtime_env(runtime_env)
+            .host_approval(approval_manager.clone(), Arc::new(protocol_sink));
+        if let Some(router) = child_router {
+            bootstrap = bootstrap.child_router(router);
+        }
+        if let Some(session) = resume_session {
+            info!(
+                conversation_id = %conversation_id,
+                session_id = %session.id,
+                message_count = session.messages.len(),
+                "Resuming aionrs session"
+            );
+            bootstrap = bootstrap.resume(session);
+        }
+
+        let result = bootstrap
+            .build()
+            .await
+            .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
+
+        let mut engine = result.engine;
+        if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
+            error!(
+                conversation_id = %conversation_id,
+                error = %ErrorChain(&*e),
+                "Failed to init session, continuing without persistence"
+            );
+        }
+
         let slash_commands = engine
             .slash_command_list()
             .into_iter()

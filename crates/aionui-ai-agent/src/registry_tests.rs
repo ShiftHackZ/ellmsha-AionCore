@@ -479,7 +479,7 @@ async fn management_rows_include_aionrs_builtin_mode_catalog() {
         .list_management_rows()
         .await
         .into_iter()
-        .find(|item| item.agent_type == AgentType::Aionrs)
+        .find(|item| item.agent_type == AgentType::Aionrs && item.backend.is_none())
         .unwrap();
     let row_json = serde_json::to_value(&row).unwrap();
 

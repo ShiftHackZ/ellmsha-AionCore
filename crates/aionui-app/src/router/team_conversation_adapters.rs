@@ -412,9 +412,10 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
     ) -> Result<TeamConversationCreateResult, TeamError> {
         let response = self
             .conversation_service
-            .create(
+            .create_team_routed(
                 &request.user_id,
                 CreateConversationRequest {
+                    routing: None,
                     tool_scope: Default::default(),
                     r#type: request.agent_type,
                     name: Some(request.name),
@@ -428,6 +429,8 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
                     channel_chat_id: None,
                     extra: request.extra,
                 },
+                request.routing_parent.as_deref(),
+                request.initial_task.as_deref(),
             )
             .await
             .map_err(map_conversation_create_error)?;
@@ -439,6 +442,22 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .ok_or_else(|| TeamError::InvalidRequest("created team conversation did not resolve a workspace".into()))?
             .to_owned();
         Ok(TeamConversationCreateResult {
+            resolved_backend: response.extra.get("routing").and_then(|_| {
+                response
+                    .extra
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }),
+            resolved_model: response.extra.get("routing").and_then(|_| {
+                response.model.as_ref().map(|m| m.model.clone()).or_else(|| {
+                    response
+                        .extra
+                        .get("current_model_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+            }),
             conversation_id: response.id,
             workspace,
         })

@@ -50,6 +50,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
+    routing: Option<aionui_api_types::RouterSnapshot>,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
 
@@ -244,6 +245,12 @@ pub(super) async fn build(
     let catalog_tx = deps.agent_registry.catalog_sender();
 
     let (agent, domain_rx, notification_rx) = AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
+    if let Some(routing) = routing {
+        let aionui_api_types::RouterTarget::Agent { model, .. } = routing.decision.target else {
+            return Err(AgentError::bad_request("Routed ACP session requires an agent target"));
+        };
+        agent.require_routed_model(model).await;
+    }
 
     let arc = Arc::new(agent);
     arc.start_permission_handler();

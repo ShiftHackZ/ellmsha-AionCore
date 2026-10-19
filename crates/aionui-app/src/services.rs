@@ -235,7 +235,21 @@ impl AppServices {
         let generation_service = Arc::new(aionui_ai_agent::generation::GenerationService::new(
             runtime_base_url.clone(),
         ));
+        let router = Arc::new(
+            aionui_ai_agent::routing::RouterService::new(
+                provider_repo.clone(),
+                Arc::new(aionui_db::SqliteClientPreferenceRepository::new(
+                    database.pool().clone(),
+                )),
+                agent_registry.clone(),
+                encryption_key,
+            )
+            .with_outcomes(Arc::new(aionui_db::SqliteRouterOutcomeRepository::new(
+                database.pool().clone(),
+            ))),
+        );
         let factory = build_agent_factory(AgentFactoryDeps {
+            router: Some(router.clone()),
             generation_service: Some(generation_service.clone()),
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
             provider_repo,
@@ -281,7 +295,8 @@ impl AppServices {
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
-        });
+        })
+        .with_router_service(router);
 
         Ok(Self {
             generation_service,

@@ -329,6 +329,12 @@ impl AcpAgentManager {
             .ok_or_else(|| AgentError::internal("Cannot prompt: no session ID available"))
             .map_err(AcpSendFailure::from)?;
 
+        self.session
+            .read()
+            .await
+            .verify_routed_model()
+            .map_err(AcpSendFailure::from)?;
+
         let content = data.content.clone();
 
         // Subscribe BEFORE emitting Start so we can observe every event

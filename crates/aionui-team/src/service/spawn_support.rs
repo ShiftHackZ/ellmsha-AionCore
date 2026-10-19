@@ -1053,6 +1053,7 @@ mod tests {
                 "user1",
                 &created.id,
                 aionui_api_types::AddAgentRequest {
+                    initial_task: None,
                     name: "Worker".into(),
                     role: "teammate".into(),
                     backend: None,
@@ -1107,6 +1108,8 @@ mod tests {
                 backend: "acp".into(),
                 model: "claude".into(),
                 assistant_id: None,
+                routing_parent: None,
+                initial_task: None,
             })
             .await
             .unwrap();

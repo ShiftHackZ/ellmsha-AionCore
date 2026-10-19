@@ -169,6 +169,7 @@ impl ChannelMessageService {
         };
 
         let req = CreateConversationRequest {
+            routing: None,
             tool_scope: Default::default(),
             r#type: if assistant_id.is_some() { None } else { Some(agent_type) },
             name: Some(name),

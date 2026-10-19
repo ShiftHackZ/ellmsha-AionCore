@@ -64,3 +64,5 @@ pub use repository::{
 
 // Re-export sqlx pool type for downstream crates
 pub use sqlx::SqlitePool;
+
+pub use repository::{IRouterOutcomeRepository, RouterOutcome, SqliteRouterOutcomeRepository};

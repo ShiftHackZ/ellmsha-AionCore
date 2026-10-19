@@ -34,11 +34,15 @@ pub(crate) struct InitialProvisioningResult {
 }
 
 struct ProvisionedConversation {
+    backend: Option<String>,
+    model: Option<String>,
     conversation_id: String,
     workspace: Option<String>,
 }
 
 struct NewAgentProvisioning {
+    routing_parent: Option<String>,
+    initial_task: Option<String>,
     user_id: String,
     team_id: String,
     slot_id: String,
@@ -52,6 +56,8 @@ struct NewAgentProvisioning {
 }
 
 pub(crate) struct PersistSpawnedAgentRequest {
+    pub routing_parent: Option<String>,
+    pub initial_task: Option<String>,
     pub user_id: String,
     pub team_id: String,
     pub slot_id: String,
@@ -62,6 +68,8 @@ pub(crate) struct PersistSpawnedAgentRequest {
 }
 
 pub struct TeamConversationCreateRequest {
+    pub routing_parent: Option<String>,
+    pub initial_task: Option<String>,
     pub user_id: String,
     pub agent_type: Option<AgentType>,
     pub name: String,
@@ -72,6 +80,8 @@ pub struct TeamConversationCreateRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamConversationCreateResult {
+    pub resolved_backend: Option<String>,
+    pub resolved_model: Option<String>,
     pub conversation_id: String,
     pub workspace: String,
 }
@@ -192,6 +202,8 @@ impl TeamAgentProvisioner {
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
+                None,
+                leader_input.initial_task.as_deref(),
             )
             .await?;
 
@@ -214,8 +226,8 @@ impl TeamAgentProvisioner {
             name: leader_input.name.clone(),
             role: leader_role,
             conversation_id: leader_conversation.conversation_id,
-            backend: leader_backend,
-            model: leader_input.model.clone(),
+            backend: leader_conversation.backend.unwrap_or(leader_backend),
+            model: leader_conversation.model.unwrap_or_else(|| leader_input.model.clone()),
             assistant_id: leader_assistant_id,
             status: None,
             conversation_type: None,
@@ -244,6 +256,8 @@ impl TeamAgentProvisioner {
                     assistant_id.as_deref(),
                     Some(&team_workspace),
                     None,
+                    agents.first().map(|a| a.conversation_id.as_str()),
+                    input.initial_task.as_deref(),
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -251,8 +265,8 @@ impl TeamAgentProvisioner {
                 name: input.name.clone(),
                 role: *role,
                 conversation_id: conversation.conversation_id,
-                backend,
-                model: input.model.clone(),
+                backend: conversation.backend.unwrap_or(backend),
+                model: conversation.model.unwrap_or_else(|| input.model.clone()),
                 assistant_id,
                 status: None,
                 conversation_type: None,
@@ -299,6 +313,12 @@ impl TeamAgentProvisioner {
             .await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
+                routing_parent: team
+                    .agents
+                    .iter()
+                    .find(|a| a.role == TeammateRole::Lead)
+                    .map(|a| a.conversation_id.clone()),
+                initial_task: req.initial_task,
                 user_id: user_id.to_owned(),
                 team_id: team.id.clone(),
                 slot_id: generate_id(),
@@ -352,6 +372,8 @@ impl TeamAgentProvisioner {
         let workspace = self.workspace_resolver().resolve_for_new_agent(&row, &team).await?;
         let agent = self
             .provision_new_agent(NewAgentProvisioning {
+                routing_parent: req.routing_parent,
+                initial_task: req.initial_task,
                 user_id: req.user_id,
                 team_id: req.team_id.clone(),
                 slot_id: req.slot_id,
@@ -533,6 +555,8 @@ impl TeamAgentProvisioner {
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
+                input.routing_parent.as_deref(),
+                input.initial_task.as_deref(),
             )
             .await?;
         Ok(TeamAgent {
@@ -540,8 +564,8 @@ impl TeamAgentProvisioner {
             name: input.name,
             role: input.role,
             conversation_id: conversation.conversation_id,
-            backend: input.backend,
-            model: input.model,
+            backend: conversation.backend.unwrap_or(input.backend),
+            model: conversation.model.unwrap_or(input.model),
             assistant_id: input.assistant_id,
             status: None,
             conversation_type: None,
@@ -562,9 +586,15 @@ impl TeamAgentProvisioner {
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         session_mode: Option<&str>,
+        routing_parent: Option<&str>,
+        initial_task: Option<&str>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let cli_metadata = cli_backend_metadata(&self.agent_metadata_repo, user_id, backend).await?;
-        let agent_type = agent_type_for_backend(cli_metadata.as_ref(), backend)?;
+        let agent_type = if backend == "auto-router" {
+            AgentType::Aionrs
+        } else {
+            agent_type_for_backend(cli_metadata.as_ref(), backend)?
+        };
         let extra = self.build_team_extra(
             team_id,
             slot_id,
@@ -602,6 +632,8 @@ impl TeamAgentProvisioner {
         let created = self
             .conversation_port
             .create_team_conversation(TeamConversationCreateRequest {
+                routing_parent: routing_parent.map(str::to_owned),
+                initial_task: initial_task.map(str::to_owned),
                 user_id: user_id.to_owned(),
                 agent_type: if assistant_id.is_some() { None } else { Some(agent_type) },
                 name: name.to_owned(),
@@ -620,6 +652,8 @@ impl TeamAgentProvisioner {
             "Team agent provisioned"
         );
         Ok(ProvisionedConversation {
+            backend: created.resolved_backend,
+            model: created.resolved_model,
             conversation_id: conv_id,
             workspace: Some(resolved_workspace),
         })

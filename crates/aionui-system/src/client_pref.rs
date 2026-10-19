@@ -11,11 +11,17 @@ use crate::keep_awake::{DynKeepAwakeController, KEEP_AWAKE_KEY, NoopKeepAwakeCon
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
 
+#[async_trait::async_trait]
+pub trait RouterConfigValidator: Send + Sync {
+    async fn validate(&self, user_id: &str, config: &aionui_api_types::RouterConfig) -> Result<(), SystemError>;
+}
+
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
 pub struct ClientPrefService {
     repo: Arc<dyn IClientPreferenceRepository>,
     keep_awake_controller: DynKeepAwakeController,
+    router_config_validator: Option<Arc<dyn RouterConfigValidator>>,
 }
 
 impl ClientPrefService {
@@ -23,6 +29,7 @@ impl ClientPrefService {
         Self {
             repo,
             keep_awake_controller: Arc::new(NoopKeepAwakeController),
+            router_config_validator: None,
         }
     }
 
@@ -43,7 +50,13 @@ impl ClientPrefService {
         Self {
             repo,
             keep_awake_controller,
+            router_config_validator: None,
         }
+    }
+
+    pub fn with_router_config_validator(mut self, validator: Arc<dyn RouterConfigValidator>) -> Self {
+        self.router_config_validator = Some(validator);
+        self
     }
 
     /// Get all client preferences, or only the specified keys.
@@ -99,6 +112,16 @@ impl ClientPrefService {
 
         for (key, value) in req {
             validate_key(&key)?;
+            if key == aionui_api_types::ROUTER_CONFIG_KEY && !value.is_null() {
+                let config: aionui_api_types::RouterConfig = serde_json::from_value(value.clone())
+                    .map_err(|_| SystemError::BadRequest("Invalid router configuration".into()))?;
+                config
+                    .validate()
+                    .map_err(|reason| SystemError::BadRequest(reason.into()))?;
+                if let Some(validator) = &self.router_config_validator {
+                    validator.validate(user_id, &config).await?;
+                }
+            }
 
             if value.is_null() {
                 info!(
@@ -347,6 +370,7 @@ mod tests {
         ClientPrefService {
             repo,
             keep_awake_controller: controller,
+            router_config_validator: None,
         }
     }
 

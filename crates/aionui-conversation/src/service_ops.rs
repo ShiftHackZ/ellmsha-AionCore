@@ -56,6 +56,20 @@ impl ConversationService {
         }
         self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
+        if self.is_routed(user_id, conversation_id).await? {
+            let options = agent.get_config_options().await.map_err(ConversationError::from)?;
+            let category = options
+                .config_options
+                .iter()
+                .find(|option| option.id == option_id)
+                .and_then(|option| option.category.as_deref())
+                .unwrap_or(option_id);
+            if category == "model" || !options.config_options.iter().any(|option| option.id == option_id) {
+                return Err(ConversationError::bad_request(
+                    "Router execution target is pinned; start a new chat to change it",
+                ));
+            }
+        }
         let response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,
             Err(err @ AgentError::Acp(AcpError::NotConnected)) => {

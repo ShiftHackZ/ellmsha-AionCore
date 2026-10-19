@@ -78,6 +78,8 @@ pub(crate) enum PrepareBatchResult {
 /// it calls the `spawn_agent` MCP tool.
 #[derive(Debug, Clone)]
 pub struct SpawnAgentRequest {
+    /// Actual assignment used for prompt-aware routing and first mailbox delivery.
+    pub initial_task: Option<String>,
     pub name: String,
     pub assistant_id: Option<String>,
 }
@@ -1558,6 +1560,8 @@ impl TeamSession {
         let new_slot_id = generate_id();
         let new_agent = service
             .persist_spawned_agent(PersistSpawnedAgentRequest {
+                routing_parent: Some(caller.conversation_id.clone()),
+                initial_task: req.initial_task.clone(),
                 team_id: self.team.id.clone(),
                 user_id: self.user_id.clone(),
                 slot_id: new_slot_id.clone(),
@@ -1584,7 +1588,9 @@ impl TeamSession {
                 &new_agent.slot_id,
                 caller_slot_id,
                 MailboxMessageType::Message,
-                "You have been spawned as a teammate. Read your mailbox and wait for instructions.",
+                req.initial_task
+                    .as_deref()
+                    .unwrap_or("You have been spawned as a teammate. Read your mailbox and wait for instructions."),
                 None,
             )
             .await
@@ -2576,6 +2582,7 @@ mod tests {
 
     fn sample_spawn_req() -> SpawnAgentRequest {
         SpawnAgentRequest {
+            initial_task: None,
             name: "Helper".into(),
             assistant_id: Some("word-creator".into()),
         }
@@ -3162,6 +3169,7 @@ mod tests {
 
     fn spawn_req(assistant_id: Option<&str>) -> SpawnAgentRequest {
         SpawnAgentRequest {
+            initial_task: None,
             name: "Helper".into(),
             assistant_id: assistant_id.map(str::to_owned),
         }

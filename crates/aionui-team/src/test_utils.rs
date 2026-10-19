@@ -701,6 +701,8 @@ pub(crate) mod workspace_harness {
                 })
                 .await?;
             Ok(TeamConversationCreateResult {
+                resolved_backend: None,
+                resolved_model: None,
                 conversation_id: id,
                 workspace,
             })
@@ -1374,6 +1376,7 @@ pub(crate) mod workspace_harness {
         CreateTeamRequest {
             name: name.into(),
             agents: vec![aionui_api_types::TeamAgentInput {
+                initial_task: None,
                 name: "Lead".into(),
                 role: "lead".into(),
                 backend: Some("acp".into()),

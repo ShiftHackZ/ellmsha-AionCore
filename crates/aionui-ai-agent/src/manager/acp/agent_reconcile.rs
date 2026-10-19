@@ -113,6 +113,9 @@ impl AcpAgentManager {
 
                 ReconcileAction::SetModel { model } => {
                     if let Err(e) = self.protocol.set_model(session_id, model.as_str()).await {
+                        if self.session.read().await.has_required_routed_model() {
+                            return Err(e);
+                        }
                         if is_acp_session_not_found(&e) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
@@ -206,6 +209,9 @@ impl AcpAgentManager {
                             actions = followup_actions.into();
                         }
                         Err(err) => {
+                            if self.session.read().await.has_required_routed_model() {
+                                return Err(err);
+                            }
                             if is_acp_session_not_found(&err) {
                                 warn!(
                                     conversation_id = %self.params.conversation_id,
@@ -229,7 +235,7 @@ impl AcpAgentManager {
                 }
             }
         }
-        Ok(())
+        self.session.read().await.verify_routed_model()
     }
 
     fn log_reconcile_session_plan_results(
@@ -283,6 +289,129 @@ mod tests {
     use super::*;
     use crate::manager::acp::AcpSession;
     use std::collections::HashMap;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routed_acp_reconcile_fails_closed_on_catalog_mismatch_and_selection_errors() {
+        use crate::factory::acp_assembler::{WorkspaceInfo, assemble_acp_params};
+        use crate::registry::AgentRegistry;
+        use std::sync::Arc;
+        for (scenario, routed, should_pass) in [
+            ("missing", true, false),
+            ("config-fails", true, false),
+            ("legacy-fails", true, false),
+            ("success", true, true),
+            ("missing", false, true),
+            ("config-fails", false, true),
+            ("legacy-fails", false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join("agent.py");
+            let calls = dir.path().join("calls");
+            std::fs::write(&script, r#"import json, sys
+scenario, path = sys.argv[1:]
+def options(current):
+    models = ['other'] if scenario == 'missing' else ['other', 'wanted']
+    return [{'id':'model','name':'Model','category':'model','type':'select','currentValue':current,'options':[{'value':m,'name':m} for m in models]}]
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    with open(path, 'a') as log: log.write(str(method) + '\n')
+    if 'id' not in message: continue
+    response = {'jsonrpc':'2.0','id':message['id']}
+    if method == 'initialize': response['result'] = {'protocolVersion':1,'agentCapabilities':{},'authMethods':[]}
+    elif method == 'session/new':
+        response['result'] = {'sessionId':'fixture'}
+        if scenario == 'legacy-fails': response['result']['models'] = {'currentModelId':'other','availableModels':[{'modelId':'other','name':'Other'},{'modelId':'wanted','name':'Wanted'}]}
+        else: response['result']['configOptions'] = options('other')
+    elif method in ['session/set_config_option', 'session/set_model']:
+        if scenario == 'success': response['result'] = {'configOptions':options('wanted')}
+        else: response['error'] = {'code':-32602,'message':'fixture rejected model'}
+    elif method == 'session/prompt': response['result'] = {'stopReason':'end_turn'}
+    else: response['result'] = {}
+    print(json.dumps(response), flush=True)
+"#).unwrap();
+            let db = aionui_db::init_database_memory().await.unwrap();
+            let registry = AgentRegistry::new(Arc::new(aionui_db::SqliteAgentMetadataRepository::new(
+                db.pool().clone(),
+            )));
+            registry.hydrate().await.unwrap();
+            let metadata = registry.find_builtin_by_backend("gemini").await.unwrap();
+            let params = Arc::new(
+                assemble_acp_params(
+                    "route-fixture".into(),
+                    "fixture-user".into(),
+                    WorkspaceInfo {
+                        path: dir.path().to_string_lossy().into_owned(),
+                        is_custom: true,
+                    },
+                    metadata,
+                    aionui_common::CommandSpec {
+                        command: "python3".into(),
+                        args: vec![
+                            script.to_string_lossy().into_owned(),
+                            scenario.into(),
+                            calls.to_string_lossy().into_owned(),
+                        ],
+                        env: vec![],
+                        cwd: None,
+                    },
+                    aionui_api_types::AcpBuildExtra {
+                        backend: Some("gemini".into()),
+                        current_model_id: Some("wanted".into()),
+                        ..Default::default()
+                    },
+                    vec![],
+                    None,
+                    dir.path().into(),
+                    false,
+                )
+                .await,
+            );
+            let paths = Arc::new(aionui_extension::resolve_skill_paths(dir.path(), dir.path()));
+            let (manager, _events, notifications) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                AcpAgentManager::build(params, crate::AcpSkillManager::new(paths), &registry.catalog_sender()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if routed {
+                manager.require_routed_model("wanted".into()).await;
+            }
+            let manager = Arc::new(manager);
+            manager.start_session_event_tracker(notifications);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), manager.warmup_session())
+                .await
+                .unwrap();
+            if routed && scenario == "success" {
+                manager
+                    .session
+                    .write()
+                    .await
+                    .apply_observed_model(ModelId::new("other"));
+                let data = serde_json::from_value(serde_json::json!({"content":"must not be sent","msg_id":"fixture"}))
+                    .unwrap();
+                assert!(
+                    manager
+                        .prompt_existing_session(&data, Some("fixture"), None)
+                        .await
+                        .is_err(),
+                    "drift after warmup must be rejected before sending a prompt"
+                );
+            }
+            manager.kill_and_wait(None).await;
+            assert_eq!(result.is_ok(), should_pass, "{scenario}, routed={routed}: {result:?}");
+            let calls = std::fs::read_to_string(calls).unwrap();
+            assert!(!calls.lines().any(|method| method == "session/prompt"));
+            if scenario == "config-fails" {
+                assert!(calls.contains("session/set_config_option"));
+            }
+            if scenario == "legacy-fails" {
+                assert!(calls.contains("session/set_model"));
+            }
+        }
+    }
 
     #[test]
     fn reconcile_action_equality() {

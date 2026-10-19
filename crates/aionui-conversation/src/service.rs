@@ -329,6 +329,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    router: Option<Arc<aionui_ai_agent::routing::RouterService>>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -412,12 +413,95 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            router: None,
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    pub fn with_router_service(mut self, router: Arc<aionui_ai_agent::routing::RouterService>) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    pub(crate) async fn is_routed(&self, user: &str, id: &str) -> Result<bool, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.into() })?;
+        Ok(serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .is_some_and(|v| v.get("routing").is_some()))
+    }
+
+    pub async fn record_router_outcome(
+        &self,
+        user: &str,
+        id: &str,
+        request: aionui_api_types::RouterOutcomeRequest,
+    ) -> Result<aionui_api_types::RouterOutcomeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.into() })?;
+        if self.runtime_state.active_turn_id_for(id).is_some() || row.status.as_deref() != Some("finished") {
+            return Err(ConversationError::bad_request(
+                "Review a completed task before recording its outcome",
+            ));
+        }
+        let extra: serde_json::Value =
+            serde_json::from_str(&row.extra).map_err(|_| ConversationError::bad_request("Invalid conversation"))?;
+        if extra.get("subagent").is_some() {
+            return Err(ConversationError::bad_request(
+                "A transcript cannot be reviewed as its parent route",
+            ));
+        }
+        let message = self
+            .conversation_repo
+            .get_message(user, id, &request.message_id)
+            .await?
+            .ok_or_else(|| ConversationError::bad_request("Select a completed assistant response to review"))?;
+        if message.position.as_deref() != Some("left")
+            || message.status.as_deref() != Some("finish")
+            || message.r#type != "text"
+            || message.hidden
+        {
+            return Err(ConversationError::bad_request(
+                "Acceptance requires an actual completed assistant text response",
+            ));
+        }
+        let snapshot: aionui_api_types::RouterSnapshot = serde_json::from_value(
+            extra
+                .get("routing")
+                .cloned()
+                .ok_or_else(|| ConversationError::bad_request("This is not a routed task"))?,
+        )
+        .map_err(|_| ConversationError::bad_request("Invalid routing snapshot"))?;
+        self.router
+            .as_ref()
+            .ok_or_else(|| ConversationError::internal("Router service unavailable"))?
+            .record_outcome(&aionui_db::RouterOutcome {
+                user_id: user.into(),
+                conversation_id: id.into(),
+                message_id: request.message_id,
+                decision_id: snapshot.decision.id.clone(),
+                workspace: snapshot.decision.scope_workspace.clone(),
+                target_json: serde_json::to_string(&snapshot.decision.target).unwrap_or_default(),
+                task: serde_json::to_string(&snapshot.decision.requirements.task).unwrap_or_default(),
+                accepted: request.accepted,
+                updated_at: now_ms(),
+            })
+            .await?;
+        Ok(aionui_api_types::RouterOutcomeResponse {
+            decision_id: snapshot.decision.id,
+            accepted: request.accepted,
+            source: "explicit_user_review".into(),
+        })
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -995,12 +1079,63 @@ impl ConversationService {
         user_id: &str,
         req: CreateConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
+        self.create_inner(user_id, req, None, false, false, None).await
+    }
+
+    /// Trusted host Team seam. Inherit the caller's frozen policy; no client decision is accepted.
+    pub async fn create_team_routed(
+        &self,
+        user: &str,
+        mut req: CreateConversationRequest,
+        parent: Option<&str>,
+        task: Option<&str>,
+    ) -> Result<ConversationResponse, ConversationError> {
+        let mut config = None;
+        if let Some(parent) = parent {
+            let row = self
+                .conversation_repo
+                .get(user, parent)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound { id: parent.into() })?;
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_default();
+            if let Some(value) = extra.get("routing") {
+                let snapshot: aionui_api_types::RouterSnapshot = serde_json::from_value(value.clone())
+                    .map_err(|_| ConversationError::bad_request("Invalid parent routing policy"))?;
+                config = Some(snapshot.config);
+            }
+        }
+        if config.is_some() {
+            let task = task.filter(|v| !v.trim().is_empty()).ok_or_else(|| {
+                ConversationError::bad_request("Auto Router Team members require an initial task before warmup")
+            })?;
+            req.routing = Some(aionui_api_types::RouterCreateRequest {
+                initial_prompt: task.into(),
+                config: None,
+                has_images: false,
+            });
+        }
+        self.create_inner(user, req, config, parent.is_some(), true, task).await
+    }
+
+    async fn create_inner(
+        &self,
+        user_id: &str,
+        mut req: CreateConversationRequest,
+        trusted_config: Option<aionui_api_types::RouterConfig>,
+        route_child: bool,
+        host_team: bool,
+        team_initial_task: Option<&str>,
+    ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let tool_scope = req.tool_scope;
         let mut extra = req.extra;
+        if extra.get("routing").is_some() {
+            return Err(ConversationError::bad_request("Routing decisions are server-owned"));
+        }
+        let mut routing_request = req.routing.take();
         if extra.get("tool_scope").is_some() {
             return Err(ConversationError::BadRequest {
                 reason: "tool_scope must be supplied at the top level when creating a conversation".into(),
@@ -1042,13 +1177,148 @@ impl ConversationService {
             .and_then(|assistant| assistant.conversation_overrides)
             .map(AssistantConversationOverrides::from)
             .unwrap_or_default();
-        let assistant_snapshot = match assistant_id.as_deref() {
+        let mut assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
                 self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
             }
             None => None,
         };
+        let is_router = assistant_snapshot
+            .as_ref()
+            .is_some_and(|s| s.runtime_backend == aionui_api_types::ROUTER_AGENT_ID);
+        if is_router && host_team && routing_request.is_none() {
+            let task = team_initial_task
+                .filter(|task| !task.trim().is_empty())
+                .ok_or_else(|| {
+                    ConversationError::bad_request("Auto Router Team members require an initial task before warmup")
+                })?;
+            routing_request = Some(aionui_api_types::RouterCreateRequest {
+                initial_prompt: task.to_owned(),
+                config: None,
+                has_images: false,
+            });
+        }
+        if is_router && routing_request.is_none() {
+            return Err(ConversationError::bad_request(
+                "Auto Router requires the initial task before runtime initialization",
+            ));
+        }
+        if routing_request.is_some() && !is_router && trusted_config.is_none() {
+            return Err(ConversationError::bad_request(
+                "Select the Auto Router assistant to route this task",
+            ));
+        }
+        let mut auto_provisioned_workspace = None;
+        if let Some(routing) = routing_request {
+            let router = self
+                .router
+                .as_ref()
+                .ok_or_else(|| ConversationError::internal("Router service unavailable"))?;
+            let config = match trusted_config.or(routing.config) {
+                Some(config) => config,
+                None => router.settings(user_id).await?,
+            };
+            // Routing needs the actual workspace before classification/recall.
+            // Use one stable router label because the concrete runtime is not
+            // selected yet; keep this same path through warmup and deletion.
+            let workspace = match extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|workspace| !workspace.is_empty())
+            {
+                Some(workspace) => normalize_workspace_path(workspace)?,
+                None => {
+                    let path =
+                        auto_workspace_parent(&self.workspace_root, user_id).join(format!("auto-router-temp-{id}"));
+                    std::fs::create_dir_all(&path)
+                        .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+                    let workspace = normalize_workspace_path(&path.to_string_lossy())?;
+                    auto_provisioned_workspace = Some(PathBuf::from(&workspace));
+                    if !extra.is_object() {
+                        extra = serde_json::json!({});
+                    }
+                    extra["workspace"] = serde_json::Value::String(workspace.clone());
+                    workspace
+                }
+            };
+            extra["workspace"] = serde_json::Value::String(workspace.clone());
+            let scope = MemoryRecallScope {
+                workspace: workspace.clone(),
+                roots: vec![workspace],
+                isolated_test: tool_scope.is_session_only(),
+                ..Default::default()
+            };
+            let facts = aionui_api_types::RouterRequirements {
+                vision: routing.has_images,
+                ..Default::default()
+            };
+            let (decision, backend) = router
+                .select(
+                    user_id,
+                    &config,
+                    &routing.initial_prompt,
+                    &scope,
+                    route_child,
+                    false,
+                    host_team,
+                    &facts,
+                )
+                .await?;
+            let snapshot = assistant_snapshot
+                .as_mut()
+                .ok_or_else(|| ConversationError::bad_request("A routed task requires an available assistant"))?;
+            let requested_permission = snapshot.resolved_defaults.permission.clone().or_else(|| {
+                extra
+                    .get("session_mode")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+            let original_full_auto = snapshot.agent_type.full_auto_mode_id(Some(&snapshot.runtime_backend));
+            let permission = if host_team && requested_permission.as_deref() == Some(original_full_auto) {
+                Some("yolo")
+            } else {
+                requested_permission.as_deref()
+            };
+            snapshot.resolved_defaults.permission = router.permission(user_id, &decision.target, permission).await?;
+            if let Some(object) = extra.as_object_mut() {
+                object.remove("session_mode");
+                object.remove("current_mode_id");
+            }
+            snapshot.runtime_backend = backend;
+            snapshot.resolved_defaults.model = Some(decision.target.model().to_owned());
+            match &decision.target {
+                aionui_api_types::RouterTarget::Provider { provider_id, model } => {
+                    snapshot.agent_type = AgentType::Aionrs;
+                    snapshot.agent_id.clear();
+                    snapshot.agent_source = "internal".into();
+                    req.model = Some(aionui_common::ProviderWithModel {
+                        provider_id: provider_id.clone(),
+                        model: model.clone(),
+                        use_model: Some(model.clone()),
+                    });
+                }
+                aionui_api_types::RouterTarget::Agent { .. } => {
+                    let meta = router
+                        .agent_metadata(user_id, &decision.target)
+                        .await?
+                        .ok_or_else(|| ConversationError::bad_request("Selected agent disappeared"))?;
+                    snapshot.agent_type = meta.agent_type;
+                    snapshot.agent_id = meta.id;
+                    snapshot.agent_source = serde_json::to_value(meta.agent_source)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    req.model = None;
+                }
+            }
+            req.r#type = Some(snapshot.agent_type);
+            if !extra.is_object() {
+                extra = serde_json::json!({});
+            }
+            extra["routing"] = serde_json::to_value(aionui_api_types::RouterSnapshot { config, decision })
+                .map_err(|_| ConversationError::internal("Invalid routing snapshot"))?;
+        }
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
 
@@ -1108,18 +1378,19 @@ impl ConversationService {
         // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
         // Skill wiring runs for both kinds so native CLI discovery behaves
         // consistently.
-        let user_supplied_workspace = match extra
-            .get("workspace")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            Some(workspace) => Some(normalize_workspace_path(workspace)?),
-            None => None,
+        let user_supplied_workspace = if auto_provisioned_workspace.is_some() {
+            None
+        } else {
+            extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|workspace| !workspace.is_empty())
+                .map(normalize_workspace_path)
+                .transpose()?
         };
         if let Some(workspace) = user_supplied_workspace.as_ref() {
             extra["workspace"] = serde_json::Value::String(workspace.clone());
         }
-
         let assistant_backend = assistant_snapshot
             .as_ref()
             .map(|snapshot| snapshot.runtime_backend.clone())
@@ -1149,7 +1420,7 @@ impl ConversationService {
             }
         }
 
-        let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
+        if user_supplied_workspace.is_none() && auto_provisioned_workspace.is_none() {
             // Per-conversation temp workspaces live under
             // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
             // The label lets operators eyeball the agent type; the
@@ -1165,10 +1436,8 @@ impl ConversationService {
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
             extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
-            Some(ws_path)
-        } else {
-            None
-        };
+            auto_provisioned_workspace = Some(ws_path);
+        }
 
         // Strip the request-only custom_workspace toggle — it was read above
         // and must not be persisted as an extra field.
@@ -1579,7 +1848,11 @@ impl ConversationService {
                 .await?;
         }
 
-        if let Some(snapshot) = assistant_snapshot.as_ref() {
+        // A routed runtime belongs to this conversation; its provider/model and
+        // permission values must not become defaults for the source assistant.
+        if extra.get("routing").is_none()
+            && let Some(snapshot) = assistant_snapshot.as_ref()
+        {
             self.persist_assistant_preferences_from_snapshot(user_id, snapshot)
                 .await?;
         }
@@ -1834,7 +2107,10 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
             })?;
-        if let Some(selected_model) = model.as_deref() {
+        if let Some(selected_model) = model
+            .as_deref()
+            .filter(|_| agent_binding.runtime_backend != "auto-router")
+        {
             self.validate_advertised_model(user_id, &agent_binding.agent_id, selected_model)
                 .await?;
         }
@@ -2049,6 +2325,10 @@ impl ConversationService {
         else {
             return Ok(());
         };
+
+        if self.is_routed(user_id, conversation_id).await? {
+            return Ok(());
+        }
 
         let persisted_snapshot = self
             .conversation_repo
@@ -2331,6 +2611,20 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        let old_extra: serde_json::Value = serde_json::from_str(&existing.extra).unwrap_or_default();
+        if req.extra.as_ref().is_some_and(|v| v.get("routing").is_some())
+            || (old_extra.get("routing").is_some()
+                && (req.model.is_some()
+                    || req.extra.as_ref().is_some_and(|v| {
+                        ["backend", "agent_id", "current_model_id"]
+                            .iter()
+                            .any(|k| v.get(k).is_some())
+                    })))
+        {
+            return Err(ConversationError::bad_request(
+                "Router decisions and execution target are pinned; start a new chat to change them",
+            ));
+        }
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
         // Snapshot invariant: once written at create time, `extra.skills`
@@ -4198,6 +4492,21 @@ impl ConversationService {
         } else {
             options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
         }
+        if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .and_then(|v| v.get("routing").cloned())
+        {
+            let snapshot: aionui_api_types::RouterSnapshot = serde_json::from_value(value)
+                .map_err(|_| ConversationError::bad_request("Stored routing snapshot is invalid"))?;
+            let router = self
+                .router
+                .as_ref()
+                .ok_or_else(|| ConversationError::internal("Router service unavailable"))?;
+            router
+                .validate_target(&row.user_id, &snapshot.config, &snapshot.decision.target)
+                .await?;
+            options.routing = Some(snapshot);
+        }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
     }
@@ -4217,6 +4526,21 @@ impl ConversationService {
             options.memory_recall.isolated_test = true;
         } else {
             options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
+        }
+        if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
+            .ok()
+            .and_then(|v| v.get("routing").cloned())
+        {
+            let snapshot: aionui_api_types::RouterSnapshot = serde_json::from_value(value)
+                .map_err(|_| ConversationError::bad_request("Stored routing snapshot is invalid"))?;
+            let router = self
+                .router
+                .as_ref()
+                .ok_or_else(|| ConversationError::internal("Router service unavailable"))?;
+            router
+                .validate_target(&row.user_id, &snapshot.config, &snapshot.decision.target)
+                .await?;
+            options.routing = Some(snapshot);
         }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
@@ -4368,13 +4692,25 @@ impl ConversationService {
 
         let runtime_workspace = PathBuf::from(build_opts.context.workspace.path.trim());
         if !build_opts.context.workspace.is_custom {
-            let expected_workspace = expected_auto_workspace_path(
-                &self.workspace_root,
-                &row.user_id,
-                &row.id,
-                &build_opts.context.conversation.agent_type,
-                backend.as_ref(),
-            );
+            let extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+            let routed = extra.get("routing").is_some();
+            let expected_workspace = if routed {
+                // A router workspace is allocated before its runtime is known.
+                // Validate the persisted managed root/date/id, then still use
+                // the concrete runtime below to select native skill folders.
+                if validated_auto_workspace_path(&self.workspace_root, row, &row.id, true).is_none() {
+                    return;
+                }
+                PathBuf::from(extra["workspace"].as_str().unwrap_or_default())
+            } else {
+                expected_auto_workspace_path(
+                    &self.workspace_root,
+                    &row.user_id,
+                    &row.id,
+                    &build_opts.context.conversation.agent_type,
+                    backend.as_ref(),
+                )
+            };
 
             if runtime_workspace != expected_workspace {
                 return;
@@ -4783,6 +5119,15 @@ fn auto_provisioned_workspace_to_delete(
     row: &ConversationRow,
     conversation_id: &str,
 ) -> Option<PathBuf> {
+    validated_auto_workspace_path(workspace_root, row, conversation_id, false)
+}
+
+fn validated_auto_workspace_path(
+    workspace_root: &Path,
+    row: &ConversationRow,
+    conversation_id: &str,
+    allow_missing_leaf: bool,
+) -> Option<PathBuf> {
     let extra = serde_json::from_str::<serde_json::Value>(&row.extra).ok()?;
     let workspace = extra.get("workspace")?.as_str()?.trim();
     if workspace.is_empty() {
@@ -4796,7 +5141,22 @@ fn auto_provisioned_workspace_to_delete(
 
     let conversations_root = workspace_root.join("conversations");
     let conversations_root = std::fs::canonicalize(conversations_root).ok()?;
-    let workspace_path = std::fs::canonicalize(workspace_path).ok()?;
+    let workspace_path = match std::fs::canonicalize(workspace_path) {
+        Ok(path) => path,
+        Err(error)
+            if allow_missing_leaf
+                && error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(workspace_path).is_err() =>
+        {
+            // Skill recovery may recreate a removed workspace leaf. Its
+            // parent must still resolve inside the app-managed root; never
+            // follow a dangling/replaced symlink to another location.
+            std::fs::canonicalize(workspace_path.parent()?)
+                .ok()?
+                .join(workspace_path.file_name()?)
+        }
+        Err(_) => return None,
+    };
     let file_name = workspace_path.file_name()?.to_str()?;
     let expected_suffix = format!("-temp-{conversation_id}");
     if !file_name.ends_with(&expected_suffix) {

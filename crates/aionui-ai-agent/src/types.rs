@@ -28,6 +28,7 @@ pub struct SendMessageData {
 /// Options for building (creating or resuming) an Agent task.
 #[derive(Debug, Clone)]
 pub struct BuildTaskOptions {
+    pub routing: Option<aionui_api_types::RouterSnapshot>,
     pub context: AgentSessionContext,
     pub runtime_capabilities: RuntimeCapabilities,
     pub memory_recall: MemoryRecallScope,
@@ -36,6 +37,7 @@ pub struct BuildTaskOptions {
 impl BuildTaskOptions {
     pub fn new(context: AgentSessionContext) -> Self {
         Self {
+            routing: None,
             context,
             runtime_capabilities: RuntimeCapabilities::default(),
             memory_recall: MemoryRecallScope::default(),

@@ -84,6 +84,9 @@ impl ConversationToolScope {
 /// Body for `POST /api/conversations`.
 #[derive(Debug, Deserialize)]
 pub struct CreateConversationRequest {
+    /// Auto Router selection resolved before any runtime is started.
+    #[serde(default)]
+    pub routing: Option<crate::RouterCreateRequest>,
     /// Immutable trusted creation-time scope. Omitted preserves ordinary behavior.
     #[serde(default)]
     pub tool_scope: ConversationToolScope,

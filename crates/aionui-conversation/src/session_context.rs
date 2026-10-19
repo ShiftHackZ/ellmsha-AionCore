@@ -136,12 +136,21 @@ impl<'a> SessionContextBuilder<'a> {
         extra: &serde_json::Value,
         workspace_override: Option<&str>,
     ) -> Result<WorkspaceContext, ConversationError> {
+        // Router workspaces are allocated before the concrete runtime is
+        // selected. Their stable label must survive native/CLI selection.
+        let router_backend = extra.get("routing").map(|_| serde_json::json!("auto-router"));
+        let workspace_agent_type = if router_backend.is_some() {
+            &AgentType::Acp
+        } else {
+            agent_type
+        };
+        let workspace_backend = router_backend.as_ref().or_else(|| extra.get("backend"));
         let expected_auto_workspace = expected_auto_workspace_path(
             self.workspace_root,
             &row.user_id,
             &row.id,
-            agent_type,
-            extra.get("backend"),
+            workspace_agent_type,
+            workspace_backend,
         );
         let existing_stored_path = extra
             .get("workspace")
@@ -185,8 +194,8 @@ impl<'a> SessionContextBuilder<'a> {
                 if is_auto_workspace(
                     self.workspace_root,
                     &row.id,
-                    agent_type,
-                    extra.get("backend"),
+                    workspace_agent_type,
+                    workspace_backend,
                     Path::new(stored_path),
                 ) =>
             {
@@ -202,8 +211,8 @@ impl<'a> SessionContextBuilder<'a> {
             is_custom: !is_auto_workspace(
                 self.workspace_root,
                 &row.id,
-                agent_type,
-                extra.get("backend"),
+                workspace_agent_type,
+                workspace_backend,
                 Path::new(&normalized),
             ),
             stored_path: stored_path.to_owned(),

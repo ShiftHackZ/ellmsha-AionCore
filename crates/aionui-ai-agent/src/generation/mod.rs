@@ -7,3 +7,5 @@ mod types;
 pub use service::GenerationService;
 pub(crate) use service::GenerationTarget;
 pub use types::*;
+
+pub(crate) use native::complete as complete_native;

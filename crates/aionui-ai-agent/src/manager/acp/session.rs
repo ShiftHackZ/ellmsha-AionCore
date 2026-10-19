@@ -77,6 +77,8 @@ pub struct AcpSession {
     desired: Desired,
     observed: Observed,
     advertised: Advertised,
+    required_routed_model: Option<ModelId>,
+    observed_routed_model: Option<ModelId>,
     /// Single-flight lease over user-triggered config/mode/model updates.
     ///
     /// Held as an `Arc<AtomicBool>` (not a plain `bool`) so a
@@ -167,6 +169,8 @@ impl AcpSession {
             },
             observed: Observed::default(),
             advertised: Advertised::default(),
+            required_routed_model: None,
+            observed_routed_model: None,
             config_set_in_flight: Arc::new(AtomicBool::new(false)),
             pending_events: Vec::new(),
             last_close_reason: None,
@@ -175,6 +179,30 @@ impl AcpSession {
 }
 
 impl AcpSession {
+    /// Cached catalogs and mutable desired state cannot prove a routed target.
+    /// Only subsequent session responses/notifications may confirm it.
+    pub(crate) fn require_routed_model(&mut self, model: ModelId) {
+        self.required_routed_model = Some(model);
+        self.observed_routed_model = None;
+    }
+
+    pub(crate) fn has_required_routed_model(&self) -> bool {
+        self.required_routed_model.is_some()
+    }
+
+    pub(crate) fn verify_routed_model(&self) -> Result<(), crate::protocol::error::AcpError> {
+        if let Some(required) = &self.required_routed_model
+            && self.observed_routed_model.as_ref() != Some(required)
+        {
+            return Err(crate::protocol::error::AcpError::InvalidRequest {
+                message: format!(
+                    "Auto Router target `{required}` was not confirmed by the active agent session; no prompt was sent"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Atomically claim the single-flight config lease. Returns a RAII guard
     /// on success (releases the lease on drop), or `None` when a config update
     /// is already in flight — preserving the `rejected_in_progress` semantics.
@@ -225,6 +253,7 @@ impl AcpSession {
     pub fn clear_session_id(&mut self) {
         self.session_id = None;
         self.opened = false;
+        self.observed_routed_model = None;
         // A rebuilt session must not inherit the prior turn's close reason —
         // otherwise the next user-facing error would surface stale context.
         self.last_close_reason = None;
@@ -590,6 +619,9 @@ impl AcpSession {
     /// the `advertised.models.current_model_id` (available_models preserved);
     /// emits `ObservedModelSynced` when the value actually changed.
     pub fn apply_observed_model(&mut self, model: ModelId) {
+        if self.required_routed_model.is_some() {
+            self.observed_routed_model = Some(model.clone());
+        }
         let changed = self.observed.model_id.as_ref() != Some(&model);
         self.observed.model_id = Some(model.clone());
         let available = self
@@ -669,6 +701,9 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_models(&mut self, models: LegacySessionModelState) {
+        if self.required_routed_model.is_some() {
+            self.observed_routed_model = Some(ModelId::new(models.current_model_id.clone()));
+        }
         let incoming_model_catalog_count = models.available_models.len();
         let existing_model_catalog_count = self
             .advertised
@@ -736,6 +771,9 @@ impl AcpSession {
     }
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
+        let routed_observation = derive_models_from_config_options(&options)
+            .map(|models| ModelId::new(models.current_model_id))
+            .or_else(|| self.observed_routed_model.clone());
         let options = merge_config_options(self.advertised.config_options.as_deref(), options);
         let supplement_summary = ConfigSnapshot::supplement_summary_for_real_options(
             &options,
@@ -765,7 +803,14 @@ impl AcpSession {
         }
 
         if let Some(models) = derive_models_from_config_options(&options) {
-            self.apply_advertised_models(self.preserve_desired_model_in_catalog(models));
+            if self.required_routed_model.is_some() {
+                self.apply_advertised_models(models);
+            } else {
+                self.apply_advertised_models(self.preserve_desired_model_in_catalog(models));
+            }
+        }
+        if self.required_routed_model.is_some() {
+            self.observed_routed_model = routed_observation;
         }
 
         let mut changed = false;

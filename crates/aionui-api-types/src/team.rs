@@ -16,6 +16,8 @@ use crate::chat_file::ChatFileRef;
 ///
 #[derive(Debug, Clone)]
 pub struct TeamAgentInput {
+    /// Initial assignment required for Auto Router members before process warmup.
+    pub initial_task: Option<String>,
     pub name: String,
     pub role: String,
     pub backend: Option<String>,
@@ -31,6 +33,8 @@ pub struct TeamAgentInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TeamAgentInputCompat {
+    #[serde(default)]
+    pub initial_task: Option<String>,
     #[serde(default)]
     pub assistant_id: Option<String>,
     pub name: String,
@@ -56,6 +60,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
             normalize_assistant_id(raw.assistant_id).ok_or_else(|| serde::de::Error::missing_field("assistant_id"))?;
 
         Ok(Self {
+            initial_task: raw.initial_task,
             name: raw.name,
             role: raw.role,
             backend: None,
@@ -95,6 +100,8 @@ pub struct RenameTeamRequest {
 /// created automatically for the new agent.
 #[derive(Debug)]
 pub struct AddAgentRequest {
+    /// Actual initial assignment required for routed Team members.
+    pub initial_task: Option<String>,
     pub name: String,
     pub role: String,
     pub backend: Option<String>,
@@ -105,6 +112,8 @@ pub struct AddAgentRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddAgentRequestCompat {
+    #[serde(default)]
+    initial_task: Option<String>,
     #[serde(default)]
     assistant: Option<TeamAgentInput>,
     #[serde(default)]
@@ -125,6 +134,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
         let raw = AddAgentRequestCompat::deserialize(deserializer)?;
         if let Some(assistant) = raw.assistant {
             return Ok(Self {
+                initial_task: assistant.initial_task,
                 name: assistant.name,
                 role: assistant.role,
                 backend: None,
@@ -140,6 +150,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
             normalize_assistant_id(raw.assistant_id).ok_or_else(|| serde::de::Error::missing_field("assistant_id"))?;
 
         Ok(Self {
+            initial_task: raw.initial_task,
             name,
             role,
             backend: None,

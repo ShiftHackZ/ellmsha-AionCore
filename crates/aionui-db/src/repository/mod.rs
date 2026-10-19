@@ -77,3 +77,6 @@ pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
 pub use team::ITeamRepository;
 pub use user::IUserRepository;
+
+mod router_outcome;
+pub use router_outcome::{IRouterOutcomeRepository, RouterOutcome, SqliteRouterOutcomeRepository};

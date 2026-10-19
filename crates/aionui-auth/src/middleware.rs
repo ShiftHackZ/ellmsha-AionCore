@@ -93,6 +93,8 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Server-owned transport identity, never inferred from request headers.
+    request.extensions_mut().insert(state.identity_mode);
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.identity_mode == AuthIdentityMode::Local {
         request.extensions_mut().insert(CurrentUser::local_default());
@@ -207,6 +209,7 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
 /// Injects a fixed `CurrentUser` with id and username `system_default_user`.
 /// Used when the server runs as an embedded subprocess inside Electron.
 pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
+    request.extensions_mut().insert(AuthIdentityMode::Local);
     request.extensions_mut().insert(CurrentUser::local_default());
     next.run(request).await
 }

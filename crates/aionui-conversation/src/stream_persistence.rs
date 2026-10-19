@@ -142,6 +142,7 @@ impl SubagentTranscriptStore {
         let mut extra = serde_json::from_str::<serde_json::Value>(&parent.extra).unwrap_or_else(|_| json!({}));
         if let Some(object) = extra.as_object_mut() {
             for key in [
+                "routing", // A CLI transcript has no independently resolved host route.
                 "backend_session_id",
                 "acp_session_id",
                 "acp_session_updated_at",
