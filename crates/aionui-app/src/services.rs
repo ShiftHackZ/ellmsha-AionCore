@@ -22,6 +22,7 @@ use aionui_project::{ManagedUploadStore, ProjectService};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
+    pub router_service: Arc<aionui_ai_agent::routing::RouterService>,
     pub generation_service: Arc<aionui_ai_agent::generation::GenerationService>,
     pub database: Database,
     pub jwt_service: Arc<JwtService>,
@@ -95,7 +96,8 @@ impl AppServices {
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
             project_service: self.project_service.clone(),
-        });
+        })
+        .with_router_service(self.router_service.clone());
         self
     }
 
@@ -244,6 +246,7 @@ impl AppServices {
                 agent_registry.clone(),
                 encryption_key,
             )
+            .with_session_spawner(session_spawner.clone())
             .with_outcomes(Arc::new(aionui_db::SqliteRouterOutcomeRepository::new(
                 database.pool().clone(),
             ))),
@@ -296,9 +299,10 @@ impl AppServices {
             runtime_token_service: runtime_token_service.clone(),
             project_service: project_service.clone(),
         })
-        .with_router_service(router);
+        .with_router_service(router.clone());
 
         Ok(Self {
+            router_service: router,
             generation_service,
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),

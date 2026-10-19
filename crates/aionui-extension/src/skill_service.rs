@@ -3273,7 +3273,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            link_workspace_skills(&workspace, &[".codex/skills"], &[new.clone()])
+            link_workspace_skills(&workspace, &[".codex/skills"], std::slice::from_ref(&new))
                 .await
                 .unwrap(),
             1

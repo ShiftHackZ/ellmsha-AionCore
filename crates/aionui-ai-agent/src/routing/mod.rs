@@ -1,5 +1,10 @@
 //! Host-owned routing over existing configured accounts. No credentials enter decisions.
+mod catalog;
 mod children;
+mod graph;
+#[cfg(test)]
+mod graph_test;
+pub(crate) mod guard;
 mod native;
 mod selector;
 use crate::{AgentError, registry::AgentRegistry, types::MemoryRecallScope};
@@ -18,6 +23,7 @@ pub struct RouterService {
     registry: Arc<AgentRegistry>,
     key: [u8; 32],
     outcomes: Option<Arc<dyn aionui_db::IRouterOutcomeRepository>>,
+    session_spawner: Option<Arc<dyn aionui_process::Spawner>>,
 }
 impl RouterService {
     pub fn new(
@@ -32,10 +38,15 @@ impl RouterService {
             registry,
             key,
             outcomes: None,
+            session_spawner: None,
         }
     }
     pub fn with_outcomes(mut self, outcomes: Arc<dyn aionui_db::IRouterOutcomeRepository>) -> Self {
         self.outcomes = Some(outcomes);
+        self
+    }
+    pub fn with_session_spawner(mut self, spawner: Arc<dyn aionui_process::Spawner>) -> Self {
+        self.session_spawner = Some(spawner);
         self
     }
     pub async fn record_outcome(&self, outcome: &aionui_db::RouterOutcome) -> Result<(), AgentError> {
@@ -52,14 +63,15 @@ impl RouterService {
             .get_by_keys(user, &[ROUTER_CONFIG_KEY])
             .await
             .map_err(|_| AgentError::internal("Could not read router settings"))?;
-        let config: RouterConfig = rows
+        let value: Value = rows
             .first()
             .map(|r| serde_json::from_str(&r.value))
             .transpose()
             .map_err(|_| AgentError::bad_request("Stored router settings are invalid"))?
-            .unwrap_or_default();
-        config.validate().map_err(AgentError::bad_request)?;
-        Ok(config)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let settings = RouterSettings::from_value(value)
+            .map_err(|_| AgentError::bad_request("Stored router settings are invalid"))?;
+        Ok(settings.active().map_err(AgentError::bad_request)?.clone())
     }
     async fn candidates(&self, user: &str, config: &RouterConfig) -> Result<Vec<Candidate>, AgentError> {
         let mut result = Vec::new();
@@ -183,6 +195,11 @@ impl RouterService {
         host_team: bool,
         facts: &RouterRequirements,
     ) -> Result<(RouterDecision, String), AgentError> {
+        if config.schema_version == 2 {
+            return self
+                .select_graph(user, config, prompt, scope, child, native_child, host_team, facts)
+                .await;
+        }
         config.validate().map_err(AgentError::bad_request)?;
         if prompt.trim().is_empty() || prompt.len() > 128 * 1024 {
             return Err(AgentError::bad_request(
@@ -409,6 +426,9 @@ impl RouterService {
     /// running classification, memory recall, or model inference.
     pub async fn validate_configuration(&self, user: &str, config: &RouterConfig) -> Result<(), AgentError> {
         config.validate().map_err(AgentError::bad_request)?;
+        if config.schema_version == 2 {
+            return self.validate_graph_references(user, config).await;
+        }
         let mut catalog_config = config.clone();
         catalog_config.allowed_targets.clear();
         let candidates = self.candidates(user, &catalog_config).await?;
@@ -427,6 +447,16 @@ impl RouterService {
             }
         }
         Ok(())
+    }
+
+    /// Inactive graph slots may be incomplete, but every submitted reference must
+    /// still be owned or previously saved. Availability is an execution concern.
+    pub async fn validate_draft_configuration(&self, user: &str, config: &RouterConfig) -> Result<(), AgentError> {
+        if config.schema_version != 2 {
+            return self.validate_configuration(user, config).await;
+        }
+        config.validate_shape().map_err(AgentError::bad_request)?;
+        self.validate_graph_references(user, config).await
     }
 }
 fn loopback_url(value: &str) -> bool {

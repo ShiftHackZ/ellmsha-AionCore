@@ -78,6 +78,7 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
 }
 
 async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+    let frozen_target = crate::routing::guard::frozen_target(&options)?.cloned();
     let routing = options.routing;
     let routing_scope = options.memory_recall.clone();
     let mut context = options.context;
@@ -87,13 +88,23 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     codex_home::isolate_legacy_memory(&mut context, &deps.data_dir).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();
-    match context.kind {
-        AgentSessionKind::Acp(acp_context) => acp::build(deps, *acp_context, ctx, routing).await,
+    let instance = match context.kind {
+        AgentSessionKind::Acp(acp_context) => {
+            acp::build(deps, *acp_context, ctx, routing, frozen_target.as_ref()).await
+        }
         AgentSessionKind::Aionrs(aionrs_context) => {
             aionrs::build(deps, *aionrs_context, model, ctx, routing, routing_scope).await
         }
-        AgentSessionKind::Antigravity(agy_context) => antigravity::build(deps, *agy_context, ctx).await,
+        AgentSessionKind::Antigravity(agy_context) => {
+            antigravity::build(deps, *agy_context, ctx, frozen_target.as_ref()).await
+        }
+    }?;
+    if let (Some(aionui_api_types::RouterTarget::Agent { model, .. }), AgentInstance::Session(task)) =
+        (&frozen_target, &instance)
+    {
+        task.require_routed_model(model.clone()).await?;
     }
+    Ok(instance)
 }
 
 #[cfg(test)]

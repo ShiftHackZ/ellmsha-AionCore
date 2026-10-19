@@ -204,7 +204,7 @@ impl BackendConnection for CodexConnection {
         };
         backend.run_handshake(handshake_mode).await?;
 
-        // codex-model-gating: `thread/start` intentionally did NOT bind `config.model`
+        // Ordinary codex-model-gating: `thread/start` did NOT bind `config.model`
         // (see `thread_start_params`), nor a permission tier (`thread/start` carries no
         // `permissions` field, U1) — the thread launched on codex's own default model +
         // default permission profile. Now apply the requested model+mode the ACP way:
@@ -213,22 +213,29 @@ impl BackendConnection for CodexConnection {
         // a stale picker default never poisons every turn). Detached + off the open hot
         // path; only a Fresh session with a requested model and/or mode does any work
         // (Resume keeps codex's rollout-restored model + permission tier; no requested
-        // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
+        // config → nothing to reconcile). Frozen routes already sent required_model
+        // and instead await its wire confirmation. The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
+        let reconcile_model = config.required_model.is_none().then(|| config.model.clone()).flatten();
+        let backend = Arc::new(backend);
+        // Reject before any detached reconciliation can outlive a failed open.
+        if config.required_model.is_some()
+            && let Err(error) = backend.bound_thread().await
+        {
+            backend.terminate().await;
+            return Err(error);
+        }
         if !config.generation_only
             && matches!(spec, SessionSpec::Fresh { .. })
-            && (config.model.is_some() || config.mode.is_some())
+            && (reconcile_model.is_some() || config.mode.is_some())
         {
             backend
                 .model_reconcile_ready
-                .store(config.model.is_none(), Ordering::SeqCst);
-            let backend = Arc::new(backend);
-            spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
-            return Ok(backend);
+                .store(reconcile_model.is_none(), Ordering::SeqCst);
+            spawn_codex_reconcile(backend.clone(), reconcile_model, config.mode.clone());
         }
-
-        Ok(Arc::new(backend))
+        Ok(backend)
     }
 
     async fn close_session(&self, _session_id: &str) -> Result<(), BackendError> {
@@ -503,9 +510,9 @@ fn initialize_params() -> HandshakeParams {
 /// `thread/start` params (Fresh / lost-Resume). approvalPolicy/sandbox are valid
 /// AskForApproval/SandboxMode enum values; cwd threaded from config.
 ///
-/// ⚠️ MODEL IS DELIBERATELY NOT EMBEDDED HERE (codex-model-gating regression fix).
-/// `thread/start` binds the model for the WHOLE thread, and `turn/start` carries NO
-/// model — so a stale/invalid `config.model` (e.g. a frontend picker default like
+/// Ordinary model preferences are deliberately not embedded here (codex-model-gating).
+/// `thread/start` binds the model for the whole thread, and ordinary `turn/start`
+/// requests omit a model — so a stale/invalid `config.model` (e.g. a frontend picker default like
 /// `gpt-5.5` the local codex doesn't have) bound here makes EVERY turn fail with an
 /// opaque UNKNOWN_UPSTREAM_ERROR (live-repro: a fresh codex conv's first reply
 /// fails; an old conv resumes via thread/resume which sends no model → works). The
@@ -548,6 +555,12 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
             "sandbox": sandbox,
         })
     };
+    // A frozen host route must never silently fall back to Codex's default.
+    // Verified: Codex 0.162.1 generated v2/{ThreadStart,ThreadResume,ThreadFork}Params
+    // accept model; their corresponding responses require the effective model.
+    if let Some(model) = &config.required_model {
+        params["model"] = json!(model);
+    }
     if let Some(cwd) = &config.cwd {
         params["cwd"] = json!(cwd);
     }
@@ -619,7 +632,7 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         params["baseInstructions"] = json!(preset);
     }
     if config.generation_only {
-        params["model"] = json!(config.model);
+        params["model"] = json!(config.required_model.as_ref().or(config.model.as_ref()));
         params["ephemeral"] = json!(true);
         params["config"] = json!({
             "project_doc_max_bytes": 0,
@@ -1171,6 +1184,24 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
+    /// V2 route intent and actual wire-confirmed model, never the optimistic config seed.
+    required_model: Option<String>,
+    observed_model: Option<String>,
+    model_open_confirmed: bool,
+}
+
+const ROUTED_MODEL_MISMATCH: &str = "codex routed model mismatch: start a new chat to change the frozen route";
+
+/// Only the opt-in frozen route consumes these observations. Ordinary sessions keep
+/// their existing mutable-model behavior. Missing required response fields fail closed.
+fn observe_routed_model(discovered: &std::sync::Mutex<Discovered>, model: Option<&str>, open_response: bool) -> bool {
+    let mut state = discovered.lock().unwrap_or_else(|error| error.into_inner());
+    if state.required_model.is_none() || (!open_response && !state.model_open_confirmed) {
+        return true;
+    }
+    state.model_open_confirmed |= open_response;
+    state.observed_model = model.map(str::to_owned);
+    state.observed_model == state.required_model
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
@@ -1630,6 +1661,7 @@ impl CodexSessionBackend {
             if let Some(poison) = self.resume_poison.lock().await.clone() {
                 return Err(
                     if poison.starts_with("codex thread/start failed:")
+                        || poison.starts_with("codex routed model mismatch:")
                         || poison.starts_with("codex resume MCP catalog failed:")
                         || poison.starts_with("codex model catalog unavailable:")
                         || poison.starts_with("codex requested model unavailable:")
@@ -1644,6 +1676,11 @@ impl CodexSessionBackend {
             if self.resume_ready.load(Ordering::SeqCst)
                 && self.skill_roots_ready.load(Ordering::SeqCst)
                 && (!require_model_reconcile || self.model_reconcile_ready.load(Ordering::SeqCst))
+                && (!require_model_reconcile || {
+                    let state = self.discovered.lock().unwrap_or_else(|error| error.into_inner());
+                    state.required_model.is_none()
+                        || (state.model_open_confirmed && state.observed_model == state.required_model)
+                })
                 && let Some(tid) = self.thread_binding.lock().await.clone()
             {
                 return Ok(tid);
@@ -1709,6 +1746,12 @@ impl CodexSessionBackend {
 
     async fn run_handshake(&self, mode: HandshakeMode<'_>) -> Result<(), BackendError> {
         let mut config = self.wake.config_snapshot();
+        {
+            let mut state = self.discovered.lock().unwrap_or_else(|error| error.into_inner());
+            state.required_model.clone_from(&config.required_model);
+            state.observed_model = None;
+            state.model_open_confirmed = false;
+        }
         // A handshake is a fresh chance: any prior resume rejection belonged to
         // the previous process/attempt.
         *self.resume_poison.lock().await = None;
@@ -2210,6 +2253,16 @@ async fn reader_task(
                                 );
                             }
                         }
+                        if m == "thread/settings/updated"
+                            && let Some(model) = params
+                                .get("threadSettings")
+                                .or_else(|| params.get("thread_settings"))
+                                .and_then(|settings| settings.get("model"))
+                                .and_then(Value::as_str)
+                            && !observe_routed_model(&discovered, Some(model), false)
+                        {
+                            *resume_poison.lock().await = Some(ROUTED_MODEL_MISMATCH.into());
+                        }
                         if m == "turn/started" {
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
@@ -2404,6 +2457,17 @@ async fn reader_task(
                                 continue;
                             }
                             if is_resume {
+                                if !observe_routed_model(
+                                    &discovered,
+                                    frame
+                                        .get("result")
+                                        .and_then(|result| result.get("model"))
+                                        .and_then(Value::as_str),
+                                    true,
+                                ) {
+                                    *resume_poison.lock().await = Some(ROUTED_MODEL_MISMATCH.into());
+                                    continue;
+                                }
                                 if resume_needs_memory_catalog.load(Ordering::SeqCst) {
                                     let Some(thread_id) = thread_binding.lock().await.clone() else {
                                         *resume_poison.lock().await = Some(
@@ -2545,6 +2609,19 @@ async fn reader_task(
                                 };
                                 tracing::warn!(conversation_id = %session_id, method, rpc_code = ?frame["error"]["code"].as_i64(), reason = %safe_message, "codex session opening rejected");
                                 *resume_poison.lock().await = Some(format!("codex {method} failed: {safe_message}"));
+                                continue;
+                            }
+                            if open_method.is_some()
+                                && !observe_routed_model(
+                                    &discovered,
+                                    frame
+                                        .get("result")
+                                        .and_then(|result| result.get("model"))
+                                        .and_then(Value::as_str),
+                                    true,
+                                )
+                            {
+                                *resume_poison.lock().await = Some(ROUTED_MODEL_MISMATCH.into());
                                 continue;
                             }
                             let pending_send = pending_sends.lock().await.remove(&rid);
@@ -4746,8 +4823,15 @@ impl SessionBackend for CodexSessionBackend {
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
                 };
                 let config = self.wake.config_snapshot();
+                if let Some(model) = &config.required_model
+                    && method == "turn/start"
+                {
+                    // Verified: Codex 0.162.1 generated v2/TurnStartParams.model
+                    // overrides the model for this and subsequent turns.
+                    params["model"] = json!(model);
+                }
                 if config.generation_only && method == "turn/start" {
-                    params["model"] = json!(config.model);
+                    params["model"] = json!(config.required_model.as_ref().or(config.model.as_ref()));
                     if let Some(schema) = &config.generation_response_schema {
                         params["outputSchema"] = schema.clone();
                     }
@@ -4930,6 +5014,15 @@ impl SessionBackend for CodexSessionBackend {
                 })
             }
             Command::SetModel { model } => {
+                if self
+                    .wake
+                    .config_snapshot()
+                    .required_model
+                    .as_ref()
+                    .is_some_and(|required| required != &model)
+                {
+                    return Err(BackendError::SetupRejected(ROUTED_MODEL_MISMATCH.into()));
+                }
                 // F-4: between-turn config write → wake a suspended session first.
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
@@ -5266,6 +5359,9 @@ impl SessionBackend for CodexSessionBackend {
         // fixed permission-tier mode enum, feature 012). Read-only sync lock.
         let mut caps = self.capabilities.clone();
         let disc = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
+        if disc.required_model.is_some() {
+            caps.current_model.clone_from(&disc.observed_model);
+        }
         if !disc.models.is_empty() {
             caps.available_models = disc.models.clone();
         }
@@ -5449,6 +5545,10 @@ impl Drop for CodexSessionBackend {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "codex_routed_model_test.rs"]
+mod routed_model_test;
 
 #[cfg(test)]
 mod tests {

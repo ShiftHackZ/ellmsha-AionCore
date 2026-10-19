@@ -36,6 +36,16 @@ pub(super) async fn complete(
     spawner: Arc<dyn Spawner>,
     request: &GenerationRequest,
 ) -> Result<Completion, AgentError> {
+    complete_bounded(backend, source, spawner, request, 1024 * 1024).await
+}
+
+pub(super) async fn complete_bounded(
+    backend: &str,
+    source: SessionConfig,
+    spawner: Arc<dyn Spawner>,
+    request: &GenerationRequest,
+    output_limit: usize,
+) -> Result<Completion, AgentError> {
     let directory = tempfile::Builder::new()
         .prefix("ellmsha-memory-generation-")
         .tempdir()
@@ -104,8 +114,8 @@ pub(super) async fn complete(
                     message_item = Some(item_id);
                 }
                 result.content.push_str(&text);
-                if result.content.len() > 1024 * 1024 {
-                    return Err(AgentError::bad_gateway("Memory generation output exceeded 1 MiB"));
+                if result.content.len() > output_limit {
+                    return Err(AgentError::bad_gateway("Generation output exceeded its byte limit"));
                 }
             }
             SessionEvent::ToolCall { .. } | SessionEvent::Permission { .. } => {
@@ -131,6 +141,9 @@ pub(super) async fn complete(
                 }
                 if !result_text.is_empty() {
                     result.content = result_text;
+                }
+                if result.content.len() > output_limit {
+                    return Err(AgentError::bad_gateway("Generation output exceeded its byte limit"));
                 }
                 if let Some(max) = request.max_tokens() {
                     // Native CLIs do not expose a common exact token cap. Enforce

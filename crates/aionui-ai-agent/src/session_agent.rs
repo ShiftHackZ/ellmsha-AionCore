@@ -324,6 +324,8 @@ fn session_content_blocks_to_json(content: &[ContentBlock]) -> Vec<serde_json::V
 
 /// One claude/codex session, presented as an `IAgentTask`.
 pub struct SessionAgentTask {
+    /// Frozen V2 route. Unlike picker state, this never consults a prior catalog preload.
+    routed_model: std::sync::OnceLock<String>,
     generation: std::sync::Mutex<Option<crate::generation::GenerationTarget>>,
     agent_type: AgentType,
     conversation_id: String,
@@ -357,7 +359,38 @@ pub struct SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    pub(crate) async fn require_routed_model(&self, model: String) -> Result<(), AgentError> {
+        let result = if let Err(model) = self.routed_model.set(model)
+            && self.routed_model.get() != Some(&model)
+        {
+            Err(AgentError::bad_request(crate::routing::guard::PIN_ERROR))
+        } else {
+            self.validate_routed_model()
+        };
+        // Called before a newly built task becomes visible. Do not leave its
+        // opened process running when the adapter reports a conflicting model.
+        if result.is_err() {
+            self.backend.terminate().await;
+        }
+        result
+    }
+
+    fn validate_routed_model(&self) -> Result<(), AgentError> {
+        if let Some(expected) = self.routed_model.get() {
+            // The live adapter may only have the configured seed at startup. This
+            // detects known drift; it is not proof of the provider's actual model.
+            let observed = self.backend.capabilities().current_model;
+            if observed.as_ref().is_some_and(|m| m != expected)
+                || self.runtime.model_override().as_ref().is_some_and(|m| m != expected)
+            {
+                return Err(AgentError::bad_request(crate::routing::guard::PIN_ERROR));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn generation_target(&self) -> Result<crate::generation::GenerationTarget, AgentError> {
+        self.validate_routed_model()?;
         let mut target = self
             .generation
             .lock()
@@ -365,8 +398,12 @@ impl SessionAgentTask {
             .and_then(|value| value.clone())
             .ok_or_else(|| AgentError::bad_request("This session does not support memory generation"))?;
         if let crate::generation::GenerationTarget::Cli { config, .. } = &mut target {
-            let (_, current, _, _) = self.effective_catalog();
-            config.model = self.runtime.model_override().or(current).or(config.model.clone());
+            if let Some(model) = self.routed_model.get() {
+                config.model = Some(model.clone());
+            } else {
+                let (_, current, _, _) = self.effective_catalog();
+                config.model = self.runtime.model_override().or(current).or(config.model.clone());
+            }
         }
         Ok(target)
     }
@@ -469,6 +506,7 @@ impl SessionAgentTask {
             broadcaster,
         );
         Arc::new(Self {
+            routed_model: std::sync::OnceLock::new(),
             generation: std::sync::Mutex::new(None),
             agent_type,
             conversation_id,
@@ -823,6 +861,10 @@ impl SessionAgentTask {
         option_id: &str,
         value: &str,
     ) -> Result<aionui_api_types::SetConfigOptionResponse, AgentError> {
+        if option_id == "model" && self.routed_model.get().is_some_and(|model| model != value) {
+            return Err(AgentError::bad_request(crate::routing::guard::PIN_ERROR));
+        }
+        self.validate_routed_model()?;
         // Validate a runtime mode/model switch against the advertised catalog BEFORE
         // dispatch — the ACP `clear_invalid_desired_*` semantic, but as REJECT+report
         // (not silent-drop) since this is an explicit user action at the single runtime
@@ -1047,6 +1089,7 @@ impl IAgentTask for SessionAgentTask {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.validate_routed_model().map_err(AgentSendError::from_agent_error)?;
         self.runtime.touch();
         let mut content: Vec<ContentBlock> = Vec::new();
         if !data.content.is_empty() {
@@ -1219,6 +1262,8 @@ pub struct SessionBuildInputs<'a> {
     pub managed_skill_roots: &'a [String],
     /// The conversation's persisted build `extra` (mode/model/mcp/preset/skills).
     pub config: &'a AcpBuildExtra,
+    /// Exact V2 route model; ordinary and V1 sessions leave this unset.
+    pub required_model: Option<String>,
     /// The resolved catalog row. Used to normalize the persisted/requested mode
     /// alias (`yolo`/`yoloNoSandbox` → the row's `yolo_id`; codex `default`/`autoEdit`
     /// → `auto`) into the backend-native mode id, exactly as the ACP path does via
@@ -1411,6 +1456,7 @@ pub async fn build_antigravity_instance(
         workspace,
         managed_skill_roots: _,
         config,
+        required_model: _,
         metadata,
         session_snapshot,
         backend_session_id,
@@ -1535,6 +1581,7 @@ pub async fn build_session_instance(
         workspace,
         managed_skill_roots,
         config,
+        required_model,
         metadata,
         session_snapshot,
         backend_session_id,
@@ -1604,6 +1651,7 @@ pub async fn build_session_instance(
             }),
         cwd: Some(workspace.clone()),
         model,
+        required_model,
         mode,
         init,
         cli_program,
@@ -1807,7 +1855,7 @@ pub async fn build_session_instance(
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
-fn resolve_session_cli_program(
+pub(crate) fn resolve_session_cli_program(
     backend_label: &str,
     metadata: &aionui_api_types::AgentMetadata,
 ) -> Result<Option<std::path::PathBuf>, aionui_runtime::CliRuntimeError> {
@@ -4367,6 +4415,10 @@ fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
     }
     if buf.is_empty() { None } else { Some(buf) }
 }
+
+#[cfg(test)]
+#[path = "session_router_pin_test.rs"]
+mod router_pin_tests;
 
 #[cfg(test)]
 mod build_mapping_tests {

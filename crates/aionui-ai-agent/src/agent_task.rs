@@ -591,6 +591,7 @@ mod aionrs_config_option_tests {
 
     fn make_test_config() -> AionrsResolvedConfig {
         AionrsResolvedConfig {
+            host_delegation: false,
             mcp_approval_bindings: Default::default(),
             mcp_approval_store: None,
             tool_scope: Default::default(),

@@ -14,8 +14,9 @@ use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
     AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CustomAgentUpsertRequest,
-    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
-    SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
+    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, RouterCatalogRequest,
+    RouterCatalogResponse, SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest,
+    TryConnectCustomAgentResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -27,6 +28,7 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
         .route("/api/agents/logos", get(list_agent_logos))
         .route("/api/agents/management", get(list_management_agents))
+        .route("/api/agents/router/catalog", post(router_catalog))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
         .route("/api/agents/provider-health-check", post(provider_health_check))
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
@@ -38,6 +40,30 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
         .with_state(state)
+}
+
+/// Authenticated read-only catalog projection. The surrounding API middleware
+/// applies the existing POST CSRF policy; user scope comes only from CurrentUser.
+async fn router_catalog(
+    State(state): State<AgentRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RouterCatalogRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<RouterCatalogResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let config = match req.config {
+        Some(config) => config,
+        None => state
+            .router
+            .settings(&user.id)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    };
+    let entries = state
+        .router
+        .catalog(&user.id, &config)
+        .await
+        .map_err(agent_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(RouterCatalogResponse { entries })))
 }
 
 async fn list_agent_logos(

@@ -327,6 +327,7 @@ pub async fn build_module_states(
         agent: build_module_state_phase(&boot, "agent", || AgentRouterState {
             agent_registry: services.agent_registry.clone(),
             service: agent_service,
+            router: services.router_service.clone(),
         }),
         connection_test: build_module_state_phase(&boot, "connection_test", build_connection_test_state),
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
@@ -428,6 +429,17 @@ struct RouterSettingsValidator(aionui_ai_agent::routing::RouterService);
 
 #[async_trait::async_trait]
 impl aionui_system::client_pref::RouterConfigValidator for RouterSettingsValidator {
+    async fn validate_draft(
+        &self,
+        user_id: &str,
+        config: &aionui_api_types::RouterConfig,
+    ) -> Result<(), aionui_system::SystemError> {
+        self.0.validate_draft_configuration(user_id, config).await.map_err(|_| {
+            aionui_system::SystemError::BadRequest(
+                "Router configuration references an unknown or unowned target".into(),
+            )
+        })
+    }
     async fn validate(
         &self,
         user_id: &str,

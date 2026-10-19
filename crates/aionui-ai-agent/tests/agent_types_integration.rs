@@ -90,6 +90,7 @@ impl IMockAgent for TypedMockAgent {}
 
 fn make_aionrs_config() -> AionrsResolvedConfig {
     AionrsResolvedConfig {
+        host_delegation: false,
         tool_scope: Default::default(),
         mcp_approval_store: None,
         mcp_approval_bindings: Default::default(),

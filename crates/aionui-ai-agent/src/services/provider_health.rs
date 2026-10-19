@@ -88,6 +88,7 @@ impl ProviderHealthCheckService {
         };
 
         Ok(AionrsResolvedConfig {
+            host_delegation: false,
             mcp_approval_bindings: Default::default(),
             mcp_approval_store: None,
             tool_scope: Default::default(),

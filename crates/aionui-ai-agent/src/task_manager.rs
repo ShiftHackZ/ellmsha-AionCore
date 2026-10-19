@@ -82,6 +82,7 @@ pub trait IWorkerTaskManager: Send + Sync {
 struct ManagedAgentTask {
     agent: AgentInstance,
     runtime_capabilities: RuntimeCapabilities,
+    frozen_target: Option<aionui_api_types::RouterTarget>,
 }
 
 /// Per-conversation slot: an [`OnceCell`] that the first concurrent caller
@@ -140,8 +141,14 @@ impl WorkerTaskManagerImpl {
         };
         // Helper scope for every conversation; team scopes only when team-bound.
         let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        let host_router = options.context.team.is_none()
+            && !options.context.is_session_only()
+            && options.routing.as_ref().is_some_and(|r| r.config.schema_version == 2);
         if options.context.team.is_some() {
             scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
+        }
+        if host_router {
+            scopes.push(RuntimeTokenScope::RouterCall);
         }
         let issue = service.issue(
             options.context.conversation.user_id.clone(),
@@ -156,7 +163,22 @@ impl WorkerTaskManagerImpl {
         options
             .context
             .runtime_env
-            .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), issue.token));
+            .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), issue.token.clone()));
+        if host_router {
+            let servers = match &mut options.context.kind {
+                crate::session_context::AgentSessionKind::Aionrs(ctx) => &mut ctx.config.session_mcp_servers,
+                crate::session_context::AgentSessionKind::Acp(ctx) => &mut ctx.config.session_mcp_servers,
+                crate::session_context::AgentSessionKind::Antigravity(ctx) => &mut ctx.config.session_mcp_servers,
+            };
+            for server in servers
+                .iter_mut()
+                .filter(|s| s.id == "ellmsha-router" && s.name == "ellmsha-router")
+            {
+                if let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &mut server.transport {
+                    env.insert(AIONUI_RUNTIME_TOKEN_ENV.into(), issue.token.clone());
+                }
+            }
+        }
     }
 }
 
@@ -171,6 +193,12 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         mut options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        let frozen_target = crate::routing::guard::frozen_target(&options)?.cloned();
+        if let Some(existing) = self.initialised_managed_task(conversation_id)
+            && existing.frozen_target != frozen_target
+        {
+            return Err(AgentError::bad_request(crate::routing::guard::PIN_ERROR));
+        }
         if let Some(existing) = self.initialised_managed_task(conversation_id)
             && !existing.runtime_capabilities.satisfies(&options.runtime_capabilities)
         {
@@ -198,26 +226,37 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
         let runtime_capabilities = options.runtime_capabilities.clone();
-        crate::capability::tencent_memory::register_session(
-            options.context.conversation_id(),
-            options.memory_recall.clone(),
-        );
         let registered_conversation_id = options.context.conversation_id().to_owned();
+        let memory_scope = options.memory_recall.clone();
+        let build_conversation_id = registered_conversation_id.clone();
+        let build_target = frozen_target.clone();
         let managed = slot
             .get_or_try_init(|| async move {
+                crate::capability::tencent_memory::register_session(
+                    &build_conversation_id,
+                    options.memory_recall.clone(),
+                );
                 let agent = match factory(options).await {
                     Ok(agent) => agent,
                     Err(error) => {
-                        crate::capability::tencent_memory::unregister_session(&registered_conversation_id);
+                        crate::capability::tencent_memory::unregister_session(&build_conversation_id);
                         return Err(error);
                     }
                 };
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
                     runtime_capabilities,
+                    frozen_target: build_target,
                 })
             })
             .await?;
+        // Concurrent callers may have waited on another caller's factory.
+        if managed.frozen_target != frozen_target {
+            return Err(AgentError::bad_request(crate::routing::guard::PIN_ERROR));
+        }
+        // Matching cached requests retain ordinary per-turn recall refresh. A
+        // rejected waiter must never replace the winning task's memory scope.
+        crate::capability::tencent_memory::register_session(&registered_conversation_id, memory_scope);
         Ok(managed.agent.clone())
     }
 
@@ -534,7 +573,191 @@ mod tests {
         ManagedAgentTask {
             agent,
             runtime_capabilities: RuntimeCapabilities::default(),
+            frozen_target: None,
         }
+    }
+
+    fn routed_options() -> BuildTaskOptions {
+        let mut options = make_options("routed");
+        if let AgentSessionKind::Acp(context) = &mut options.context.kind {
+            context.config.agent_id = Some("agent".into());
+            context.config.current_model_id = Some("frozen".into());
+        }
+        options.routing = Some(aionui_api_types::RouterSnapshot {
+            config: aionui_api_types::RouterConfig {
+                schema_version: 2,
+                ..Default::default()
+            },
+            decision: aionui_api_types::RouterDecision {
+                id: "decision".into(),
+                target: aionui_api_types::RouterTarget::Agent {
+                    agent_id: "agent".into(),
+                    model: "frozen".into(),
+                },
+                requirements: Default::default(),
+                reasons: vec![],
+                evidence_count: 0,
+                elapsed_ms: 0,
+                managed_children: true,
+                scope_workspace: "/tmp/test".into(),
+            },
+        });
+        options
+    }
+
+    #[tokio::test]
+    async fn routed_target_rejects_drift_before_factory_and_cached_reuse() {
+        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = builds.clone();
+        let manager = WorkerTaskManagerImpl::new(Arc::new(move |options| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(mock_instance(MockAgent::new(options.conversation_id(), None))) }.boxed()
+        }));
+        let mut changed = routed_options();
+        if let AgentSessionKind::Acp(context) = &mut changed.context.kind {
+            context.config.current_model_id = Some("changed".into());
+        }
+        assert!(matches!(manager.get_or_build_task("routed", changed.clone()).await,
+            Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR));
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        manager.get_or_build_task("routed", routed_options()).await.unwrap();
+        assert!(matches!(manager.get_or_build_task("routed", changed).await,
+            Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR));
+        let mut rewritten = routed_options();
+        rewritten.routing.as_mut().unwrap().decision.target = aionui_api_types::RouterTarget::Agent {
+            agent_id: "agent".into(),
+            model: "changed".into(),
+        };
+        if let AgentSessionKind::Acp(context) = &mut rewritten.context.kind {
+            context.config.current_model_id = Some("changed".into());
+        }
+        assert!(matches!(manager.get_or_build_task("routed", rewritten).await,
+            Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR));
+        let mut removed = routed_options();
+        removed.routing = None;
+        assert!(matches!(manager.get_or_build_task("routed", removed).await,
+            Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR));
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn routed_target_validates_resume_account_effective_model_and_typed_runtime() {
+        use crate::routing::guard::frozen_target;
+        let mut options = routed_options();
+        if let AgentSessionKind::Acp(context) = &mut options.context.kind {
+            context.session_snapshot = Some(crate::shared_kernel::PersistedSessionState {
+                current_model_id: Some(crate::shared_kernel::ModelId::new("other")),
+                ..Default::default()
+            });
+        }
+        assert!(
+            matches!(frozen_target(&options), Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR)
+        );
+        options.routing.as_mut().unwrap().config.schema_version = 1;
+        assert_eq!(
+            frozen_target(&options).unwrap(),
+            None,
+            "legacy snapshot semantics unchanged"
+        );
+        options.routing.as_mut().unwrap().config.schema_version = 2;
+        if let AgentSessionKind::Acp(context) = &mut options.context.kind {
+            context.belongs_to_team = true;
+        }
+        assert_eq!(
+            frozen_target(&options).unwrap(),
+            None,
+            "Teams retain their existing path"
+        );
+        let mut options = routed_options();
+        options.routing.as_mut().unwrap().decision.target = aionui_api_types::RouterTarget::Provider {
+            provider_id: "p1".into(),
+            model: "frozen".into(),
+        };
+        assert!(
+            frozen_target(&options).is_err(),
+            "provider target cannot execute through ACP"
+        );
+        options.context.conversation.agent_type = AgentType::Aionrs;
+        options.context.kind = AgentSessionKind::Aionrs(Box::new(crate::session_context::AionrsSessionBuildContext {
+            config: Default::default(),
+            team: None,
+            belongs_to_team: false,
+        }));
+        options.context.model.use_model = Some("frozen".into());
+        assert!(
+            frozen_target(&options).unwrap().is_some(),
+            "effective model takes precedence"
+        );
+        options.context.model.provider_id = "other-account".into();
+        assert!(frozen_target(&options).is_err());
+        options.context.model.provider_id = "p1".into();
+        options.context.model.use_model = Some("other-model".into());
+        assert!(frozen_target(&options).is_err());
+        assert!(
+            crate::routing::guard::validate_agent_identity(
+                Some(&aionui_api_types::RouterTarget::Agent {
+                    agent_id: "pinned-agent".into(),
+                    model: "frozen".into(),
+                }),
+                "different-catalog-row"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_target_rejected_pending_waiter_cannot_replace_memory_scope() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_factory = entered.clone();
+        let release_factory = release.clone();
+        let manager = Arc::new(WorkerTaskManagerImpl::new(Arc::new(move |options| {
+            let entered = entered_factory.clone();
+            let release = release_factory.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(mock_instance(MockAgent::new(options.conversation_id(), None)))
+            }
+            .boxed()
+        })));
+        let mut winner = routed_options();
+        winner.context.conversation.conversation_id = "routed-pending-memory".into();
+        winner.memory_recall.workspace = "/tmp/winner".into();
+        let mut foreign = winner.clone();
+        foreign.memory_recall.workspace = "/tmp/rejected".into();
+        foreign.routing.as_mut().unwrap().decision.target = aionui_api_types::RouterTarget::Agent {
+            agent_id: "agent".into(),
+            model: "different".into(),
+        };
+        if let AgentSessionKind::Acp(context) = &mut foreign.context.kind {
+            context.config.current_model_id = Some("different".into());
+        }
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move { first_manager.get_or_build_task("routed-pending-memory", winner).await });
+        entered.notified().await;
+        let second_manager = manager.clone();
+        let mut second =
+            tokio::spawn(async move { second_manager.get_or_build_task("routed-pending-memory", foreign).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut second)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::capability::tencent_memory::registered_workspace("routed-pending-memory").as_deref(),
+            Some("/tmp/winner")
+        );
+        release.notify_one();
+        first.await.unwrap().unwrap();
+        assert!(
+            matches!(second.await.unwrap(), Err(AgentError::BadRequest(reason)) if reason == crate::routing::guard::PIN_ERROR)
+        );
+        assert_eq!(
+            crate::capability::tencent_memory::registered_workspace("routed-pending-memory").as_deref(),
+            Some("/tmp/winner")
+        );
+        manager.kill("routed-pending-memory", None).unwrap();
     }
 
     fn make_manager() -> WorkerTaskManagerImpl {
@@ -699,6 +922,81 @@ mod tests {
                 TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             )
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn router_capability_rebuild_refreshes_reserved_mcp_token_and_keeps_scope() {
+        let tokens = Arc::new(RuntimeTokenService::new());
+        let old = tokens.issue("user-1", "conv-1", "default", [RuntimeTokenScope::RouterCall]);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory: AgentFactory = Arc::new({
+            let observed = observed.clone();
+            move |opts: BuildTaskOptions| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push(opts.clone());
+                    Ok(mock_instance(MockAgent::new(opts.conversation_id(), None)))
+                }
+                .boxed()
+            }
+        });
+        let mgr = WorkerTaskManagerImpl::new(factory).with_runtime_token_service(tokens.clone());
+        let mut opts = routed_options();
+        opts.context.conversation.conversation_id = "conv-1".into();
+        mgr.get_or_build_task("conv-1", opts.clone()).await.unwrap();
+        opts.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+        if let AgentSessionKind::Acp(ctx) = &mut opts.context.kind {
+            ctx.config.session_mcp_servers.push(aionui_api_types::SessionMcpServer {
+                id: "ellmsha-router".into(),
+                name: "ellmsha-router".into(),
+                transport: aionui_api_types::SessionMcpTransport::Stdio {
+                    command: "helper".into(),
+                    args: vec!["mcp-router-stdio".into()],
+                    env: std::collections::HashMap::from([(AIONUI_RUNTIME_TOKEN_ENV.into(), old.token.clone())]),
+                },
+                auto_approve_in_unattended: false,
+                approval_identity: None,
+            });
+        }
+        mgr.get_or_build_task("conv-1", opts).await.unwrap();
+        let observed = observed.lock().unwrap();
+        let rebuilt = &observed[1];
+        let token = &rebuilt
+            .context
+            .runtime_env
+            .iter()
+            .find(|(k, _)| k == AIONUI_RUNTIME_TOKEN_ENV)
+            .unwrap()
+            .1;
+        assert_ne!(token, &old.token);
+        tokens
+            .validate(
+                Some(token),
+                "user-1",
+                "conv-1",
+                RuntimeTokenScope::RouterCall,
+                "default",
+            )
+            .unwrap();
+        assert!(
+            tokens
+                .validate(
+                    Some(&old.token),
+                    "user-1",
+                    "conv-1",
+                    RuntimeTokenScope::RouterCall,
+                    "default"
+                )
+                .is_err()
+        );
+        let AgentSessionKind::Acp(ctx) = &rebuilt.context.kind else {
+            panic!("ACP fixture")
+        };
+        let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &ctx.config.session_mcp_servers[0].transport
+        else {
+            panic!("stdio")
+        };
+        assert_eq!(env[AIONUI_RUNTIME_TOKEN_ENV], *token);
     }
 
     #[tokio::test]

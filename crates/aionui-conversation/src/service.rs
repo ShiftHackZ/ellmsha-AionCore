@@ -1,3 +1,5 @@
+#[path = "router_children.rs"]
+mod router_children;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -330,6 +332,7 @@ pub struct ConversationService {
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
     router: Option<Arc<aionui_ai_agent::routing::RouterService>>,
+    router_children: Arc<router_children::RouterChildren>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -414,6 +417,7 @@ impl ConversationService {
             runtime_base_url: None,
             runtime_token_service: None,
             router: None,
+            router_children: Arc::default(),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -979,6 +983,8 @@ impl ConversationService {
         turn_id: &str,
         was_deleting: bool,
     ) {
+        self.close_router_children(user_id, conversation_id, Some(turn_id))
+            .await;
         if was_deleting {
             debug!(
                 conversation_id,
@@ -1077,9 +1083,15 @@ impl ConversationService {
     pub async fn create(
         &self,
         user_id: &str,
-        req: CreateConversationRequest,
+        mut req: CreateConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
-        self.create_inner(user_id, req, None, false, false, None).await
+        if let Some(config) = req.routing.as_mut().and_then(|r| r.config.as_mut()) {
+            config.validate().map_err(ConversationError::bad_request)?;
+            if config.schema_version == 1 {
+                config.schema_version = 2;
+            }
+        }
+        self.create_inner(user_id, req, None, false, false, None, None).await
     }
 
     /// Trusted host Team seam. Inherit the caller's frozen policy; no client decision is accepted.
@@ -1114,9 +1126,11 @@ impl ConversationService {
                 has_images: false,
             });
         }
-        self.create_inner(user, req, config, parent.is_some(), true, task).await
+        self.create_inner(user, req, config, parent.is_some(), true, task, None)
+            .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_inner(
         &self,
         user_id: &str,
@@ -1125,15 +1139,29 @@ impl ConversationService {
         route_child: bool,
         host_team: bool,
         team_initial_task: Option<&str>,
+        inherited: Option<(AssistantSnapshot, aionui_api_types::RouterChildMetadata)>,
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
         let tool_scope = req.tool_scope;
+        let (inherited_assistant, child_metadata) = match inherited {
+            Some((assistant, metadata)) => (Some(assistant), Some(metadata)),
+            None => (None, None),
+        };
         let mut extra = req.extra;
+        if extra.get("router_child").is_some() || extra.get("subagent").is_some() {
+            return Err(ConversationError::bad_request("Child lineage is server-owned"));
+        }
         if extra.get("routing").is_some() {
             return Err(ConversationError::bad_request("Routing decisions are server-owned"));
+        }
+        let host_child = child_metadata.is_some();
+        if let Some(metadata) = child_metadata {
+            extra["subagent"] = serde_json::json!({"parent_conversation_id":metadata.parent_conversation_id,"ref":metadata.task_id,"label":req.name,"status":"pending_init"});
+            extra["router_child"] =
+                serde_json::to_value(metadata).map_err(|_| ConversationError::internal("Invalid child lineage"))?;
         }
         let mut routing_request = req.routing.take();
         if extra.get("tool_scope").is_some() {
@@ -1177,12 +1205,22 @@ impl ConversationService {
             .and_then(|assistant| assistant.conversation_overrides)
             .map(AssistantConversationOverrides::from)
             .unwrap_or_default();
-        let mut assistant_snapshot = match assistant_id.as_deref() {
-            Some(id) => {
-                self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+        let mut assistant_snapshot = if inherited_assistant.is_some() {
+            inherited_assistant
+        } else {
+            match assistant_id.as_deref() {
+                Some(id) => {
+                    self.resolve_assistant_snapshot(
+                        user_id,
+                        id,
+                        assistant_locale.as_deref(),
+                        &assistant_overrides,
+                        &extra,
+                    )
                     .await?
+                }
+                None => None,
             }
-            None => None,
         };
         let is_router = assistant_snapshot
             .as_ref()
@@ -1275,7 +1313,12 @@ impl ConversationService {
                     .map(str::to_owned)
             });
             let original_full_auto = snapshot.agent_type.full_auto_mode_id(Some(&snapshot.runtime_backend));
-            let permission = if host_team && requested_permission.as_deref() == Some(original_full_auto) {
+            let permission = if host_child {
+                Some(router_children::inherited_permission(
+                    requested_permission.as_deref().unwrap_or(""),
+                    &backend,
+                )?)
+            } else if host_team && requested_permission.as_deref() == Some(original_full_auto) {
                 Some("yolo")
             } else {
                 requested_permission.as_deref()
@@ -2612,6 +2655,20 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
         let old_extra: serde_json::Value = serde_json::from_str(&existing.extra).unwrap_or_default();
+        if (old_extra.get("routing").is_some() || old_extra.get("router_child").is_some())
+            && req.extra.as_ref().is_some_and(|v| !v.is_object())
+        {
+            return Err(ConversationError::bad_request(
+                "Router conversation extra must remain an object",
+            ));
+        }
+        if req
+            .extra
+            .as_ref()
+            .is_some_and(|v| v.get("router_child").is_some() || v.get("subagent").is_some())
+        {
+            return Err(ConversationError::bad_request("Child lineage is server-owned"));
+        }
         if req.extra.as_ref().is_some_and(|v| v.get("routing").is_some())
             || (old_extra.get("routing").is_some()
                 && (req.model.is_some()
@@ -2623,6 +2680,17 @@ impl ConversationService {
         {
             return Err(ConversationError::bad_request(
                 "Router decisions and execution target are pinned; start a new chat to change them",
+            ));
+        }
+        if (old_extra.get("router_child").is_some()
+            || old_extra
+                .pointer("/routing/config/schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(2))
+            && req.extra.as_ref().is_some_and(|v| v.get("workspace").is_some())
+        {
+            return Err(ConversationError::bad_request(
+                "Router workspace is pinned; start a new chat to change it",
             ));
         }
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
@@ -2891,6 +2959,16 @@ impl ConversationService {
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
         let mut auto_workspace_to_delete = auto_provisioned_workspace_to_delete(&self.workspace_root, &existing, id);
+        if let Some(turn) = self.runtime_state.active_turn_id_for(id) {
+            self.mark_router_child_cancelled(user_id, id, &turn);
+        }
+        self.mark_router_parent_deleting(id);
+        self.close_router_children(user_id, id, None).await;
+        if let Err(error) = self.delete_router_child_rows(user_id, id).await {
+            self.clear_router_parent_deleting(id);
+            return Err(error);
+        }
+
         // Shared-workspace guard: a forked conversation inherits the parent's
         // auto workspace verbatim (claude keys on-disk sessions by cwd), so
         // deleting the parent must not rip the directory out from under the
@@ -2931,6 +3009,7 @@ impl ConversationService {
 
         if let Err(err) = self.conversation_repo.delete(user_id, id).await {
             self.runtime_state.clear_deleting(id);
+            self.clear_router_parent_deleting(id);
             return Err(err.into());
         }
         if !had_active_turn {
@@ -3127,6 +3206,10 @@ impl ConversationService {
             // A fork remints message IDs; reconstruct its brief from its own
             // user messages instead of carrying invalid parent references.
             obj.remove("task_context");
+            // A user-created fork is independent; it must not duplicate a host task's authority or deletion lineage.
+            if obj.remove("router_child").is_some() {
+                obj.remove("subagent");
+            }
             obj.insert(
                 "fork".to_owned(),
                 serde_json::to_value(aionui_api_types::ForkSpec {
@@ -3312,6 +3395,10 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        if let Some(turn) = self.runtime_state.active_turn_id_for(id) {
+            self.mark_router_child_cancelled(user_id, id, &turn);
+        }
+        self.close_router_children(user_id, id, None).await;
         // Delete all messages
         self.conversation_repo
             .delete_messages_by_conversation(user_id, id)
@@ -3886,6 +3973,7 @@ impl ConversationService {
         };
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
@@ -4010,6 +4098,7 @@ impl ConversationService {
 
         self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
@@ -4155,6 +4244,9 @@ impl ConversationService {
             });
         }
 
+        self.mark_router_child_cancelled(user_id, conversation_id, turn_id);
+        self.close_router_children(user_id, conversation_id, Some(turn_id))
+            .await;
         let Some(agent) = task_manager.get_task(conversation_id) else {
             // The turn IS live — its id matched above — but its agent has not
             // registered yet, because building one runs real work first (an
@@ -4342,6 +4434,7 @@ impl ConversationService {
         let mut build_opts = self.build_task_options(&row).await?;
         self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
@@ -4668,6 +4761,14 @@ impl ConversationService {
         // CLI (`aioncore config` / `diagnose`) can authenticate in AionPro
         // mode; team-bound conversations additionally get the team-tools scopes.
         let mut scopes = vec![RuntimeTokenScope::ConversationHelper];
+        if build_opts.context.team.is_none()
+            && build_opts
+                .routing
+                .as_ref()
+                .is_some_and(|r| r.config.schema_version == 2)
+        {
+            scopes.push(RuntimeTokenScope::RouterCall);
+        }
         if build_opts.context.team.is_some() {
             scopes.extend([RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall]);
         }

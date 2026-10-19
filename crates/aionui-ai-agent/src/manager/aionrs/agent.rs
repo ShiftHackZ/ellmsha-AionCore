@@ -263,12 +263,13 @@ impl AionrsAgentManager {
         let confirmations = Arc::new(RwLock::new(Vec::new()));
         let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone())
             .with_approval_manager(approval_manager.clone());
-        if child_router.is_some() {
+        if child_router.is_some() || config_extra.host_delegation {
             // The live shared manager owns mode changes; a startup yolo flag
             // must not permanently bypass later default-mode approvals.
             config.tools.auto_approve = false;
         }
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .host_delegation(config_extra.host_delegation)
             .runtime_env(runtime_env)
             .host_approval(approval_manager.clone(), Arc::new(protocol_sink));
         if let Some(router) = child_router {

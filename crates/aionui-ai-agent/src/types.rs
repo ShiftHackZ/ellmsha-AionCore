@@ -158,6 +158,8 @@ pub struct AionrsCompatOverrides {
 /// Fully resolved Aionrs configuration passed to the agent manager.
 #[derive(Debug, Clone)]
 pub struct AionrsResolvedConfig {
+    /// V2 host tools own delegation; retain model pinning and live approvals.
+    pub host_delegation: bool,
     /// Host-owned exact MCP grants; absent for probes and isolated test chats.
     pub mcp_approval_bindings: std::collections::HashMap<String, String>,
     pub mcp_approval_store: Option<aionui_common::mcp_approvals::McpApprovalStore>,

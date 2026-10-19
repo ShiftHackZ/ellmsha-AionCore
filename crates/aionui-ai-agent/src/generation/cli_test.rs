@@ -54,6 +54,51 @@ fn generation_cli_projects_external_tool_calls_and_rejects_unknown_functions() {
     assert!(project_tool_response(&mut result, &request()).is_err());
 }
 
+#[test]
+fn classifier_cli_preserves_selected_auth_source_but_drops_execution_context() {
+    let mut source = SessionConfig {
+        cli_program: Some("/configured/claude".into()),
+        spawn_env: vec![
+            EnvVar {
+                name: "ANTHROPIC_BASE_URL".into(),
+                value: "https://configured.example".into(),
+            },
+            EnvVar {
+                name: "ANTHROPIC_AUTH_TOKEN".into(),
+                value: "private-fixture".into(),
+            },
+            EnvVar {
+                name: "AIONUI_RUNTIME_TOKEN".into(),
+                value: "never-inherit".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    source.init.resume = true;
+    source.extra_args = vec!["--dangerously-skip-permissions".into()];
+    let request:GenerationRequest=serde_json::from_value(json!({"model":"configured-model","messages":[{"role":"user","content":"Classify"}],"tool_choice":"none","max_tokens":128,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","required":["class_id"],"properties":{"class_id":{"type":["string","null"]}},"additionalProperties":false}}}})).unwrap();
+    let isolated = isolated_config(&source, Path::new("/tmp/classifier-fixture"), &request);
+    assert_eq!(isolated.cli_program, source.cli_program);
+    assert_eq!(isolated.model.as_deref(), Some("configured-model"));
+    assert_eq!(isolated.spawn_env.len(), 2);
+    assert!(
+        isolated
+            .spawn_env
+            .iter()
+            .all(|entry| !entry.name.starts_with("AIONUI_"))
+    );
+    assert!(isolated.init.mcp_servers.is_empty());
+    assert!(isolated.init.skills.is_empty());
+    assert!(!isolated.init.resume);
+    assert!(isolated.extra_args.is_empty());
+    assert!(isolated.generation_only);
+    assert_eq!(isolated.approval_policy.as_deref(), Some("never"));
+    assert_eq!(
+        isolated.generation_response_schema.unwrap()["required"],
+        json!(["class_id"])
+    );
+}
+
 /// Opt-in acceptance probe: uses the installed authenticated Codex CLI and
 /// does real text generation in an isolated ephemeral session.
 #[tokio::test]

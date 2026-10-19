@@ -187,16 +187,20 @@ pub(super) async fn build(
         }
     };
 
+    let host_delegation =
+        routing.as_ref().is_some_and(|r| r.config.schema_version == 2) && !isolated && !build_context.belongs_to_team;
     let child_router = match (routing, deps.router.as_ref()) {
-        (Some(snapshot), Some(service)) => Some(Arc::new(crate::routing::RoutedChildren {
+        (Some(snapshot), Some(service)) if !host_delegation => Some(Arc::new(crate::routing::RoutedChildren {
             service: service.clone(),
             user_id: ctx.user_id.clone(),
             config: snapshot.config,
             scope: routing_scope,
-        }) as Arc<dyn aion_agent::spawner::ChildRouter>),
+        })
+            as Arc<dyn aion_agent::spawner::ChildRouter>),
         _ => None,
     };
     let config = AionrsResolvedConfig {
+        host_delegation,
         mcp_approval_bindings,
         mcp_approval_store: (!isolated)
             .then(|| aionui_common::mcp_approvals::McpApprovalStore::new(&deps.data_dir, &ctx.user_id)),

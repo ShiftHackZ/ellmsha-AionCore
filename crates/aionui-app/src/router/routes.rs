@@ -419,6 +419,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(super::runtime_router_tools::runtime_router_tools_routes(
+        super::runtime_router_tools::RuntimeRouterToolsState {
+            conversation: services.conversation_service.clone(),
+            tokens: services.runtime_token_service.clone(),
+        },
+    ))
     .merge(super::memory_generation::routes(
         services.generation_service.clone(),
         services.worker_task_manager.clone(),

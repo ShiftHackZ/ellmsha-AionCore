@@ -8123,11 +8123,12 @@ async fn codex_managed_skills_stay_outside_custom_workspace() {
     let managed_root = PathBuf::from(&options.context.managed_skill_roots[0]);
     assert!(managed_root.starts_with(workspace_root.join("managed-skills")));
     assert!(managed_root.join("cron").is_dir());
-    let calls = links.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_ne!(calls[0].workspace, custom_workspace);
-    assert_eq!(calls[0].rel_dirs, vec!["skills"]);
-    drop(calls);
+    {
+        let calls = links.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_ne!(calls[0].workspace, custom_workspace);
+        assert_eq!(calls[0].rel_dirs, vec!["skills"]);
+    }
 
     svc.delete("user-1", &created.id).await.unwrap();
     assert!(!managed_root.exists());
@@ -8771,4 +8772,19 @@ async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
     assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
     // Consumed exactly once.
     assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+}
+
+pub(crate) fn router_test_service() -> ConversationService {
+    make_service().0
+}
+
+#[tokio::test]
+async fn router_child_lineage_cannot_be_created_by_public_request() {
+    let service = router_test_service();
+    for field in ["router_child", "subagent"] {
+        let request: CreateConversationRequest =
+            serde_json::from_value(serde_json::json!({"extra":{field:{"parent_conversation_id":"foreign"}}})).unwrap();
+        let error = service.create("user-1", request).await.unwrap_err();
+        assert!(matches!(error,ConversationError::BadRequest {reason} if reason.contains("server-owned")));
+    }
 }

@@ -14,6 +14,10 @@ const MAX_KEY_LENGTH: usize = 255;
 #[async_trait::async_trait]
 pub trait RouterConfigValidator: Send + Sync {
     async fn validate(&self, user_id: &str, config: &aionui_api_types::RouterConfig) -> Result<(), SystemError>;
+    /// Validate references in an incomplete graph draft without requiring pins.
+    async fn validate_draft(&self, user_id: &str, config: &aionui_api_types::RouterConfig) -> Result<(), SystemError> {
+        self.validate(user_id, config).await
+    }
 }
 
 /// Business logic for client preferences (generic key-value store).
@@ -113,13 +117,24 @@ impl ClientPrefService {
         for (key, value) in req {
             validate_key(&key)?;
             if key == aionui_api_types::ROUTER_CONFIG_KEY && !value.is_null() {
-                let config: aionui_api_types::RouterConfig = serde_json::from_value(value.clone())
-                    .map_err(|_| SystemError::BadRequest("Invalid router configuration".into()))?;
-                config
-                    .validate()
-                    .map_err(|reason| SystemError::BadRequest(reason.into()))?;
-                if let Some(validator) = &self.router_config_validator {
-                    validator.validate(user_id, &config).await?;
+                if value.get("configurations").is_some() {
+                    let settings = aionui_api_types::RouterSettings::from_value(value.clone())
+                        .map_err(|_| SystemError::BadRequest("Invalid router settings".into()))?;
+                    if let Some(validator) = &self.router_config_validator {
+                        for config in settings.policies() {
+                            validator.validate_draft(user_id, config).await?;
+                        }
+                    }
+                } else {
+                    // Old clients retain their exact write/validation behavior.
+                    let config: aionui_api_types::RouterConfig = serde_json::from_value(value.clone())
+                        .map_err(|_| SystemError::BadRequest("Invalid router configuration".into()))?;
+                    config
+                        .validate()
+                        .map_err(|reason| SystemError::BadRequest(reason.into()))?;
+                    if let Some(validator) = &self.router_config_validator {
+                        validator.validate(user_id, &config).await?;
+                    }
                 }
             }
 

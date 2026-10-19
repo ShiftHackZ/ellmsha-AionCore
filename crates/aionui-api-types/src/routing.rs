@@ -1,5 +1,9 @@
 //! Credential-free Auto Router contracts. Runtime decisions are server-owned.
 use serde::{Deserialize, Serialize};
+mod children;
+mod settings;
+pub use children::*;
+pub use settings::*;
 
 pub const ROUTER_CONFIG_KEY: &str = "router.config";
 pub const ROUTER_AGENT_ID: &str = "auto-router";
@@ -24,7 +28,7 @@ impl RouterTarget {
         }
     }
 }
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouterMode {
     #[default]
@@ -60,9 +64,12 @@ pub struct RouterHint {
     #[serde(default)]
     pub local_inference: bool,
 }
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {
+    /// Missing in frozen pre-graph conversations. Never upgrade a stored snapshot.
+    #[serde(default = "legacy_version", skip_serializing_if = "is_legacy_version")]
+    pub schema_version: u8,
     #[serde(default)]
     pub mode: RouterMode,
     #[serde(default)]
@@ -77,20 +84,66 @@ pub struct RouterConfig {
     pub allowed_targets: Vec<RouterTarget>,
     #[serde(default)]
     pub hints: Vec<RouterHint>,
+    /// Child-only classification rules. Empty bypasses classification entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<RouterClass>,
+}
+fn legacy_version() -> u8 {
+    1
+}
+fn is_legacy_version(value: &u8) -> bool {
+    *value == 1
+}
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            mode: RouterMode::default(),
+            profile: RouterProfile::default(),
+            local_only: false,
+            root_target: None,
+            child_target: None,
+            classifier_target: None,
+            allowed_targets: vec![],
+            hints: vec![],
+            classes: vec![],
+        }
+    }
 }
 impl RouterConfig {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.allowed_targets.len() > 128 || self.hints.len() > 128 {
-            return Err("Router pool exceeds 128 targets");
-        }
-        for target in self
-            .allowed_targets
+    /// All persisted references, including currently inactive graph roles.
+    pub fn targets(&self) -> impl Iterator<Item = &RouterTarget> {
+        self.allowed_targets
             .iter()
             .chain(self.root_target.iter())
             .chain(self.child_target.iter())
             .chain(self.classifier_target.iter())
             .chain(self.hints.iter().filter_map(|h| h.target.as_ref()))
-        {
+            .chain(self.classes.iter().map(|c| &c.target))
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.validate_shape()?;
+        if self.mode != RouterMode::Auto && self.root_target.is_none() {
+            return Err("Semi-auto and manual routing require a root target");
+        }
+        if self.mode == RouterMode::Manual && self.child_target.is_none() {
+            return Err("Manual routing requires a child target");
+        }
+        if !self.classes.is_empty() && self.classifier_target.is_none() {
+            return Err("Custom classes require an explicit classifier target");
+        }
+        Ok(())
+    }
+    /// Validate a saved draft's shape without requiring all execution roles yet.
+    /// Execution and the active settings slot still require [`Self::validate`].
+    pub fn validate_shape(&self) -> Result<(), &'static str> {
+        if !matches!(self.schema_version, 1 | 2) || (self.schema_version == 1 && !self.classes.is_empty()) {
+            return Err("Unsupported router policy version");
+        }
+        if self.allowed_targets.len() > 128 || self.hints.len() > 128 {
+            return Err("Router pool exceeds 128 targets");
+        }
+        for target in self.targets() {
             if target.id().trim().is_empty()
                 || target.id().len() > 256
                 || target.model().trim().is_empty()
@@ -100,14 +153,32 @@ impl RouterConfig {
                 return Err("Router target requires an existing non-router account/agent and model");
             }
         }
-        if matches!(self.classifier_target, Some(RouterTarget::Agent { .. })) {
+        if self.schema_version == 1 && matches!(self.classifier_target, Some(RouterTarget::Agent { .. })) {
             return Err("Task classification requires a configured provider model");
         }
-        if self.mode != RouterMode::Auto && self.root_target.is_none() {
-            return Err("Semi-auto and manual routing require a root target");
+        if self.classes.len() > 32 {
+            return Err("Router supports at most 32 custom classes");
         }
-        if self.mode == RouterMode::Manual && self.child_target.is_none() {
-            return Err("Manual routing requires a child target");
+        let mut ids = std::collections::BTreeSet::new();
+        for class in &self.classes {
+            if class.id.is_empty()
+                || class.id.len() > 64
+                || class.id.starts_with('-')
+                || class.id.ends_with('-')
+                || !class
+                    .id
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                || !ids.insert(&class.id)
+                || class.name.trim().is_empty()
+                || class.name.len() > 80
+                || class.description.trim().is_empty()
+                || class.description.len() > 1024
+            {
+                return Err(
+                    "Custom classes require unique lowercase IDs, names up to 80 bytes and descriptions up to 1024 bytes",
+                );
+            }
         }
         for hint in &self.hints {
             if hint.target.is_none()

@@ -12,6 +12,15 @@ pub(crate) async fn complete(
     provider: Arc<dyn LlmProvider>,
     request: &GenerationRequest,
 ) -> Result<Completion, AgentError> {
+    complete_bounded(provider, request, 1024 * 1024, false).await
+}
+
+pub(super) async fn complete_bounded(
+    provider: Arc<dyn LlmProvider>,
+    request: &GenerationRequest,
+    output_limit: usize,
+    reject_tools: bool,
+) -> Result<Completion, AgentError> {
     let mut messages = Vec::new();
     let mut system = String::new();
     for message in &request.messages {
@@ -102,7 +111,15 @@ pub(crate) async fn complete(
     };
     while let Some(event) = stream.recv().await {
         match event {
-            LlmEvent::TextDelta(text) => result.content.push_str(&text),
+            LlmEvent::TextDelta(text) => {
+                if result.content.len().saturating_add(text.len()) > output_limit {
+                    return Err(AgentError::bad_gateway("Generation output exceeded its byte limit"));
+                }
+                result.content.push_str(&text);
+            }
+            LlmEvent::ToolUse { .. } if reject_tools => {
+                return Err(AgentError::bad_gateway("Stateless classifier attempted a tool call"));
+            }
             LlmEvent::ToolUse { id, name, input, .. } => result.tools.push(GenerationToolCall {
                 id,
                 r#type: "function".into(),

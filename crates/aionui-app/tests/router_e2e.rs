@@ -464,6 +464,254 @@ async fn router_settings_validate_owned_available_references_before_any_write() 
 }
 
 #[tokio::test]
+async fn graph_catalog_requires_user_csrf_and_retains_unhealthy_models_without_secrets() {
+    use common::json_with_token;
+    use serde_json::json;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "TestPass123!").await;
+    let (other, other_csrf) = setup_and_login(&mut app, &services, "other", "OtherPass123!").await;
+    let created = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/providers",
+            json!({
+                "id":"catalog-owned","platform":"ollama","name":"Owned account","base_url":"http://127.0.0.1:9",
+                "api_key":"never-public-fixture","models":["healthy","stale-unhealthy"],"enabled":true
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert!(created.status().is_success(), "{}", body_json(created).await);
+    sqlx::query("UPDATE providers SET model_health=? WHERE id='catalog-owned'")
+        .bind(json!({"stale-unhealthy":{"status":"unhealthy","last_check":1}}).to_string())
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    let uri = "/api/agents/router/catalog";
+    let mut unauth = json_with_token("POST", uri, json!({}), &token, &csrf);
+    unauth.headers_mut().remove("authorization");
+    assert_eq!(
+        app.clone().oneshot(unauth).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut no_csrf = json_with_token("POST", uri, json!({}), &token, &csrf);
+    no_csrf.headers_mut().remove("x-csrf-token");
+    assert_eq!(
+        app.clone().oneshot(no_csrf).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let response = app
+        .clone()
+        .oneshot(json_with_token("POST", uri, json!({}), &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let entries = body["data"]["entries"].as_array().unwrap();
+    let owned: Vec<_> = entries
+        .iter()
+        .filter(|e| e["target"]["provider_id"] == "catalog-owned")
+        .collect();
+    assert_eq!(owned.len(), 2);
+    assert!(
+        owned
+            .iter()
+            .any(|e| e["target"]["model"] == "healthy" && e["classifier"]["supported"] == true)
+    );
+    assert!(
+        owned
+            .iter()
+            .any(|e| e["target"]["model"] == "stale-unhealthy" && e["classifier"]["reason"] == "model_unhealthy")
+    );
+    let text = body.to_string();
+    for secret in ["never-public-fixture", "api_key", "base_url", "spawn_env"] {
+        assert!(!text.contains(secret));
+    }
+    let body = body_json(
+        app.clone()
+            .oneshot(json_with_token("POST", uri, json!({}), &other, &other_csrf))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !body["data"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["target"]["provider_id"] == "catalog-owned")
+    );
+    assert_eq!(app.clone().oneshot(json_with_token("POST",uri,json!({"config":{"hints":[{"target":{"kind":"provider","provider_id":"catalog-owned","model":"healthy"},"quality_tier":9}]}}),&token,&csrf)).await.unwrap().status(),StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn graph_preferences_roundtrip_every_slot_and_validate_inactive_rules_atomically() {
+    use aionui_api_types::*;
+    use common::json_with_token;
+    use serde_json::json;
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(tmp.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "TestPass123!").await;
+    let (other, other_csrf) = setup_and_login(&mut app, &services, "other", "OtherPass123!").await;
+    for (id, auth, anti_csrf, enabled) in [
+        ("graph-owned", &token, &csrf, true),
+        ("graph-disabled", &token, &csrf, false),
+        ("graph-foreign", &other, &other_csrf, true),
+    ] {
+        let response=app.clone().oneshot(json_with_token("POST","/api/providers",json!({"id":id,"platform":"ollama","name":id,"base_url":"http://127.0.0.1:9","api_key":"fixture","models":["model"],"enabled":enabled}),auth,anti_csrf)).await.unwrap();
+        assert!(response.status().is_success(), "{}", body_json(response).await);
+    }
+    let target = |id: &str| RouterTarget::Provider {
+        provider_id: id.into(),
+        model: "model".into(),
+    };
+    let mut settings = RouterSettings::migrate(RouterConfig {
+        mode: RouterMode::Manual,
+        root_target: Some(target("graph-owned")),
+        child_target: Some(target("graph-disabled")),
+        ..Default::default()
+    });
+    let alternate = RouterConfig {
+        schema_version: 2,
+        mode: RouterMode::Auto,
+        profile: RouterProfile::Cost,
+        classifier_target: Some(target("graph-owned")),
+        classes: vec![RouterClass {
+            id: "qa".into(),
+            name: "QA".into(),
+            description: "Tests".into(),
+            target: target("graph-disabled"),
+        }],
+        ..Default::default()
+    };
+    settings.configurations.insert(
+        RouterMode::Auto,
+        std::collections::BTreeMap::from([(RouterPreset::Cost, alternate)]),
+    );
+    settings.active_presets.insert(RouterMode::Auto, RouterPreset::Cost);
+    // Visiting Manual/Quality and returning to the active slot must retain the
+    // unfinished draft without forcing configuration of an unused mode/preset.
+    settings.configurations.get_mut(&RouterMode::Manual).unwrap().insert(
+        RouterPreset::Quality,
+        RouterConfig {
+            schema_version: 2,
+            mode: RouterMode::Manual,
+            profile: RouterProfile::Quality,
+            classes: vec![RouterClass {
+                id: "code".into(),
+                name: "Code".into(),
+                description: "Write code".into(),
+                target: target("graph-disabled"),
+            }],
+            ..Default::default()
+        },
+    );
+    let saved = serde_json::to_value(&settings).unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/settings/client",
+            json!({"router.config":saved,"theme":"dark"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{}", body_json(response).await);
+    let restored = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/settings/client", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(restored["data"]["router.config"], saved);
+    let active = services.router_service.settings("system_default_user").await.unwrap();
+    assert_eq!(active.schema_version, 2);
+    assert_eq!(active.mode, RouterMode::Manual);
+    let mut invalid = saved.clone();
+    invalid["configurations"]["auto"]["cost"]["classes"][0]["target"] =
+        serde_json::to_value(target("graph-foreign")).unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/settings/client",
+            json!({"router.config":invalid,"theme":"must-not-write"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let restored = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/settings/client", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(restored["data"]["router.config"], saved);
+    assert_eq!(restored["data"]["theme"], "dark");
+    let mut incomplete_active = settings.clone();
+    incomplete_active
+        .active_presets
+        .insert(RouterMode::Manual, RouterPreset::Quality);
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/settings/client",
+            json!({"router.config":incomplete_active, "theme":"must-not-write"}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "active incomplete draft must not replace valid settings"
+    );
+    let restored = body_json(
+        app.clone()
+            .oneshot(get_with_token("/api/settings/client", &token))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(restored["data"]["router.config"], saved);
+    assert_eq!(restored["data"]["theme"], "dark");
+    sqlx::query("UPDATE providers SET models='[]' WHERE id='graph-disabled'")
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    settings.active_mode = RouterMode::Auto;
+    let response = app
+        .clone()
+        .oneshot(json_with_token(
+            "PUT",
+            "/api/settings/client",
+            json!({"router.config":settings}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "stale assignment must remain preservable: {}",
+        body_json(response).await
+    );
+}
+
+#[tokio::test]
 async fn outcome_requires_owned_completed_response_user_csrf_and_idle_runtime() {
     use common::json_with_token;
     use serde_json::json;

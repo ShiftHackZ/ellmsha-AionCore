@@ -60,6 +60,7 @@ async fn setup() -> (
     (service, repo, db, task_manager)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert(
     repo: &Arc<SqliteConversationRepository>,
     chat: &str,

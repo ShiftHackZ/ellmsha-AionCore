@@ -123,6 +123,8 @@ pub(crate) enum Command {
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
+    /// MCP stdio server for ordinary host-managed router delegation.
+    McpRouterStdio,
     /// MCP stdio server for one verified Clockify account.
     McpClockifyStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
@@ -145,6 +147,7 @@ impl Command {
             Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
+            Self::McpRouterStdio => "mcp-router-stdio",
             Self::McpClockifyStdio => "mcp-clockify-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",

@@ -24,6 +24,12 @@ const EXACT_ID_LIMIT: usize = 32;
 const EXACT_ID_BYTES: usize = 64;
 
 static SESSION_RECALL: LazyLock<DashMap<String, SessionRecall>> = LazyLock::new(DashMap::new);
+#[cfg(test)]
+pub(crate) fn registered_workspace(conversation_id: &str) -> Option<String> {
+    SESSION_RECALL
+        .get(conversation_id)
+        .map(|entry| entry.scope.workspace.clone())
+}
 static FACT_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b[A-Z][A-Z0-9]{1,15}-\d{2,}\b").expect("valid factual identifier regex"));
 static ISSUE_URL: LazyLock<Regex> =

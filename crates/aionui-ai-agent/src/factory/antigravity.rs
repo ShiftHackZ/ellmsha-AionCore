@@ -41,6 +41,7 @@ pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AntigravitySessionBuildContext,
     ctx: FactoryContext,
+    frozen_target: Option<&aionui_api_types::RouterTarget>,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
 
@@ -48,6 +49,7 @@ pub(super) async fn build(
     // ACP factory: the frontend collapses row-scoped rows to a shared slot
     // string that downstream consumers would misread.
     let meta = crate::factory::acp::resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
+    crate::routing::guard::validate_agent_identity(frozen_target, &meta.id)?;
     if config.agent_id.is_some() || config.backend.is_none() {
         config.backend.clone_from(&meta.backend);
     }
@@ -134,6 +136,7 @@ pub(super) async fn build(
             workspace: ctx.workspace.clone(),
             managed_skill_roots: &ctx.managed_skill_roots,
             config: &config,
+            required_model: None,
             metadata: &meta,
             session_snapshot: build_context.session_snapshot.as_ref(),
             backend_session_id: build_context.session_id.clone(),

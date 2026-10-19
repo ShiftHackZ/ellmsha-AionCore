@@ -51,12 +51,14 @@ pub(super) async fn build(
     build_context: AcpSessionBuildContext,
     ctx: FactoryContext,
     routing: Option<aionui_api_types::RouterSnapshot>,
+    frozen_target: Option<&aionui_api_types::RouterTarget>,
 ) -> Result<AgentInstance, AgentError> {
     let mut config = build_context.config;
 
     // Resolve the catalog row — prefer explicit agent_id, fall
     // back to a vendor-label match for legacy payloads.
     let meta = resolve_catalog_metadata(&deps.agent_registry, &config, &ctx.user_id).await?;
+    crate::routing::guard::validate_agent_identity(frozen_target, &meta.id)?;
 
     // Trust the catalog row over the client-supplied `backend` when an
     // `agent_id` was provided. The frontend collapses row-scoped rows
@@ -87,6 +89,7 @@ pub(super) async fn build(
                 session_snapshot: build_context.session_snapshot,
             },
             ctx,
+            frozen_target,
         )
         .await;
     }
@@ -112,6 +115,7 @@ pub(super) async fn build(
                 workspace: ctx.workspace.clone(),
                 managed_skill_roots: &ctx.managed_skill_roots,
                 config: &config,
+                required_model: frozen_target.map(|target| target.model().to_owned()),
                 metadata: &meta,
                 session_snapshot: build_context.session_snapshot.as_ref(),
                 backend_session_id: build_context.session_id.clone(),

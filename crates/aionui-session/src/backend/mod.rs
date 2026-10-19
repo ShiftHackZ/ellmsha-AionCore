@@ -250,6 +250,10 @@ pub struct SessionConfig {
     pub generation_response_schema: Option<serde_json::Value>,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    /// Frozen host route, distinct from the ordinary mutable model preference.
+    /// Codex must confirm this exact model in the thread-open response and enforce
+    /// it on every turn. Absent for ordinary, legacy-router and generation sessions.
+    pub required_model: Option<String>,
     pub mode: Option<String>,
     pub extra_args: Vec<String>,
     /// F-4 idle self-suspend TTL (ms). `None` (default) = never suspend: the
