@@ -52,6 +52,8 @@ pub enum AgentStreamEvent {
     Error(ErrorEventData),
     System(serde_json::Value),
     RequestTrace(serde_json::Value),
+    /// One completed provider request; counters are deltas, context is a snapshot.
+    UsageReport(serde_json::Value),
     SessionAssigned(SessionAssignedEventData),
     /// Intra-turn soft boundary between two independent assistant outputs.
     ///

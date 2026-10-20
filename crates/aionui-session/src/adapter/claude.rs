@@ -614,6 +614,16 @@ impl ClaudeAdapter {
                     cached_read_tokens: cache_read,
                     cached_write_tokens: cache_creation,
                     thought_tokens: std::mem::take(&mut self.turn_thought_tokens),
+                    accounting: Some(crate::event::UsageAccounting {
+                        model: self.current_model.clone(),
+                        input_tokens: input_tokens.saturating_add(cache_creation).saturating_add(cache_read),
+                        output_tokens,
+                        cache_read_tokens: cache_read,
+                        cache_creation_tokens: cache_creation,
+                        cumulative: false,
+                        source: v.get("session_id").and_then(Value::as_str).map(str::to_owned),
+                        report_id: v.get("uuid").and_then(Value::as_str).map(str::to_owned),
+                    }),
                 },
             });
         }
@@ -2824,5 +2834,27 @@ mod tests {
             },
             other => panic!("expected one ToolResult, got {other:?}"),
         }
+    }
+    #[test]
+    fn captured_claude_results_produce_normalized_billing_separate_from_context() {
+        let raw = include_str!("../../tests/fixtures/claude_2.1.176_workflow_multiagent_3parallel_1fail.ndjson");
+        let mut adapter = ClaudeAdapter::new();
+        let mut reports = Vec::new();
+        for line in raw.lines() {
+            let value: Value = serde_json::from_str(line).unwrap();
+            for event in adapter.parse_value(&value) {
+                if let SessionEvent::UsageDelta { breakdown, .. } = event
+                    && let Some(report) = breakdown.accounting
+                {
+                    reports.push(report);
+                }
+            }
+        }
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].input_tokens, 3623 + 22080 + 16759);
+        assert_eq!(reports[0].output_tokens, 2235);
+        assert!(!reports[0].cumulative);
+        assert!(reports[0].report_id.is_some());
+        assert_ne!(reports[0].report_id, reports[1].report_id);
     }
 }

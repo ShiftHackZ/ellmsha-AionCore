@@ -66,3 +66,7 @@ pub use repository::{
 pub use sqlx::SqlitePool;
 
 pub use repository::{IRouterOutcomeRepository, RouterOutcome, SqliteRouterOutcomeRepository};
+
+pub use repository::usage::{SqliteUsageRepository, UsageCounter, UsageQuery, UsageReport};
+
+pub use repository::{UsageContext, UsageResponse, UsageSeries, UsageTotals};

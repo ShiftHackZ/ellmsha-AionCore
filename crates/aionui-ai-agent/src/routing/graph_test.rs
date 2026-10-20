@@ -87,7 +87,7 @@ async fn select(
 }
 async fn classifier_response(server: &MockServer, content: &str) {
     let data = json!({"id":"fixture", "choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]});
-    let done = json!({"id":"fixture", "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+    let done = json!({"id":"fixture", "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":12,"total_tokens":112}});
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -349,4 +349,77 @@ async fn graph_settings_migration_does_not_rewrite_frozen_legacy_policy() {
     assert_eq!(legacy.schema_version, 1);
     let frozen: RouterConfig = serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
     assert_eq!(frozen, legacy);
+}
+
+#[tokio::test]
+async fn generic_acp_root_and_child_routes_use_protocol_transport_not_vendor_whitelist() {
+    let (db, router) = fixture().await;
+    sqlx::query("INSERT INTO agent_metadata(id,agent_id,user_id,name,backend,agent_type,agent_source,command,enabled,last_check_status,available_models,agent_capabilities,created_at,updated_at) VALUES('router-acp-row','router-acp',?,'Generic ACP','test-acp','acp','custom','/bin/sh',1,'success',?,?,0,0)")
+        .bind(USER).bind(r#"{"available_models":[{"id":"worker"}]}"#)
+        .bind(r#"{"mcpCapabilities":{"http":false,"sse":false}}"#)
+        .execute(db.pool()).await.unwrap();
+    let catalog = router.catalog(USER, &RouterConfig::default()).await.unwrap();
+    let entry = catalog
+        .iter()
+        .find(|entry| {
+            entry.target
+                == RouterTarget::Agent {
+                    agent_id: "router-acp".into(),
+                    model: "worker".into(),
+                }
+        })
+        .expect("generic ACP model in catalog");
+    assert!(entry.root.supported, "{:?}", entry.root.reason);
+    assert!(entry.child.supported, "{:?}", entry.child.reason);
+    sqlx::query("UPDATE agent_metadata SET agent_capabilities=? WHERE agent_id='router-acp'")
+        .bind(r#"{"mcpCapabilities":{"stdio":false}}"#)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let catalog = router.catalog(USER, &RouterConfig::default()).await.unwrap();
+    let entry = catalog
+        .iter()
+        .find(|entry| {
+            entry.target
+                == RouterTarget::Agent {
+                    agent_id: "router-acp".into(),
+                    model: "worker".into(),
+                }
+        })
+        .unwrap();
+    assert_eq!(entry.root.reason.as_deref(), Some("router_mcp_transport_unsupported"));
+}
+
+#[tokio::test]
+async fn malformed_classifier_answer_still_records_its_actual_spend() {
+    #[derive(Default)]
+    struct Bus(std::sync::Mutex<Vec<aionui_api_types::WebSocketMessage<Value>>>);
+    impl aionui_realtime::EventBroadcaster for Bus {
+        fn broadcast(&self, message: aionui_api_types::WebSocketMessage<Value>) {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+    let (db, router) = fixture().await;
+    let bus = Arc::new(Bus::default());
+    let router = router.with_usage_broadcaster(bus.clone());
+    let server = MockServer::start().await;
+    provider(&db, "owned", &format!("{}/v1", server.uri()), true, None).await;
+    classifier_response(&server, "malformed").await;
+    let scope = MemoryRecallScope {
+        conversation_id: Some("parent".into()),
+        isolated_test: true,
+        ..Default::default()
+    };
+    assert!(
+        router
+            .classify_custom(USER, &policy(), &target("owned", "classifier"), "task", "", &scope)
+            .await
+            .is_err()
+    );
+    let events = bus.0.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].name, "usage.request");
+    assert_eq!(events[0].data["conversation_id"], "parent");
+    assert_eq!(events[0].data["data"]["input_tokens"], 100);
+    assert_eq!(events[0].data["data"]["context_reported"], false);
 }

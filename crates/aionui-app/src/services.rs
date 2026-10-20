@@ -234,9 +234,10 @@ impl AppServices {
             machine_id,
         ));
 
-        let generation_service = Arc::new(aionui_ai_agent::generation::GenerationService::new(
-            runtime_base_url.clone(),
-        ));
+        let generation_service = Arc::new(
+            aionui_ai_agent::generation::GenerationService::new(runtime_base_url.clone())
+                .with_usage_broadcaster(event_bus.clone()),
+        );
         let router = Arc::new(
             aionui_ai_agent::routing::RouterService::new(
                 provider_repo.clone(),
@@ -246,6 +247,7 @@ impl AppServices {
                 agent_registry.clone(),
                 encryption_key,
             )
+            .with_usage_broadcaster(event_bus.clone())
             .with_session_spawner(session_spawner.clone())
             .with_outcomes(Arc::new(aionui_db::SqliteRouterOutcomeRepository::new(
                 database.pool().clone(),

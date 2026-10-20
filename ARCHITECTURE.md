@@ -753,7 +753,9 @@ AGENTS guidance, and automatic durable-memory reads/writes are not attached. The
 scope and snapshots persist through resume and native children. Unsupported external
 agent types, stored MCP IDs, or attempts to change scope/snapshots after creation are
 rejected; create a new chat rather than converting a privileged existing session.
-Ordinary conversations retain their mandatory memory policy.
+Ordinary conversations retain their mandatory memory policy. A session-only chat
+that is bound to a registered project still receives mandatory project guidance;
+only optional historical recall and ambient tools remain excluded.
 
 This is tool/config isolation, **not an OS sandbox**: native workspace tools remain,
 selected MCP programs retain normal process permissions/environment, and an explicitly
@@ -761,3 +763,46 @@ selected provider still uses its configured credentials. Use owned temporary fix
 and a local provider for synthetic QA. The built-in browser's live bridge environment
 is resolved only at launch using the existing exact trusted-launcher validation and is
 not persisted with the snapshot.
+
+
+## Mandatory project guidance before inference
+
+Production session creation loads complete active global/project guidance before
+constructing the provider session and prepends it to the host system instructions.
+The shared `AgentInstance` send path refreshes that guidance before dispatching
+any user task, ahead of optional topical memory and the original user prompt.
+A newer host snapshot supersedes earlier startup/conversation snapshots.
+
+TencentDB's deterministic guidance inventory does not depend on embeddings. The
+inventory includes active rules/preferences; legacy v2 imported decisions and
+caveats remain searchable history, distinguished by the importer's explicit priority
+metadata rather than wording. Optional topical recall never seeds a second rules list.
+The host walks every page, reads full scenario sources, orders global before project
+rules, checks identities/counts/cursors, and rereads the inventory to reject a
+revision change during loading. There is no cached-success fallback. Missing
+configuration/binding, transport failure, incomplete coverage, unreadable sources,
+more than 512 records, over 256 KiB of complete rules, or a 30-second deadline
+blocks dispatch with a retryable error. Optional topical recall may degrade
+independently after required guidance succeeds.
+
+Conversation-backed CLI/ACP/Antigravity/native sessions use the same barrier.
+Native direct and forked children also receive fresh host guidance before routing,
+tool setup and inference, including when they specify custom system instructions.
+Registered project lookup failures block the task instead of substituting the runtime
+workspace. An explicitly isolated project chat cannot bypass required rules; it skips
+only optional recall and ambient tools. Non-project synthetic scopes remain isolated.
+Router classifiers receive required guidance before classification; strict-local
+classification additionally requires a loopback gateway and explicit local-store
+attestation and skips optional semantic recall. Standalone aionrs remains unchanged
+unless its host supplies the child-preflight callback. Synthetic lifecycle stubs
+are isolated through a test-only interface; production has no preflight bypass.
+
+Production logs contain only conversation identity, rule count/bytes, manifest
+SHA-256 and sanitized failure reasons, never rule contents or credentials.
+
+A prepared agent message is a one-use value: the conversation controller checks
+cancellation after memory loading and before backend dispatch. Cancelling during
+preflight completes the turn without inference or a fabricated tool result.
+Required-guidance failures are host-owned, retryable errors and do not mark a CLI
+or model provider unhealthy. Mandatory guidance payloads are excluded from recall
+observability exporters.

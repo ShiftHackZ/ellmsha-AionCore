@@ -15,6 +15,8 @@ pub enum AgentError {
     NotFound(String),
     #[error("Conflict: {0}")]
     Conflict(String),
+    #[error("Required project guidance unavailable: {0}")]
+    RequiredGuidanceUnavailable(String),
     #[error("Bad gateway: {0}")]
     BadGateway(String),
     #[error("Timeout: {0}")]
@@ -79,6 +81,7 @@ impl AgentError {
             | Self::Forbidden(message)
             | Self::NotFound(message)
             | Self::Conflict(message)
+            | Self::RequiredGuidanceUnavailable(message)
             | Self::BadGateway(message)
             | Self::Timeout(message)
             | Self::ConversationArchived(message)

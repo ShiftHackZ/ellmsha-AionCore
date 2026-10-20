@@ -82,8 +82,11 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let routing = options.routing;
     let routing_scope = options.memory_recall.clone();
     let mut context = options.context;
+    if !routing_scope.isolated_test {
+        tencent_memory::attach_required_guidance(&mut context).await?;
+    }
     if !context.is_session_only() {
-        tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await;
+        tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await?;
     }
     codex_home::isolate_legacy_memory(&mut context, &deps.data_dir).await?;
     let ctx = FactoryContext::resolve(&context).await?;

@@ -251,7 +251,7 @@ mod project_tests {
         };
         services.conversation_repo.create(&row).await.unwrap();
         let service = services.generation_service.clone();
-        let env = service.mcp_env(&row.id);
+        let env = service.mcp_env(&row.user_id, &row.id, None);
         let token = env
             .iter()
             .find(|(key, _)| key == "AIONUI_GENERATION_TOKEN")

@@ -43,6 +43,7 @@ impl AcpAgentManager {
         let (session_response, legacy_models) = self.protocol.new_session(req).await?;
 
         let sid = session_response.session_id.to_string();
+        self.usage_resumed.store(false, std::sync::atomic::Ordering::Relaxed);
 
         {
             let mut session = self.session.write().await;
@@ -287,6 +288,8 @@ impl AcpAgentManager {
             Err(e) => return Err(e.into()),
         };
         let new_sid = fork_response.session_id.to_string();
+        // Fork totals can include inherited history, just like resumed sessions.
+        self.usage_resumed.store(true, std::sync::atomic::Ordering::Relaxed);
 
         {
             let mut session = self.session.write().await;
@@ -370,7 +373,48 @@ impl AcpAgentManager {
         // CLI notifications, not runtime-emitted frames, so the snapshot
         // (which backs GET /usage) is updated here directly.
         if let Some(mut frame) = end_turn_usage_frame_from_response(&prompt_response) {
-            if let Ok(mut update) = serde_json::from_value::<UsageUpdate>(frame.clone()) {
+            // SDK Usage is session-cumulative (verified: schema 1.5.0
+            // v1/agent.rs Usage). Gemini's captured quota dialect is per prompt.
+            // Only end-of-prompt counters are metered; UsageUpdate.used is context,
+            // and charging both channels would double count the same execution.
+            let session = self.session.read().await;
+            let model = session.current_model_id().unwrap_or_default();
+            let context = session.context_usage();
+            let counter = prompt_response.usage.as_ref().map(|_| {
+                serde_json::json!({
+                    "source":format!("{}:{sid}",self.params.metadata.id),
+                    "baseline_if_unknown":self.usage_resumed.load(std::sync::atomic::Ordering::Relaxed)
+                })
+            });
+            // Typed SDK totals measure all turns, never current occupancy.
+            // Only the per-prompt quota dialect can supply context as a fallback.
+            let (context_used, context_size) = if prompt_response.usage.is_some() {
+                (
+                    context.map(|u| u.used).unwrap_or(0),
+                    context.map(|u| u.size).unwrap_or(0),
+                )
+            } else {
+                (
+                    frame["used"].as_u64().unwrap_or(0),
+                    context.map(|u| u.size).unwrap_or(0),
+                )
+            };
+            let counts = &frame["_meta"];
+            let count = |key| counts.get(key).and_then(Value::as_u64).unwrap_or(0);
+            self.runtime.emit(AgentStreamEvent::UsageReport(serde_json::json!({
+                "request_id":format!("{}:{}",self.params.conversation_id,uuid::Uuid::new_v4()),
+                "provider_id":self.params.metadata.id,"model":model,"counter":counter,
+                "input_tokens":count("input_tokens"),"output_tokens":count("output_tokens"),
+                "cache_read_tokens":count("cached_read_tokens"),"cache_creation_tokens":count("cached_write_tokens"),
+                "context_reported":context_used>0,"context_tokens":context_used,
+                "context_window":context_size,"breakdown":{"unattributed":context_used}
+            })));
+            drop(session);
+            frame["used"] = context_used.into();
+            frame["size"] = context_size.into();
+            if context_used > 0
+                && let Ok(mut update) = serde_json::from_value::<UsageUpdate>(frame.clone())
+            {
                 let mut session = self.session.write().await;
                 // Agents like OpenCode report through BOTH channels: a mid-turn
                 // UsageUpdate notification carrying the real window size, and an
@@ -380,7 +424,9 @@ impl AcpAgentManager {
                 session.apply_context_usage(update);
                 self.commit_session_changes(&mut session).await;
             }
-            self.runtime.emit(AgentStreamEvent::AcpContextUsage(frame));
+            if context_used > 0 {
+                self.runtime.emit(AgentStreamEvent::AcpContextUsage(frame));
+            }
         }
 
         // Drain the turn-scoped receiver once: detect both the empty-turn

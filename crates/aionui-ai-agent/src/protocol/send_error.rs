@@ -89,6 +89,15 @@ impl AgentSendError {
                     )),
                 },
             },
+            AgentError::RequiredGuidanceUnavailable(_) => Self::new(
+                "Project rules were not loaded; the task was not started",
+                AgentErrorCode::AionuiInternalError,
+                AgentErrorOwnership::Aionui,
+                Some(detail),
+                true,
+                false,
+                resolution(AgentErrorResolutionKind::Retry, None),
+            ),
             AgentError::Internal(_) => Self::new(
                 "AionUI failed while sending the message",
                 AgentErrorCode::AionuiInternalError,

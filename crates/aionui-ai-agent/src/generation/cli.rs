@@ -99,6 +99,8 @@ pub(super) async fn complete_bounded(
             AgentError::bad_gateway(reason)
         })?;
     let mut result = Completion {
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         content: String::new(),
         tools: vec![],
         input_tokens: 0,
@@ -123,17 +125,35 @@ pub(super) async fn complete_bounded(
                     "Generation-only session attempted a tool or permission request; isolated session stopped",
                 ));
             }
-            SessionEvent::UsageDelta {
-                input_tokens,
-                output_tokens,
-                ..
-            } => {
-                result.input_tokens = input_tokens;
-                result.output_tokens = output_tokens;
+            SessionEvent::UsageDelta { breakdown, .. } => {
+                if let Some(measured) = breakdown.accounting {
+                    result.input_tokens = measured.input_tokens;
+                    result.output_tokens = measured.output_tokens;
+                    result.cache_read_tokens = measured.cache_read_tokens;
+                    result.cache_creation_tokens = measured.cache_creation_tokens;
+                }
             }
             SessionEvent::TurnResult {
                 is_error, result_text, ..
             } => {
+                if backend == "claude" && result.input_tokens == 0 && result.output_tokens == 0 {
+                    // The captured Claude result expands into TurnResult THEN
+                    // UsageDelta. Drain its bounded metadata tail before teardown.
+                    // Missing counters stay unavailable; never estimate them.
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+                    while let Ok(Some(envelope)) = tokio::time::timeout_at(deadline, events.next()).await {
+                        if let SessionEvent::UsageDelta { breakdown, .. } = envelope.event
+                            && let Some(usage) = breakdown.accounting
+                        {
+                            result.input_tokens = usage.input_tokens;
+                            result.output_tokens = usage.output_tokens;
+                            result.cache_read_tokens = usage.cache_read_tokens;
+                            result.cache_creation_tokens = usage.cache_creation_tokens;
+                            break;
+                        }
+                    }
+                }
+
                 if is_error {
                     return Err(AgentError::bad_gateway(
                         "Selected agent failed memory generation; no alternate model was used",

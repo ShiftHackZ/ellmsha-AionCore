@@ -130,11 +130,33 @@ impl RouterService {
             } else {
                 None
             };
-            // Existing generation-only adapters are Claude and Codex. The host's
-            // CliAssumed transport for other CLIs is not evidence of delegation.
+            // Root/child execution uses the same factory and inline host MCP
+            // as ordinary conversations, independently from stateless generation.
+            // In particular, Team membership / a shell fallback does not prove
+            // that the router MCP server can reach an ACP session.
             let known_adapter = matches!(backend.as_str(), "claude" | "codex") && row.agent_type == AgentType::Acp;
-            let delegated = unavailable.or(if !known_adapter || !row.team_capable {
-                Some("host_delegation_unverified")
+            let capabilities = self
+                .registry
+                .repo_handle()
+                .get_for_user(user, &row.id)
+                .await
+                .map_err(|_| AgentError::internal("Could not read router adapter capabilities"))?
+                .and_then(|meta| meta.agent_capabilities)
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            let transport = match row.agent_type {
+                AgentType::Acp if known_adapter => true,
+                AgentType::Acp => {
+                    capabilities
+                        .as_ref()
+                        .map(aionui_mcp::parse_acp_mcp_capabilities)
+                        .unwrap_or_default()
+                        .stdio
+                }
+                AgentType::Antigravity => true,
+                _ => false,
+            };
+            let delegated = unavailable.or(if !transport {
+                Some("router_mcp_transport_unsupported")
             } else {
                 None
             });

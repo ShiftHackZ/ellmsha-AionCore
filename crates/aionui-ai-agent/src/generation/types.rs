@@ -137,6 +137,8 @@ impl GenerationRequest {
 }
 
 pub(crate) struct Completion {
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub content: String,
     pub tools: Vec<GenerationToolCall>,
     pub input_tokens: u64,

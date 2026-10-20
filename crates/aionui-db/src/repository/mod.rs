@@ -80,3 +80,8 @@ pub use user::IUserRepository;
 
 mod router_outcome;
 pub use router_outcome::{IRouterOutcomeRepository, RouterOutcome, SqliteRouterOutcomeRepository};
+
+pub mod usage;
+
+mod usage_types;
+pub use usage_types::{UsageContext, UsageResponse, UsageSeries, UsageTotals};

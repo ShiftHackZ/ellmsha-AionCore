@@ -110,6 +110,16 @@ impl ConversationTurnOrchestrator {
         {
             Ok(agent) => agent,
             Err(err) => {
+                if self
+                    .service
+                    .runtime_state()
+                    .take_deferred_cancel(&input.conv_id, &input.turn_id)
+                {
+                    return Err(ConversationTurnResult {
+                        status: ConversationTurnStatus::Completed,
+                        error_message: None,
+                    });
+                }
                 let top_level_code = agent_error_top_level_code(&err);
                 let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
                 let top_level_code = if send_error.is_openclaw_gateway_unreachable() {
@@ -136,14 +146,16 @@ impl ConversationTurnOrchestrator {
                     "Agent task build failed"
                 );
                 let failure_message = send_error_display_message(&send_error);
-                record_agent_session_failure(
-                    &self.service,
-                    &input.user_id,
-                    availability_agent_id.as_deref(),
-                    "session_build_failed",
-                    &failure_message,
-                )
-                .await;
+                if send_error.ownership() != Some(aionui_api_types::AgentErrorOwnership::Aionui) {
+                    record_agent_session_failure(
+                        &self.service,
+                        &input.user_id,
+                        availability_agent_id.as_deref(),
+                        "session_build_failed",
+                        &failure_message,
+                    )
+                    .await;
+                }
                 self.service
                     .persist_and_broadcast_send_failure_tip(
                         &input.user_id,
@@ -333,6 +345,17 @@ impl ConversationTurnOrchestrator {
                 .service
                 .with_task_context(&input.user_id, &input.conv_id, current_send.content)
                 .await;
+            let prepared_send = agent.prepare_message(current_send).await;
+            if runtime_state.is_cancelling(&input.conv_id)
+                || runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id)
+            {
+                info!(conversation_id = %input.conv_id, turn_id = %input.turn_id,
+                    "Cancelled after host preflight; task was not dispatched");
+                return Err(ConversationTurnResult {
+                    status: ConversationTurnStatus::Completed,
+                    error_message: None,
+                });
+            }
             let send_agent = agent.clone();
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();
@@ -342,16 +365,22 @@ impl ConversationTurnOrchestrator {
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
-                if let Err(e) = send_agent.send_message(current_send).await {
+                let sent = match prepared_send {
+                    Ok(prepared) => prepared.send().await,
+                    Err(error) => Err(error),
+                };
+                if let Err(e) = sent {
                     let failure_message = send_error_display_message(&e);
-                    record_agent_session_failure(
-                        &feedback_service,
-                        &feedback_user_id,
-                        feedback_agent_id.as_deref(),
-                        "session_send_failed",
-                        &failure_message,
-                    )
-                    .await;
+                    if e.ownership() != Some(aionui_api_types::AgentErrorOwnership::Aionui) {
+                        record_agent_session_failure(
+                            &feedback_service,
+                            &feedback_user_id,
+                            feedback_agent_id.as_deref(),
+                            "session_send_failed",
+                            &failure_message,
+                        )
+                        .await;
+                    }
                     let task_status = send_agent.status();
                     let agent_type = send_agent.agent_type();
                     error!(

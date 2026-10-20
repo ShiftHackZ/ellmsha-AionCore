@@ -121,6 +121,13 @@ impl AcpAgentManager {
             AgentStreamEvent::AcpContextUsage(value) => {
                 if let Ok(update) = serde_json::from_value::<UsageUpdate>(value.clone()) {
                     let mut s = self.session.write().await;
+                    let model = s.current_model_id().unwrap_or_default();
+                    self.runtime.emit(AgentStreamEvent::UsageReport(serde_json::json!({
+                        "request_id":uuid::Uuid::new_v4().to_string(),"provider_id":self.params.metadata.id,
+                        "model":model,"billing_reported":false,"input_tokens":0,"output_tokens":0,
+                        "cache_read_tokens":0,"cache_creation_tokens":0,"context_tokens":update.used,
+                        "context_window":update.size,"breakdown":{"unattributed":update.used}
+                    })));
                     s.apply_context_usage(update);
                     self.commit_session_changes(&mut s).await;
                 }

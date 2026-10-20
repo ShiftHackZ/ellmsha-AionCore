@@ -77,8 +77,21 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // to connected WebSocket clients.
     let mut event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
+    crate::usage::start(services.database.pool().clone(), services.event_bus.subscribe());
     tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
+        loop {
+            let event = match event_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    tracing::warn!(count, "websocket event relay lagged");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            // Private accounting telemetry is persisted by its own subscriber, not sent to chat clients.
+            if event.name == "usage.request" {
+                continue;
+            }
             if let Some(user_id) = event
                 .data
                 .get("user_id")
@@ -205,6 +218,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         bootstrap_secret: services.bootstrap_secret.clone(),
         session_revoked_hook: {
             let ws_manager = services.ws_manager.clone();
+
             let conversation_service = states.conversation.service.clone();
             let team_service = states.team.service.clone();
             let channel_manager = states.channel.manager.clone();
@@ -281,6 +295,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // Conversation routes protected by auth middleware
     let conversation_authenticated = conversation_routes(states.conversation.clone())
+        .merge(crate::usage::routes(services.database.pool().clone()))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     let conversation_ops_authenticated = conversation_ops_routes(states.conversation)

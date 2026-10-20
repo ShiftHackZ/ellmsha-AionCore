@@ -233,6 +233,7 @@ impl ChannelMessageService {
             | AgentStreamEvent::AcpContextUsage(_)
             | AgentStreamEvent::AcpPromptHookWarning(_)
             | AgentStreamEvent::System(_)
+            | AgentStreamEvent::UsageReport(_)
             | AgentStreamEvent::RequestTrace(_)
             | AgentStreamEvent::SlashCommandsUpdated(_)
             | AgentStreamEvent::SessionAssigned(_)

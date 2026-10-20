@@ -564,7 +564,7 @@ async fn row_to_mcp_server_config(
                 env: Some(env),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred: Some(true),
                 startup_timeout_ms: None,
             })
         }
@@ -590,7 +590,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: Some(true),
                 startup_timeout_ms: None,
             })
         }
@@ -616,7 +616,7 @@ async fn row_to_mcp_server_config(
                 env: None,
                 url: Some(url.to_owned()),
                 headers: Some(headers),
-                deferred: Some(false),
+                deferred: Some(true),
                 startup_timeout_ms: None,
             })
         }
@@ -630,9 +630,8 @@ async fn session_server_to_mcp_server_config(
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
-    // ToolSearch only indexes deferred tools. Keep the built-in memory catalog
-    // discoverable there and avoid sending all 17 full schemas on every turn.
-    let deferred = Some(server.id == "ellmsha-tencentdb-memory");
+    // Every MCP integration uses the same session-local discovery path.
+    let deferred = Some(true);
     match &server.transport {
         SessionMcpTransport::Stdio { command, args, .. } => {
             if command.is_empty() {
@@ -789,7 +788,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
         env: Some(env),
         url: None,
         headers: None,
-        deferred: Some(false),
+        deferred: Some(true),
         startup_timeout_ms: None,
     };
 
@@ -1826,7 +1825,7 @@ mod tests {
         assert_eq!(server.transport, TransportType::Stdio);
         assert_eq!(server.command.as_deref(), Some("/usr/bin/backend"));
         assert_eq!(server.args.as_deref(), Some(&["mcp-team-stdio".to_owned()][..]));
-        assert_eq!(server.deferred, Some(false));
+        assert_eq!(server.deferred, Some(true));
 
         let env = server.env.as_ref().unwrap();
         assert_eq!(env.get("TEAM_MCP_PORT"), Some(&"9000".to_owned()));
@@ -1893,8 +1892,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             user_server.deferred,
-            Some(false),
-            "only the built-in ID opts into deferred discovery"
+            Some(true),
+            "all managed integrations use deferred discovery"
         );
         snapshot.id = "ellmsha-tencentdb-memory".into();
         snapshot.transport = SessionMcpTransport::Stdio {
@@ -1982,7 +1981,7 @@ mod tests {
                 env: Some(HashMap::new()),
                 url: None,
                 headers: None,
-                deferred: Some(false),
+                deferred: Some(true),
                 startup_timeout_ms: None,
             },
         )]);

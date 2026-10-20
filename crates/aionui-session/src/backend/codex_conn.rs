@@ -25,7 +25,7 @@
 use super::codex_mcp_approval::CodexMcpApprovals;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -527,7 +527,8 @@ fn initialize_params() -> HandshakeParams {
 /// Wave 0c: the session-init surface is injected here. codex reads MCP servers
 /// from its CONFIG (NOT a per-thread param), so they go into `config.mcp_servers`
 /// — a map keyed by name (verified live, 0.139.0: thread/start accepts it AND
-/// launches the servers). The preset/system prompt goes into `baseInstructions`.
+/// launches the servers). Host additions go into `developerInstructions`, preserving
+/// the provider's model-specific agent instructions.
 /// MCP servers and the preset are omitted when empty.
 fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // Data-drive the filesystem sandbox from SessionConfig (None ⇒ workspace-write).
@@ -629,7 +630,15 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         params["config"]["apps"][app_id] = json!({"enabled": false});
     }
     if let Some(preset) = &config.init.preset_context {
-        params["baseInstructions"] = json!(preset);
+        // Agent guidance augments the provider's autonomy/tool-use instructions.
+        // Replacing baseInstructions here turns the coding agent into a bare
+        // chat model whenever memory/skills add a small host policy fragment.
+        let field = if config.generation_only {
+            "baseInstructions"
+        } else {
+            "developerInstructions"
+        };
+        params[field] = json!(preset);
     }
     if config.generation_only {
         params["model"] = json!(config.required_model.as_ref().or(config.model.as_ref()));
@@ -653,6 +662,61 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         });
     }
     HandshakeParams(params)
+}
+
+/// Codex 0.162 keeps the rollout's base/developer instructions on resume/fork.
+/// Restore the selected model's own template from its provider-authored catalog,
+/// then append host guidance. Never hardcode or synthesize the provider prompt.
+async fn restored_codex_agent_instructions(config: &SessionConfig) -> Result<Option<String>, BackendError> {
+    let Some(host) = config
+        .init
+        .preset_context
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if config.generation_only {
+        return Ok(None);
+    }
+    let model = config
+        .required_model
+        .as_ref()
+        .or(config.model.as_ref())
+        .ok_or_else(|| {
+            BackendError::SetupRejected(
+                "Codex resume requires the selected model to restore native agent instructions".into(),
+            )
+        })?;
+    let home = config
+        .spawn_env
+        .iter()
+        .find(|value| value.name == "CODEX_HOME")
+        .map(|value| PathBuf::from(&value.value))
+        .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .ok_or_else(|| BackendError::SetupRejected("Codex profile is unavailable for instruction recovery".into()))?;
+    let path = home.join("models_cache.json");
+    let reject = || {
+        BackendError::SetupRejected(
+            "Codex native model instructions are unavailable; refresh its model catalog before resuming".into(),
+        )
+    };
+    let metadata = tokio::fs::metadata(&path).await.map_err(|_| reject())?;
+    if metadata.len() > 8 * 1024 * 1024 {
+        return Err(reject());
+    }
+    let bytes = tokio::fs::read(path).await.map_err(|_| reject())?;
+    let cache: Value = serde_json::from_slice(&bytes).map_err(|_| reject())?;
+    let native = cache["models"]
+        .as_array()
+        .and_then(|models| models.iter().find(|entry| entry["slug"].as_str() == Some(model)))
+        .and_then(|entry| entry["model_messages"]["instructions_template"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(reject)?;
+    Ok(Some(format!(
+        "{native}\n\n[eLLMsha additional guidance]\n{host}\n[/eLLMsha additional guidance]"
+    )))
 }
 
 fn mcp_only_approval_policy() -> Value {
@@ -1824,8 +1888,12 @@ impl CodexSessionBackend {
                 // (ELECTRON-3Q0).
                 let resume_id = self.next_rpc_id();
                 *self.pending_resume.lock().await = Some(resume_id);
-                self.write_frame(thread_resume_params(&config, tid).into_frame(resume_id, "thread/resume"))
-                    .await?;
+                let mut params = thread_resume_params(&config, tid);
+                if let Some(instructions) = restored_codex_agent_instructions(&config).await? {
+                    params.0["baseInstructions"] = json!(instructions);
+                    tracing::info!("Codex resume retains native model instructions with current host guidance");
+                }
+                self.write_frame(params.into_frame(resume_id, "thread/resume")).await?;
             }
             HandshakeMode::Fork {
                 parent_thread_id,
@@ -1842,10 +1910,12 @@ impl CodexSessionBackend {
                 // Send would poll for a binding that will never arrive.
                 let fork_id = self.next_rpc_id();
                 *self.pending_open.lock().await = Some((fork_id, "thread/fork"));
-                self.write_frame(
-                    thread_fork_params(&config, parent_thread_id, last_turn_id).into_frame(fork_id, "thread/fork"),
-                )
-                .await?;
+                let mut params = thread_fork_params(&config, parent_thread_id, last_turn_id);
+                if let Some(instructions) = restored_codex_agent_instructions(&config).await? {
+                    params.0["baseInstructions"] = json!(instructions);
+                    tracing::info!("Codex fork retains native model instructions with current host guidance");
+                }
+                self.write_frame(params.into_frame(fork_id, "thread/fork")).await?;
             }
             HandshakeMode::Fresh => {
                 let start_id = self.next_rpc_id();
@@ -1998,6 +2068,7 @@ async fn reader_task(
     // authoritative `turn/completed`; the trailing `status→idle` is then absorbed.
     // Reset on `turn/started` so the NEXT turn can terminate once.
     let mut terminated = false;
+    let mut last_completed_root_turn: Option<String> = None;
     // Each multiplexed child needs the same one-terminal-per-turn rule.
     // A fatal error can precede its turn/completed notification.
     let mut terminated_children = std::collections::HashSet::<String>::new();
@@ -2235,6 +2306,17 @@ async fn reader_task(
                             // running in a child. Let the normal resolved path
                             // below clear that exact parent card/counter.
                         }
+                        // A cancelled exec can publish startup/output after its
+                        // turn/completed. Do not reopen it as an orphan turn or
+                        // attribute its trailing items to the next user message.
+                        if m.starts_with("item/")
+                            && last_completed_root_turn
+                                .as_deref()
+                                .is_some_and(|closed| params.get("turnId").and_then(Value::as_str) == Some(closed))
+                        {
+                            tracing::info!(session_id = %session_id, method = m, "discarding item from completed Codex turn");
+                            continue;
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -2290,6 +2372,14 @@ async fn reader_task(
                         // (deferred), then the authoritative turn/completed produces
                         // the rich terminal (M3). Exactly ONE TurnResult per turn.
                         if m == "turn/completed" || m == "thread/status/changed" {
+                            if m == "turn/completed" {
+                                last_completed_root_turn = params
+                                    .get("turn")
+                                    .and_then(|turn| turn.get("id"))
+                                    .and_then(Value::as_str)
+                                    .filter(|id| !id.is_empty())
+                                    .map(str::to_owned);
+                            }
                             let was_pending = system_error_pending;
                             if let Some(ev) = reconcile_terminal(
                                 m,
@@ -4243,6 +4333,19 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
             cached_read_tokens: g("cachedInputTokens"),
             cached_write_tokens: g("cacheWriteInputTokens"),
             thought_tokens: g("reasoningOutputTokens"),
+            accounting: usage.get("total").filter(|v| v.is_object()).map(|totals| {
+                let count = |key| totals.get(key).and_then(Value::as_u64).unwrap_or(0);
+                crate::event::UsageAccounting {
+                    model: None,
+                    input_tokens: count("inputTokens"),
+                    output_tokens: count("outputTokens"),
+                    cache_read_tokens: count("cachedInputTokens"),
+                    cache_creation_tokens: count("cacheWriteInputTokens"),
+                    cumulative: true,
+                    source: params.get("threadId").and_then(Value::as_str).map(str::to_owned),
+                    report_id: None,
+                }
+            }),
         },
     }]
 }
@@ -4250,6 +4353,30 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
 #[cfg(test)]
 mod usage_window_tests {
     use super::*;
+
+    #[test]
+    fn billing_uses_session_totals_while_context_remains_last_request() {
+        let params = serde_json::json!({"threadId":"thread-1","tokenUsage":{
+            "total":{"inputTokens":22000,"outputTokens":43,"cachedInputTokens":17000},
+            "last":{"inputTokens":11024,"outputTokens":6,"totalTokens":11030}
+        }});
+        let events = map_usage(&params);
+        let SessionEvent::UsageDelta {
+            total_tokens,
+            breakdown,
+            ..
+        } = &events[0]
+        else {
+            panic!("missing usage")
+        };
+        assert_eq!(*total_tokens, 11030);
+        let report = breakdown.accounting.as_ref().unwrap();
+        assert!(report.cumulative);
+        assert_eq!(report.input_tokens, 22000);
+        assert_eq!(report.output_tokens, 43);
+        assert_eq!(report.cache_read_tokens, 17000);
+        assert_eq!(report.source.as_deref(), Some("thread-1"));
+    }
 
     /// Verbatim `tokenUsage` from a live two-turn probe (codex-cli 0.145.0,
     /// `gpt-5.6-sol`): turn 2, window 258400. `used` must stay on `last`
@@ -9218,7 +9345,7 @@ mod tests {
 
     /// Wave 0c: MCP servers reach codex via `config.mcp_servers` (a MAP keyed by
     /// name — NOT a per-thread array like ACP), and the preset goes to
-    /// `baseInstructions`. The codex stdio shape uses `env` as a MAP (verified live
+    /// `developerInstructions` without replacing the model base. The codex stdio shape uses `env` as a MAP (verified live
     /// against codex 0.139.0 + `codex mcp add` TOML output).
     #[test]
     fn thread_start_injects_codex_mcp_map_and_preset() {
@@ -9258,8 +9385,9 @@ mod tests {
         // codex env is a MAP {KEY:VAL}, NOT acp's array of {name,value}.
         assert_eq!(mcp["fs"]["env"]["TOKEN"], "x");
         assert_eq!(mcp["remote"]["url"], "https://mcp.example/api");
-        // preset → baseInstructions.
-        assert_eq!(frame["params"]["baseInstructions"], "You are a helpful assistant.");
+        // Host preset augments the native model instructions.
+        assert_eq!(frame["params"]["developerInstructions"], "You are a helpful assistant.");
+        assert!(frame["params"].get("baseInstructions").is_none());
     }
 
     #[test]
@@ -9534,7 +9662,8 @@ mod tests {
             frame["params"]["config"]["mcp_servers"]["fs"]["command"],
             "/usr/bin/node"
         );
-        assert_eq!(frame["params"]["baseInstructions"], "preset");
+        assert_eq!(frame["params"]["developerInstructions"], "preset");
+        assert!(frame["params"].get("baseInstructions").is_none());
         // Empty init resume: still threadId + the policy defaults, no config /
         // baseInstructions keys (mirrors the bare thread/start shape).
         let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
@@ -11524,6 +11653,68 @@ mod tests {
         assert_eq!(bound.as_deref(), Some("turn-7"), "turn/started lowers codex's turn id");
     }
 
+    /// SequelCare 2026-10-20: a command startup arrived after interrupted Finish,
+    /// opening an orphan relay which the next user turn closed with a running row.
+    #[tokio::test]
+    async fn late_items_from_interrupted_turn_do_not_reopen_it_or_pollute_next_turn() {
+        use futures_util::StreamExt as _;
+        let frames = [
+            json!({"method":"thread/started","params":{"thread":{"id":"root"}}}),
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"old"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"old","status":"interrupted"}}}),
+            json!({"method":"item/started","params":{"threadId":"root","turnId":"old","item":{"id":"late-start","type":"commandExecution","command":"sleep 1"}}}),
+            json!({"method":"item/started","params":{"threadId":"child","turnId":"old","item":{"id":"valid-child","type":"commandExecution","command":"echo child"}}}),
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"new"}}}),
+            json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"root","turnId":"old","itemId":"late-start","delta":"late output"}}),
+            json!({"method":"item/started","params":{"threadId":"root","turnId":"old","item":{"id":"late-after-new","type":"commandExecution"}}}),
+            json!({"method":"item/started","params":{"threadId":"root","turnId":"new","item":{"id":"valid-new","type":"commandExecution","command":"echo ok"}}}),
+            json!({"method":"item/completed","params":{"threadId":"root","turnId":"new","item":{"id":"valid-new","type":"commandExecution","exitCode":0,"aggregatedOutput":"ok"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"new","status":"completed"}}}),
+        ];
+        let tail = frames
+            .iter()
+            .map(|frame| format!("{frame}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let fake = FakeAgentIo::new(Vec::new(), None).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("late-interrupted-items", Box::new(fake)).await;
+        let mut stream = backend.events();
+        release();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut events = Vec::new();
+            let mut terminals = 0;
+            while let Some(envelope) = stream.next().await {
+                terminals += usize::from(matches!(envelope.event, SessionEvent::TurnResult { .. }));
+                events.push(envelope.event);
+                if terminals == 2 {
+                    return events;
+                }
+            }
+            panic!("both turns must terminate");
+        })
+        .await
+        .expect("reader drains both turns");
+        let calls = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolCall { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec!["valid-new"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ToolOutputDelta { item_id, .. } if item_id == "late-start"))
+        );
+        assert!(events.iter().any(|event| matches!(event, SessionEvent::ToolResult { tool_use_id, is_error: false, .. } if tool_use_id == "valid-new")));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::SubagentStream { r#ref, event }
+                if r#ref == "child" && matches!(event.as_ref(), SessionEvent::ToolCall { tool_use_id, .. } if tool_use_id == "valid-child")
+        )));
+    }
+
     /// Late-subscriber self-heal: `thread/started` can land BEFORE the
     /// orchestration layer subscribes (codex answers thread/start in
     /// single-digit ms), which used to lose BackendBound forever — the
@@ -11573,6 +11764,10 @@ mod memory_generation_tests {
         let frame = thread_start_params(&SessionConfig {
             model: Some("selected-exact".into()),
             generation_only: true,
+            init: crate::backend::SessionInit {
+                preset_context: Some("Bounded classification only".into()),
+                ..Default::default()
+            },
             sandbox_mode: Some("read-only".into()),
             approval_policy: Some("never".into()),
             ..Default::default()
@@ -11581,6 +11776,8 @@ mod memory_generation_tests {
         let params = &frame["params"];
         assert_eq!(params["model"], "selected-exact");
         assert_eq!(params["ephemeral"], true);
+        assert_eq!(params["baseInstructions"], "Bounded classification only");
+        assert!(params.get("developerInstructions").is_none());
         assert_eq!(params["sandbox"], "read-only");
         assert_eq!(params["approvalPolicy"], "never");
         assert!(params["config"].get("mcp_servers").is_none());
@@ -11622,3 +11819,48 @@ mod memory_generation_tests {
 #[cfg(test)]
 #[path = "codex_approval_wire_test.rs"]
 mod approval_wire_tests;
+
+#[cfg(test)]
+mod native_instruction_recovery_tests {
+    use super::*;
+    #[tokio::test]
+    async fn resume_combines_exact_selected_native_template_and_current_host_guidance() {
+        let home = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&json!({"models":[
+                {"slug":"other", "model_messages":{"instructions_template":"WRONG_MODEL"}},
+                {"slug":"selected", "model_messages":{"instructions_template":"NATIVE_AGENT_AUTONOMY"}}
+            ]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let config = SessionConfig {
+            model: Some("selected".into()),
+            spawn_env: vec![aionui_common::EnvVar {
+                name: "CODEX_HOME".into(),
+                value: home.path().to_string_lossy().into_owned(),
+            }],
+            init: crate::backend::SessionInit {
+                preset_context: Some("HOST_MEMORY_GUIDANCE".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let recovered = restored_codex_agent_instructions(&config).await.unwrap().unwrap();
+        assert!(recovered.starts_with("NATIVE_AGENT_AUTONOMY\n"));
+        assert!(recovered.contains("HOST_MEMORY_GUIDANCE"));
+        assert!(!recovered.contains("WRONG_MODEL"));
+        let missing = SessionConfig {
+            model: Some("absent".into()),
+            ..config.clone()
+        };
+        assert!(restored_codex_agent_instructions(&missing).await.is_err());
+        let generation = SessionConfig {
+            generation_only: true,
+            ..config
+        };
+        assert!(restored_codex_agent_instructions(&generation).await.unwrap().is_none());
+    }
+}

@@ -86,6 +86,12 @@ pub trait IAgentTask: Send + Sync {
 #[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 pub trait IMockAgent: IAgentTask {
+    /// Domain lifecycle stubs do not depend on a real knowledge service.
+    /// Barrier-specific tests opt in; this switch does not exist in production.
+    fn enforce_memory_preflight(&self) -> bool {
+        false
+    }
+
     fn get_confirmations(&self) -> Vec<Confirmation> {
         Vec::new()
     }
@@ -168,6 +174,19 @@ pub enum AgentInstance {
     Mock(Arc<dyn IMockAgent>),
 }
 
+/// A one-use message whose mandatory host guidance preflight has completed.
+/// Keep this only long enough to check cancellation, then dispatch it immediately.
+pub struct PreparedAgentMessage {
+    agent: AgentInstance,
+    data: SendMessageData,
+}
+
+impl PreparedAgentMessage {
+    pub async fn send(self) -> Result<(), AgentSendError> {
+        self.agent.as_task().send_message(self.data).await
+    }
+}
+
 impl AgentInstance {
     /// Common `IAgentTask` view, regardless of variant.
     pub fn as_task(&self) -> &dyn IAgentTask {
@@ -217,7 +236,26 @@ impl AgentInstance {
     }
 
     /// Send a user message to the agent.
-    pub async fn send_message(&self, mut data: SendMessageData) -> Result<(), AgentSendError> {
+    pub async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.prepare_message(data).await?.send().await
+    }
+
+    /// Complete preflight without starting the backend, allowing the host to honor
+    /// a cancellation that arrived while memory was loading.
+    pub async fn prepare_message(&self, mut data: SendMessageData) -> Result<PreparedAgentMessage, AgentSendError> {
+        // A failed/incomplete guidance preflight must never dispatch a user task.
+        let enforce_rules = match self {
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(mock) => mock.enforce_memory_preflight(),
+            _ => true,
+        };
+        let rules = if enforce_rules {
+            crate::capability::tencent_memory::required_rules_from_env(self.conversation_id(), self.workspace())
+                .await
+                .map_err(AgentSendError::from_agent_error)?
+        } else {
+            None
+        };
         // The conversation has already persisted the user's original message.
         // Only the transient provider input receives retrieved memory, covering
         // ordinary, scheduled and conversation-backed delegated turns alike.
@@ -251,7 +289,13 @@ impl AgentInstance {
             }
             data.content = format!("{}\n\n{}", memory.text, data.content);
         }
-        self.as_task().send_message(data).await
+        if let Some(rules) = rules {
+            data.content = format!("{rules}\n\n{}", data.content);
+        }
+        Ok(PreparedAgentMessage {
+            agent: self.clone(),
+            data,
+        })
     }
 
     /// Cancel the current streaming response without killing the agent.
@@ -731,7 +775,39 @@ mod required_full_auto_dispatch_tests {
         }
     }
 
-    impl IMockAgent for NoopMockAgent {}
+    impl IMockAgent for NoopMockAgent {
+        fn enforce_memory_preflight(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn mandatory_rules_failure_prevents_backend_dispatch() {
+        let (event_tx, _rx) = broadcast::channel(4);
+        let instance = AgentInstance::Mock(Arc::new(NoopMockAgent {
+            conversation_id: "rules-binding-not-registered".into(),
+            event_tx,
+        }));
+        // The backend stub would return Ok if reached. Missing host binding must stop it first.
+        let error = instance
+            .send_message(SendMessageData {
+                content: "EXECUTE_USER_TASK".into(),
+                msg_id: "rules-barrier".into(),
+                turn_id: None,
+                files: vec![],
+                inject_skills: vec![],
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .stream_error()
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("host project binding unavailable")
+        );
+    }
 
     /// Non-ACP variants (proxy for claude/codex `Session`, `Aionrs`) never
     /// enter the a-pure path — they signal `Ok(None)` so the caller falls back

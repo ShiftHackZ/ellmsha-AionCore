@@ -36,7 +36,15 @@ impl GenerationTarget {
     }
 }
 
+#[derive(Clone)]
+struct GenerationOwner {
+    user: String,
+    conversation: String,
+    provider: Option<String>,
+}
+
 struct Route {
+    owner: Option<GenerationOwner>,
     target: GenerationTarget,
     expires: Instant,
 }
@@ -44,7 +52,8 @@ struct Route {
 /// Private capabilities are never included in tool arguments or model prompts.
 /// A callback route remains frozen for 24 hours, including queued extraction jobs.
 pub struct GenerationService {
-    context_tokens: DashMap<String, String>,
+    context_tokens: DashMap<String, GenerationOwner>,
+    usage_bus: Option<Arc<dyn aionui_realtime::EventBroadcaster>>,
     routes: DashMap<String, Route>,
     slots: Semaphore,
     base_url: String,
@@ -54,16 +63,30 @@ impl GenerationService {
     pub fn new(base_url: String) -> Self {
         Self {
             context_tokens: DashMap::new(),
+            usage_bus: None,
             routes: DashMap::new(),
             slots: Semaphore::new(4),
             base_url: base_url.trim_end_matches('/').to_owned(),
         }
     }
 
+    /// Attribute auxiliary provider measurements through the private usage channel.
+    pub fn with_usage_broadcaster(mut self, bus: Arc<dyn aionui_realtime::EventBroadcaster>) -> Self {
+        self.usage_bus = Some(bus);
+        self
+    }
+
     /// Mint a conversation-bound capability for the private memory MCP.
-    pub fn mcp_env(&self, conversation_id: &str) -> [(String, String); 3] {
+    pub fn mcp_env(&self, user: &str, conversation_id: &str, provider: Option<String>) -> [(String, String); 3] {
         let token = uuid::Uuid::new_v4().to_string();
-        self.context_tokens.insert(hash(&token), conversation_id.to_owned());
+        self.context_tokens.insert(
+            hash(&token),
+            GenerationOwner {
+                user: user.into(),
+                conversation: conversation_id.into(),
+                provider,
+            },
+        );
         [
             (
                 "AIONUI_GENERATION_CONTEXT_URL".into(),
@@ -93,14 +116,21 @@ impl GenerationService {
                 ));
             }
         };
-        self.issue_target(target)
+        let context = self.issue_target(target)?;
+        if let (Some(owner), Some(mut route)) = (
+            self.context_tokens.get(&hash(token)),
+            self.routes.get_mut(&hash(&context.callback_token)),
+        ) {
+            route.owner = Some(owner.clone());
+        }
+        Ok(context)
     }
 
     pub fn validate_context_token(&self, token: &str, conversation_id: &str) -> Result<(), AgentError> {
         if self
             .context_tokens
             .get(&hash(token))
-            .is_none_or(|entry| entry.as_str() != conversation_id)
+            .is_none_or(|entry| entry.conversation != conversation_id)
         {
             return Err(AgentError::unauthorized("Invalid memory generation context capability"));
         }
@@ -122,6 +152,7 @@ impl GenerationService {
         self.routes.insert(
             hash(&token),
             Route {
+                owner: None,
                 target,
                 expires: Instant::now() + Duration::from_secs(86400),
             },
@@ -144,7 +175,7 @@ impl GenerationService {
 
     pub async fn complete(&self, token: &str, request: GenerationRequest) -> Result<GenerationResponse, AgentError> {
         request.validate()?;
-        let target = {
+        let (target, owner) = {
             let route = self.routes.get(&hash(token)).ok_or_else(|| {
                 AgentError::unauthorized("Unknown or expired memory generation route; resubmit the memory operation")
             })?;
@@ -153,7 +184,7 @@ impl GenerationService {
                     "Memory generation route expired; resubmit the memory operation",
                 ));
             }
-            route.target.clone()
+            (route.target.clone(), route.owner.clone())
         };
         if request.model != target.model() {
             return Err(AgentError::bad_request(
@@ -176,6 +207,18 @@ impl GenerationService {
         .map_err(|_| {
             AgentError::timeout("Selected agent memory generation timed out; no alternate model was used")
         })??;
+        if let (Some(bus), Some(owner)) = (&self.usage_bus, owner)
+            && (result.input_tokens > 0 || result.output_tokens > 0)
+        {
+            bus.broadcast(aionui_api_types::WebSocketMessage::new("usage.request",serde_json::json!({
+                "user_id":owner.user,"conversation_id":owner.conversation,"data":{
+                    "request_id":uuid::Uuid::new_v4().to_string(),"provider_id":owner.provider,
+                    "model":request.model,"input_tokens":result.input_tokens,"output_tokens":result.output_tokens,
+                    "cache_read_tokens":result.cache_read_tokens,"cache_creation_tokens":result.cache_creation_tokens,
+                    "context_tokens":0,"context_window":0,"context_reported":false,"breakdown":{}
+                }
+            })));
+        }
         result.validate(&request)?;
         Ok(GenerationResponse::new(request.model, result))
     }

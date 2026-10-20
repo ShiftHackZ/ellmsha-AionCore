@@ -269,6 +269,10 @@ impl AionrsAgentManager {
             config.tools.auto_approve = false;
         }
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .child_preflight(Arc::new(crate::capability::tencent_memory::NativeChildRules {
+                conversation_id: conversation_id.clone(),
+                workspace: workspace.clone(),
+            }))
             .host_delegation(config_extra.host_delegation)
             .runtime_env(runtime_env)
             .host_approval(approval_manager.clone(), Arc::new(protocol_sink));

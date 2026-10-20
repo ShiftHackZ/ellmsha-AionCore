@@ -138,6 +138,10 @@ impl OutputSink for BackendOutputSink {
             .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
     }
 
+    fn emit_usage_report(&self, report: serde_json::Value) {
+        let _ = self.event_tx.send(AgentStreamEvent::UsageReport(report));
+    }
+
     fn emit_error(&self, msg: &str) {
         let _ = self
             .event_tx
@@ -161,6 +165,15 @@ mod tests {
     fn make_sink() -> (BackendOutputSink, broadcast::Receiver<AgentStreamEvent>) {
         let (tx, rx) = broadcast::channel(16);
         (BackendOutputSink::new(tx), rx)
+    }
+
+    #[test]
+    fn usage_is_forwarded_as_metadata_without_finishing_the_turn() {
+        let (sink, mut rx) = make_sink();
+        let report = serde_json::json!({"request_id":"request-one","input_tokens":100,"output_tokens":20});
+        sink.emit_usage_report(report.clone());
+        assert!(matches!(rx.try_recv().unwrap(), AgentStreamEvent::UsageReport(value) if value==report));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

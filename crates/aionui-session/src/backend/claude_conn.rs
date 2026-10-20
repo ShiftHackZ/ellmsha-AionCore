@@ -138,7 +138,7 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// - `init.mcp_servers` → `--mcp-config <json>` + `--strict-mcp-config` (the latter
 ///   ONLY alongside `--mcp-config`: it makes the session ignore the machine's
 ///   ambient `~/.claude` servers, which we must NOT do when we inject none).
-/// - `init.preset_context` → `--system-prompt` (composed `[Assistant Rules]` /
+/// - `init.preset_context` → `--append-system-prompt` (composed `[Assistant Rules]` /
 ///   skills index / team-guide text, already assembled by the app boundary).
 /// - `model` → `--model`; `mode` → `--permission-mode` (claude has no in-band
 ///   switch at spawn; a UI switch persists + evicts so the rebuild re-applies here).
@@ -172,7 +172,16 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        args.push("--system-prompt".to_string());
+        // Ordinary agents retain Claude's native execution/tool-use policy.
+        // Bounded classifier/generation sessions intentionally replace it.
+        args.push(
+            if config.generation_only {
+                "--system-prompt"
+            } else {
+                "--append-system-prompt"
+            }
+            .to_string(),
+        );
         args.push(preset.to_string());
     }
 
@@ -3196,7 +3205,7 @@ mod tests {
         );
     }
 
-    /// preset_context → `--system-prompt`; model → `--model`; mode →
+    /// preset_context → `--append-system-prompt`; model → `--model`; mode →
     /// `--permission-mode`; each omitted independently when its source is empty.
     #[test]
     fn build_claude_init_args_threads_preset_model_mode() {
@@ -3215,7 +3224,11 @@ mod tests {
                 .position(|a| a == flag)
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        assert_eq!(pair("--system-prompt").as_deref(), Some("[Assistant Rules] be precise"));
+        assert_eq!(
+            pair("--append-system-prompt").as_deref(),
+            Some("[Assistant Rules] be precise")
+        );
+        assert!(!args.iter().any(|arg| arg == "--system-prompt"));
         assert_eq!(pair("--model").as_deref(), Some("global.anthropic.claude-opus-4-8"));
         assert_eq!(pair("--permission-mode").as_deref(), Some("plan"));
 
@@ -3234,7 +3247,9 @@ mod tests {
         };
         let blank_args = build_claude_init_args(&blank);
         assert!(
-            !blank_args.iter().any(|a| a == "--model" || a == "--system-prompt"),
+            !blank_args
+                .iter()
+                .any(|a| a == "--model" || a == "--system-prompt" || a == "--append-system-prompt"),
             "blank model/preset emit no flags"
         );
         assert_eq!(

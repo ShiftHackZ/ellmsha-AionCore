@@ -107,15 +107,12 @@ impl RouterService {
                 if !scope.isolated_test
                     && !scope.workspace.is_empty()
                     && let Some(context) =
-                        crate::capability::tencent_memory::recall_for_router(scope, prompt, config.local_only).await
+                        crate::capability::tencent_memory::recall_for_router(scope, prompt, config.local_only).await?
                 {
                     memory = context.text;
                     evidence_count = context.source_count;
                 }
-                match self
-                    .classify_custom(user, config, target, prompt, &memory, &scope.workspace)
-                    .await
-                {
+                match self.classify_custom(user, config, target, prompt, &memory, scope).await {
                     Ok(Some(id)) => {
                         classification_reason = format!("custom_class:{id}");
                         selected_class = Some(id);
@@ -163,7 +160,7 @@ impl RouterService {
         reasons.push(classification_reason);
         if config.local_only {
             reasons.push("local_inference_only".into());
-            reasons.push("memory_locality_unverified_skipped".into());
+            reasons.push("optional_semantic_recall_skipped_local_only".into());
         }
         let decision = RouterDecision {
             id: uuid::Uuid::new_v4().to_string(),
@@ -181,15 +178,16 @@ impl RouterService {
         Ok((decision, selected.backend.clone()))
     }
 
-    async fn classify_custom(
+    pub(super) async fn classify_custom(
         &self,
         user: &str,
         config: &RouterConfig,
         target: &RouterTarget,
         prompt: &str,
         memory: &str,
-        workspace: &str,
+        scope: &MemoryRecallScope,
     ) -> Result<Option<String>, AgentError> {
+        let workspace = &scope.workspace;
         let generation_target = match target {
             RouterTarget::Provider { provider_id, model } => {
                 let row = self
@@ -258,6 +256,20 @@ impl RouterService {
         };
         let completion =
             crate::generation::complete_stateless(generation_target, &request, Duration::from_secs(20), 4096).await?;
+        // Attribute the actual classifier call even when its answer is malformed.
+        if let (Some(bus), Some(conversation)) = (&self.usage_bus, &scope.conversation_id)
+            && (completion.input_tokens > 0 || completion.output_tokens > 0)
+        {
+            let provider = target.id();
+            bus.broadcast(aionui_api_types::WebSocketMessage::new("usage.request",json!({
+                "user_id":user,"conversation_id":conversation,"data":{
+                    "request_id":uuid::Uuid::new_v4().to_string(),"provider_id":provider,
+                    "model":target.model(),"input_tokens":completion.input_tokens,"output_tokens":completion.output_tokens,
+                    "cache_read_tokens":completion.cache_read_tokens,"cache_creation_tokens":completion.cache_creation_tokens,
+                    "context_tokens":0,"context_window":0,"context_reported":false,"breakdown":{}
+                }
+            })));
+        }
         parse_match(&completion.content, &config.classes)
     }
 }

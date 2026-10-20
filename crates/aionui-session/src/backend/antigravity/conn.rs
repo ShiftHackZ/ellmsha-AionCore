@@ -545,13 +545,26 @@ impl AntigravitySessionBackend {
         None
     }
 
+    fn routed_model_for_turn(&self) -> Result<Option<String>, BackendError> {
+        let model = self.effective_model();
+        if let Some(expected) = &self.config.required_model
+            && model.as_ref() != Some(expected)
+        {
+            return Err(BackendError::SetupRejected(
+                "Auto Router model unavailable; refusing default model fallback".into(),
+            ));
+        }
+        Ok(model)
+    }
+
     async fn start_turn(&self, content: Vec<ContentBlock>) -> Result<u64, BackendError> {
+        let model = self.routed_model_for_turn()?;
         let turn_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let input = ArgvInput {
             prompt: Self::prompt_text(&content),
             resume_conversation_id: self.anchor.lock().await.clone(),
             workspace: self.config.cwd.clone(),
-            model: self.effective_model(),
+            model,
             mode: self.effective_mode(),
         };
         let spec = CommandSpec {
@@ -588,6 +601,7 @@ impl AntigravitySessionBackend {
         // to outlive this reader task.
         let anchor = Arc::clone(&self.anchor);
         let current = Arc::clone(&self.current);
+        let required_model = self.config.required_model.clone();
 
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, BufReader};
@@ -608,6 +622,27 @@ impl AntigravitySessionBackend {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let Some(ev) = parse_line(&line) else { continue };
+                    if let (Some(expected), super::wire::AgyEvent::Init(init)) = (&required_model, &ev)
+                        && init.model.as_ref() != Some(expected)
+                    {
+                        // The captured init.model echo is authoritative; agy can
+                        // silently ignore --model even when argv was pinned.
+                        tracing::warn!(session_id, "Auto Router rejected Antigravity model fallback");
+                        let _ = event_tx.send(SessionEnvelope {
+                            session_id: session_id.clone(),
+                            turn_gen,
+                            event: SessionEvent::TurnResult {
+                                is_error: true,
+                                api_error_status: None,
+                                result_text: "Selected Auto Router model was not confirmed; execution stopped".into(),
+                                epoch: 0,
+                                outcome: crate::event::TurnOutcome::Failed,
+                            },
+                        });
+                        saw_terminal = true;
+                        let _ = proc.kill(std::time::Duration::from_secs(2)).await;
+                        break;
+                    }
                     for out in translator.translate(ev) {
                         match out {
                             SessionEvent::MessageDelta { item_id, text } => {
@@ -1524,6 +1559,20 @@ mod tests {
             Some("gemini-3.1-pro-preview"),
         );
         assert_eq!(b.effective_model(), None);
+    }
+
+    #[test]
+    fn frozen_router_model_never_falls_back_to_default() {
+        let mut backend = backend_with_models(&["available"], Some("missing"));
+        backend.config.required_model = Some("missing".into());
+        assert!(matches!(
+            backend.routed_model_for_turn(),
+            Err(BackendError::SetupRejected(_))
+        ));
+        backend.config.model = Some("available".into());
+        assert!(backend.routed_model_for_turn().is_err());
+        backend.config.required_model = Some("available".into());
+        assert_eq!(backend.routed_model_for_turn().unwrap().as_deref(), Some("available"));
     }
 
     #[test]

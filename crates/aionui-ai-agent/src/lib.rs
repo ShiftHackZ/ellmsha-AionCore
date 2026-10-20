@@ -20,7 +20,8 @@ mod mcp_approval;
 /// clean-slate `aionui-agent-context::mcp_resolve` — the SSOT that turns a
 /// conversation's configured MCP servers into the SDK-free `SessionMcpServer`
 /// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
-pub(crate) mod mcp_resolve;
+pub(crate) mod mcp_discovery;
+mod mcp_resolve;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -39,7 +40,7 @@ pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;
 #[cfg(any(test, feature = "test-support"))]
 pub use agent_task::IMockAgent;
-pub use agent_task::{AgentInstance, IAgentTask};
+pub use agent_task::{AgentInstance, IAgentTask, PreparedAgentMessage};
 pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,

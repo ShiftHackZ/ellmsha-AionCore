@@ -42,6 +42,8 @@ fn generation_cli_isolation_drops_parent_tools_history_skills_and_runtime_tokens
 #[test]
 fn generation_cli_projects_external_tool_calls_and_rejects_unknown_functions() {
     let mut result = Completion {
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         content: r#"{"content":"","tool_calls":[{"name":"read_file","arguments":"{\"path\":\"scene.md\"}"}]}"#.into(),
         tools: vec![],
         input_tokens: 0,

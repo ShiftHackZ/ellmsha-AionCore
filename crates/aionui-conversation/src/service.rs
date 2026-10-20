@@ -1282,9 +1282,14 @@ impl ConversationService {
             };
             extra["workspace"] = serde_json::Value::String(workspace.clone());
             let scope = MemoryRecallScope {
+                conversation_id: extra
+                    .pointer("/router_child/parent_conversation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 workspace: workspace.clone(),
                 roots: vec![workspace],
                 isolated_test: tool_scope.is_session_only(),
+                guidance_only: tool_scope.is_session_only(),
                 ..Default::default()
             };
             let facts = aionui_api_types::RouterRequirements {
@@ -4526,6 +4531,7 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
         AgentError::Forbidden(_) => "FORBIDDEN",
         AgentError::NotFound(_) => "NOT_FOUND",
         AgentError::Conflict(_) => "CONFLICT",
+        AgentError::RequiredGuidanceUnavailable(_) => "PROJECT_RULES_UNAVAILABLE",
         AgentError::BadGateway(_) | AgentError::Acp(_) => "BAD_GATEWAY",
         AgentError::Timeout(_) => "TIMEOUT",
         AgentError::RateLimited => "RATE_LIMITED",
@@ -4580,11 +4586,9 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options(row, seed)
                 .await?;
-        if options.context.is_session_only() {
-            options.memory_recall.isolated_test = true;
-        } else {
-            options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
-        }
+        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await?;
+        options.memory_recall.guidance_only = options.context.is_session_only();
+        options.memory_recall.isolated_test = options.context.is_session_only() && row.project_id.is_none();
         if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
             .ok()
             .and_then(|v| v.get("routing").cloned())
@@ -4615,11 +4619,9 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options_with_workspace_override(row, workspace_override, seed)
                 .await?;
-        if options.context.is_session_only() {
-            options.memory_recall.isolated_test = true;
-        } else {
-            options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await;
-        }
+        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await?;
+        options.memory_recall.guidance_only = options.context.is_session_only();
+        options.memory_recall.isolated_test = options.context.is_session_only() && row.project_id.is_none();
         if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
             .ok()
             .and_then(|v| v.get("routing").cloned())
@@ -4639,9 +4641,15 @@ impl ConversationService {
         Ok(options)
     }
 
-    async fn memory_recall_scope(&self, row: &ConversationRow, runtime_workspace: &str) -> MemoryRecallScope {
+    async fn memory_recall_scope(
+        &self,
+        row: &ConversationRow,
+        runtime_workspace: &str,
+    ) -> Result<MemoryRecallScope, ConversationError> {
         let mut scope = MemoryRecallScope {
+            conversation_id: Some(row.id.clone()),
             isolated_test: false,
+            guidance_only: false,
             project_id: row.project_id.clone(),
             project_name: None,
             workspace: runtime_workspace.to_owned(),
@@ -4661,34 +4669,51 @@ impl ConversationService {
                 })
                 .collect(),
         };
-        let (Some(project_id), Some(project_service)) = (
-            row.project_id.as_deref(),
-            self.project_service.read().ok().and_then(|guard| guard.clone()),
-        ) else {
-            return scope;
+        self.bind_project_memory_scope(&row.user_id, &mut scope).await?;
+        Ok(scope)
+    }
+
+    async fn bind_project_memory_scope(
+        &self,
+        user_id: &str,
+        scope: &mut MemoryRecallScope,
+    ) -> Result<(), ConversationError> {
+        let Some(project_id) = scope.project_id.as_deref() else {
+            return Ok(());
         };
-        let Ok(project) = project_service.get_project(&row.user_id, project_id).await else {
-            warn!(
-                conversation_id = %row.id,
-                project_id,
-                "Registered project scope unavailable for memory recall; using workspace scope"
-            );
-            return scope;
-        };
+        let project_service = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| {
+                ConversationError::internal(
+                    "Required project guidance unavailable: project service is not ready; task not started",
+                )
+            })?;
+        let project = project_service.get_project(user_id, project_id).await.map_err(|_| {
+            ConversationError::internal(
+                "Required project guidance unavailable: registered project could not be resolved; task not started",
+            )
+        })?;
         let mut project_workspace = None;
         let roots = project
             .explorer
             .entries
             .into_iter()
-            .filter_map(|entry| {
-                let path = canonical::uri_to_path(&entry.folder.resource_uri).ok()?;
+            .map(|entry| {
+                let path = canonical::uri_to_path(&entry.folder.resource_uri).map_err(|_| {
+                    ConversationError::internal(
+                        "Required project guidance unavailable: project root could not be resolved; task not started",
+                    )
+                })?;
                 let path = path.to_string_lossy().into_owned();
                 if entry.role == "workspace" {
                     project_workspace = Some(path.clone());
                 }
-                Some(path)
+                Ok(path)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ConversationError>>()?;
         scope.project_name = Some(project.name);
         if !roots.is_empty() {
             scope.roots = roots;
@@ -4696,7 +4721,7 @@ impl ConversationService {
         if let Some(project_workspace) = project_workspace {
             scope.workspace = project_workspace;
         }
-        scope
+        Ok(())
     }
 
     async fn include_managed_global_skills(&self, options: &mut BuildTaskOptions) {

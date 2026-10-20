@@ -97,8 +97,12 @@ impl BuildTaskOptions {
 /// provider adapters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryRecallScope {
+    /// Host-owned conversation identity for attributing auxiliary model usage.
+    pub conversation_id: Option<String>,
     /// Explicit synthetic integration-test scope; no real durable knowledge is read or written.
     pub isolated_test: bool,
+    /// An explicitly isolated project chat still receives mandatory rules, but no optional recall.
+    pub guidance_only: bool,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
     pub workspace: String,

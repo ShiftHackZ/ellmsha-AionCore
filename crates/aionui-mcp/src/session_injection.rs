@@ -123,7 +123,10 @@ pub fn parse_acp_mcp_capabilities(response: &serde_json::Value) -> AcpMcpCapabil
 
     let http = bool_field(caps, "http");
     let sse = bool_field(caps, "sse");
-    let stdio = bool_field(caps, "stdio") || http || sse;
+    // ACP schema v1 McpCapabilities advertises optional HTTP/SSE; stdio is
+    // the baseline transport, not an optional flag. Respect an explicit vendor
+    // extension disabling it, while retaining the existing HTTP/SSE implication.
+    let stdio = caps.get("stdio").and_then(serde_json::Value::as_bool).unwrap_or(true) || http || sse;
 
     AcpMcpCapabilities { stdio, http, sse }
 }
@@ -318,6 +321,12 @@ mod tests {
     }
 
     // -- parse_acp_mcp_capabilities -------------------------------------------
+
+    #[test]
+    fn standard_acp_capabilities_without_stdio_flag_keep_baseline_transport() {
+        assert!(parse_acp_mcp_capabilities(&serde_json::json!({"mcpCapabilities":{"http":false,"sse":false}})).stdio);
+        assert!(!parse_acp_mcp_capabilities(&serde_json::json!({"mcpCapabilities":{"stdio":false}})).stdio);
+    }
 
     #[test]
     fn parse_full_capabilities() {

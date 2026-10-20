@@ -77,10 +77,18 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
     union
 }
 
-/// Shared, cheaply-cloneable runtime state for a session task: the broadcast sender
-/// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
+/// Host-owned identity used only for usage attribution.
+#[derive(Clone)]
+struct UsageTarget {
+    provider: String,
+    model: String,
+    resumed: bool,
+}
+
+/// Shared session events and liveness bookkeeping.
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
+    usage_target: std::sync::Mutex<Option<UsageTarget>>,
     last_activity_ms: AtomicI64,
     /// Coarse status derived from the FSM edge the translator observes.
     status: std::sync::Mutex<Option<ConversationStatus>>,
@@ -486,6 +494,7 @@ impl SessionAgentTask {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
             tx,
+            usage_target: std::sync::Mutex::new(None),
             last_activity_ms: AtomicI64::new(now_ms()),
             status: std::sync::Mutex::new(None),
             session_id: std::sync::Mutex::new(None),
@@ -1456,7 +1465,7 @@ pub async fn build_antigravity_instance(
         workspace,
         managed_skill_roots: _,
         config,
-        required_model: _,
+        required_model,
         metadata,
         session_snapshot,
         backend_session_id,
@@ -1497,6 +1506,9 @@ pub async fn build_antigravity_instance(
         mcp_servers = coordination;
     }
 
+    crate::mcp_discovery::prepare_specs(&mut mcp_servers)
+        .await
+        .map_err(AgentError::internal)?;
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
@@ -1521,6 +1533,7 @@ pub async fn build_antigravity_instance(
         mode,
         init,
         permission_hook_body,
+        required_model,
         // agy is NOT shipped with the app: it is a large native binary the user
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
@@ -1529,6 +1542,11 @@ pub async fn build_antigravity_instance(
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
 
+    let usage_target = UsageTarget {
+        provider: metadata.id.clone(),
+        model: session_config.model.clone().unwrap_or_default(),
+        resumed: !matches!(&spec, aionui_session::SessionSpec::Fresh { .. }),
+    };
     let backend = AntigravityConnection::new(spawner)
         .open_session(spec, session_config)
         .await
@@ -1554,6 +1572,7 @@ pub async fn build_antigravity_instance(
         None,
         Some(broadcaster),
     );
+    *task.runtime.usage_target.lock().expect("usage target mutex") = Some(usage_target);
     Ok(crate::agent_task::AgentInstance::Session(task))
 }
 
@@ -1627,6 +1646,9 @@ pub async fn build_session_instance(
     }
 
     // GAP #4 — preset_context + skills carried into the init surface.
+    crate::mcp_discovery::prepare_specs(&mut mcp_servers)
+        .await
+        .map_err(AgentError::internal)?;
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
@@ -1786,6 +1808,11 @@ pub async fn build_session_instance(
         }
     }
 
+    let usage_target = UsageTarget {
+        provider: metadata.id.clone(),
+        model: session_config.model.clone().unwrap_or_default(),
+        resumed: !matches!(&spec, aionui_session::SessionSpec::Fresh { .. }),
+    };
     let generation_config = session_config.clone();
     let backend = connection
         .open_session(spec, session_config)
@@ -1847,6 +1874,7 @@ pub async fn build_session_instance(
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
     );
+    *task.runtime.usage_target.lock().expect("usage target mutex") = Some(usage_target);
     *task.generation.lock().expect("generation mutex") = Some(crate::generation::GenerationTarget::Cli {
         backend: backend_label.to_owned(),
         config: Box::new(generation_config),
@@ -3063,11 +3091,56 @@ fn spawn_event_pump(
                 } => runtime.set_session_id(bid.clone()),
                 _ => {}
             }
+            if let SessionEvent::ConfigChanged { model: Some(model), .. } = &env.event {
+                runtime.set_model_override(model.clone());
+            }
             // Persist the Tier-2 side-effects the legacy ACP path wrote via
             // AcpSessionSyncService (which this direct-CLI path bypasses). Best-effort:
             // a repo error is warn-logged, never fatal to the stream.
             if let Some(repo) = session_repo.as_ref() {
                 persist_side_effects(repo.as_ref(), &user_id, &conversation_id, &env.event).await;
+            }
+            if let (
+                Some(bus),
+                SessionEvent::UsageDelta {
+                    total_tokens,
+                    context_window,
+                    breakdown,
+                    ..
+                },
+            ) = (broadcaster.as_ref(), &env.event)
+                && let Some(target) = runtime.usage_target.lock().ok().and_then(|v| v.clone())
+            {
+                let billing_reported = breakdown.accounting.is_some();
+                let accounting = breakdown.accounting.clone().unwrap_or_default();
+                let model = accounting
+                    .model
+                    .clone()
+                    .or_else(|| runtime.model_override())
+                    .unwrap_or(target.model);
+                let source = accounting
+                    .source
+                    .clone()
+                    .or_else(|| runtime.session_id.lock().ok().and_then(|v| v.clone()))
+                    .unwrap_or_else(|| env.session_id.clone());
+                let counter = accounting.cumulative.then(|| {
+                    serde_json::json!({
+                        "source": format!("{}:{source}",target.provider), "baseline_if_unknown":target.resumed
+                    })
+                });
+                let report_id = accounting
+                    .report_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                bus.broadcast(aionui_api_types::WebSocketMessage::new("usage.request", serde_json::json!({
+                    "user_id":user_id,"conversation_id":conversation_id,"data":{
+                        "request_id":format!("{conversation_id}:{report_id}"), "provider_id":target.provider,
+                        "model":model,"counter":counter,"billing_reported":billing_reported,"input_tokens":accounting.input_tokens,
+                        "output_tokens":accounting.output_tokens,"cache_read_tokens":accounting.cache_read_tokens,
+                        "cache_creation_tokens":accounting.cache_creation_tokens,"context_tokens":total_tokens,
+                        "context_window":context_window.unwrap_or(0),"breakdown":{"unattributed":total_tokens}
+                    }
+                })));
             }
             // Usage must ALSO reach the live view directly. claude reports it on the
             // `result` frame, which lands after the relay has already broken on
@@ -5027,6 +5100,7 @@ mod translate_tests {
                     cached_read_tokens: 16_900,
                     cached_write_tokens: 79,
                     thought_tokens: 242,
+                    accounting: None,
                 },
             },
             "conv-1",

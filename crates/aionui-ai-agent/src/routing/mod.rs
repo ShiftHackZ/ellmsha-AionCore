@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct RouterService {
+    usage_bus: Option<Arc<dyn aionui_realtime::EventBroadcaster>>,
     providers: Arc<dyn IProviderRepository>,
     preferences: Arc<dyn IClientPreferenceRepository>,
     registry: Arc<AgentRegistry>,
@@ -33,6 +34,7 @@ impl RouterService {
         key: [u8; 32],
     ) -> Self {
         Self {
+            usage_bus: None,
             providers,
             preferences,
             registry,
@@ -40,6 +42,10 @@ impl RouterService {
             outcomes: None,
             session_spawner: None,
         }
+    }
+    pub fn with_usage_broadcaster(mut self, bus: Arc<dyn aionui_realtime::EventBroadcaster>) -> Self {
+        self.usage_bus = Some(bus);
+        self
     }
     pub fn with_outcomes(mut self, outcomes: Arc<dyn aionui_db::IRouterOutcomeRepository>) -> Self {
         self.outcomes = Some(outcomes);
@@ -243,7 +249,7 @@ impl RouterService {
         let mut evidence_count = 0;
         let mut inference_reason = "classification_unconfigured_conservative_keywords".to_owned();
         if !scope.isolated_test && !scope.workspace.is_empty() {
-            let memory = crate::capability::tencent_memory::recall_for_router(scope, prompt, config.local_only).await;
+            let memory = crate::capability::tencent_memory::recall_for_router(scope, prompt, config.local_only).await?;
             if let Some(memory) = memory {
                 context = memory.text;
                 evidence_count = memory.source_count;
@@ -288,7 +294,7 @@ impl RouterService {
         reasons.push(inference_reason);
         if config.local_only {
             reasons.push("local_inference_only".into());
-            reasons.push("memory_locality_unverified_skipped".into());
+            reasons.push("optional_semantic_recall_skipped_local_only".into());
         }
         let decision = RouterDecision {
             id: uuid::Uuid::new_v4().to_string(),

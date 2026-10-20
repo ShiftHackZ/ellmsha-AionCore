@@ -103,6 +103,8 @@ pub(super) async fn complete_bounded(
         .await
         .map_err(|_| AgentError::bad_gateway("Selected provider could not start memory generation"))?;
     let mut result = Completion {
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         content: String::new(),
         tools: vec![],
         input_tokens: 0,
@@ -129,6 +131,8 @@ pub(super) async fn complete_bounded(
                 },
             }),
             LlmEvent::Done { stop_reason, usage } => {
+                result.cache_read_tokens = usage.cache_read_tokens;
+                result.cache_creation_tokens = usage.cache_creation_tokens;
                 result.input_tokens = usage.input_tokens;
                 result.output_tokens = usage.output_tokens;
                 result.truncated = stop_reason == StopReason::MaxTokens;

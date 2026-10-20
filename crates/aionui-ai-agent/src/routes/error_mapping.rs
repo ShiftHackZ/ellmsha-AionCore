@@ -12,7 +12,9 @@ pub(crate) fn agent_error_to_api_error(err: AgentError) -> ApiError {
         AgentError::Forbidden(message) => ApiError::Forbidden(message),
         AgentError::NotFound(message) => ApiError::NotFound(message),
         AgentError::Conflict(message) => ApiError::Conflict(message),
-        AgentError::BadGateway(message) => ApiError::BadGateway(message),
+        AgentError::BadGateway(message) | AgentError::RequiredGuidanceUnavailable(message) => {
+            ApiError::BadGateway(message)
+        }
         AgentError::Timeout(message) => ApiError::Timeout(message),
         AgentError::RateLimited => ApiError::RateLimited,
         AgentError::ConversationArchived(message) => ApiError::ConversationArchived(message),

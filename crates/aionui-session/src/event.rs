@@ -25,7 +25,21 @@
 /// `result.usage` plus the `thinking_tokens` summed off each `message_delta`,
 /// codex via `tokenUsage.last`. Backends that report none leave it zeroed, and
 /// the renderer then omits the line entirely.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Billing measurements carry their own semantics, separate from context used.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageAccounting {
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    /// Session totals require durable differencing, never addition.
+    pub cumulative: bool,
+    pub source: Option<String>,
+    pub report_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageBreakdown {
     /// Cache HITS — tokens read from an existing prefix cache.
     pub cached_read_tokens: u64,
@@ -33,6 +47,8 @@ pub struct UsageBreakdown {
     pub cached_write_tokens: u64,
     /// Reasoning/thinking tokens, billed as output but rendered separately.
     pub thought_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<UsageAccounting>,
 }
 
 impl UsageBreakdown {
@@ -40,7 +56,7 @@ impl UsageBreakdown {
     /// from "this backend tells us nothing", so it is omitted rather than rendered
     /// as a row of zeros.
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        self.cached_read_tokens == 0 && self.cached_write_tokens == 0 && self.thought_tokens == 0
     }
 }
 

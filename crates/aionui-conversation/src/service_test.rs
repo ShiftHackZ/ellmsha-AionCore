@@ -6062,6 +6062,27 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
 }
 
 #[tokio::test]
+async fn required_guidance_outage_does_not_mark_agent_unavailable() {
+    let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let feedback = Arc::new(RecordingAvailabilityFeedback::default());
+    svc.with_agent_availability_feedback(feedback.clone());
+    let mut req = make_create_req();
+    req.extra = json!({"backend":"claude", "agent_id":"memory-outage-agent", "agent_source":"custom", "workspace":ensure_test_workspace_path()});
+    let conv = svc.create("user_1", req).await.unwrap();
+    let agent = ScriptedAgent::new(&conv.id, vec![]).with_send_error(AgentSendError::from_agent_error(
+        AgentError::RequiredGuidanceUnavailable("Required project rules unavailable; task not started".into()),
+    ));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+    let manager: Arc<dyn IWorkerTaskManager> = task_mgr;
+    svc.send_message("user_1", &conv.id, make_send_req(), &manager)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+    assert!(feedback.failures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn send_message_records_agent_availability_feedback_on_send_success() {
     let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());
@@ -6576,12 +6597,14 @@ async fn cancel_timeout_kills_acp_task_when_turn_still_claimed() {
 
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
-    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
 
     let send = svc
         .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
         .await
         .unwrap();
+    // Exercise a genuinely hung backend, not a turn cancelled before dispatch.
+    agent.wait_until_send_started().await;
 
     svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr_dyn)
         .await

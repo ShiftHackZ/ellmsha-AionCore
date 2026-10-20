@@ -579,6 +579,17 @@ impl StreamRelay {
                                 self.adapter.persist_tip(data).await;
                             }
                         }
+                        AgentStreamEvent::UsageReport(data) => {
+                            // Accounting must never look like assistant content or wake a UI loader.
+                            self.broadcaster.broadcast(WebSocketMessage::new(
+                                "usage.request",
+                                json!({
+                                    "user_id": self.user_id,
+                                    "conversation_id": self.conversation_id,
+                                    "data": data,
+                                }),
+                            ));
+                        }
                         AgentStreamEvent::CronTrigger(_)
                         | AgentStreamEvent::Permission(_)
                         | AgentStreamEvent::AcpPermission(_) => {
@@ -696,6 +707,7 @@ impl StreamRelay {
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::Subagent(_) => "Subagent",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
+            AgentStreamEvent::UsageReport(_) => "UsageReport",
         }
     }
 

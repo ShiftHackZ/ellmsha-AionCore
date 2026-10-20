@@ -191,3 +191,42 @@ async fn session_only_scope_cannot_fall_back_to_ambient_on_malformed_runtime_con
     let error = svc.build_task_options(&row).await.unwrap_err();
     assert!(error.to_string().contains("Invalid session_only runtime configuration"));
 }
+
+#[tokio::test]
+async fn session_only_project_chat_keeps_required_guidance_but_not_optional_recall() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _broadcaster, repo, _) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+    let chat = svc.create("user_1", isolated_request(tmp.path())).await.unwrap();
+    let row = repo.get("user_1", &chat.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_some());
+    let options = svc.build_task_options(&row).await.unwrap();
+    assert!(options.context.is_session_only());
+    assert!(options.memory_recall.project_id.is_some());
+    assert!(options.memory_recall.guidance_only);
+    assert!(
+        !options.memory_recall.isolated_test,
+        "a registered project must not bypass required rules"
+    );
+}
+
+#[tokio::test]
+async fn unresolved_registered_project_cannot_fall_back_to_workspace_rules() {
+    let (svc, _broadcaster, repo, _) = make_service();
+    let chat = svc.create("user_1", make_create_req()).await.unwrap();
+    let mut row = repo.get("user_1", &chat.id).await.unwrap().unwrap();
+    row.project_id = Some("registered-project-cannot-be-resolved".into());
+    let error = svc.build_task_options(&row).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("project service is not ready; task not started")
+    );
+    let error = svc.build_task_options_for_runtime(&row, None).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("project service is not ready; task not started")
+    );
+}

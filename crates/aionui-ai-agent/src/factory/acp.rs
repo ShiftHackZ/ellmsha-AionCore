@@ -8,6 +8,7 @@ use crate::factory::acp_launch_policy::{AcpLaunchPolicyInput, apply_acp_launch_p
 use crate::factory::context::FactoryContext;
 use crate::manager::acp::{AcpAgentManager, CatalogForwarder};
 use crate::registry::AgentRegistry;
+use crate::session_agent::session_server_to_spec;
 use crate::session_context::AcpSessionBuildContext;
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
@@ -18,6 +19,7 @@ use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
+use aionui_session::builtin_browser_launch_env;
 use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
@@ -204,6 +206,11 @@ pub(super) async fn build(
     let mut session_mcp_servers = user_mcp_servers;
     for server in &config.session_mcp_servers {
         if !session_server_supported_by_capabilities(server, &mcp_capabilities) {
+            if server.id == "ellmsha-router" {
+                return Err(AgentError::bad_request(
+                    "Selected ACP agent cannot receive the required Auto Router MCP transport",
+                ));
+            }
             warn!(
                 ctx.conversation_id,
                 server_id = %server.id,
@@ -215,6 +222,11 @@ pub(super) async fn build(
         match session_server_to_sdk_mcp_server(server).await {
             Ok(server) => session_mcp_servers.push(server),
             Err(err) => {
+                if server.id == "ellmsha-router" {
+                    return Err(AgentError::bad_request(
+                        "Could not prepare required Auto Router MCP server",
+                    ));
+                }
                 warn!(
                     ctx.conversation_id,
                     server_id = %server.id,
@@ -226,24 +238,28 @@ pub(super) async fn build(
         }
     }
 
-    let params = Arc::new(
-        assemble_acp_params(
-            ctx.conversation_id.clone(),
-            ctx.user_id.clone(),
-            WorkspaceInfo {
-                path: ctx.workspace,
-                is_custom: ctx.is_custom_workspace,
-            },
-            meta,
-            command_spec,
-            config,
-            session_mcp_servers,
-            session_snapshot,
-            deps.data_dir.clone(),
-            deps.dump_prompts,
-        )
-        .await,
-    );
+    let mut params = assemble_acp_params(
+        ctx.conversation_id.clone(),
+        ctx.user_id.clone(),
+        WorkspaceInfo {
+            path: ctx.workspace,
+            is_custom: ctx.is_custom_workspace,
+        },
+        meta,
+        command_spec,
+        config,
+        session_mcp_servers,
+        session_snapshot,
+        deps.data_dir.clone(),
+        deps.dump_prompts,
+    )
+    .await;
+    if mcp_capabilities.stdio {
+        crate::mcp_discovery::prepare_sdk(&mut params.mcp_servers)
+            .await
+            .map_err(AgentError::internal)?;
+    }
+    let params = Arc::new(params);
 
     let skill_mgr = deps.skill_manager.clone();
     let catalog_tx = deps.agent_registry.catalog_sender();
@@ -257,6 +273,7 @@ pub(super) async fn build(
     }
 
     let arc = Arc::new(agent);
+    arc.start_usage_forwarder(deps.broadcaster.clone());
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
@@ -517,11 +534,13 @@ fn parse_headers(value: Option<&serde_json::Value>) -> Vec<HttpHeader> {
 
 async fn session_server_to_sdk_mcp_server(server: &SessionMcpServer) -> Result<McpServer, String> {
     match &server.transport {
-        SessionMcpTransport::Stdio { command, args, env } => {
+        SessionMcpTransport::Stdio { command, args, .. } => {
             if command.is_empty() {
                 return Err("stdio: missing command".to_owned());
             }
-            let mut entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            // Capture the trusted app browser bridge before runtime resolution
+            // replaces the catalog-authored node command with an absolute path.
+            let mut entries = builtin_browser_launch_env(&session_server_to_spec(server));
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             let (command, args, env) = ensure_stdio_launch(command, args, &entries).await?;
             Ok(McpServer::Stdio(
@@ -586,8 +605,8 @@ async fn ensure_stdio_launch(
 fn row_supported_by_capabilities(row: &McpServerRow, capabilities: &AcpMcpCapabilities) -> bool {
     match row.transport_type.as_str() {
         "stdio" => capabilities.stdio,
-        "http" | "streamable_http" => capabilities.http,
-        "sse" => capabilities.sse,
+        "http" | "streamable_http" => capabilities.http || (capabilities.stdio && crate::mcp_discovery::available()),
+        "sse" => capabilities.sse || (capabilities.stdio && crate::mcp_discovery::available()),
         _ => false,
     }
 }
@@ -595,8 +614,12 @@ fn row_supported_by_capabilities(row: &McpServerRow, capabilities: &AcpMcpCapabi
 fn session_server_supported_by_capabilities(server: &SessionMcpServer, capabilities: &AcpMcpCapabilities) -> bool {
     match server.transport {
         SessionMcpTransport::Stdio { .. } => capabilities.stdio,
-        SessionMcpTransport::Http { .. } | SessionMcpTransport::StreamableHttp { .. } => capabilities.http,
-        SessionMcpTransport::Sse { .. } => capabilities.sse,
+        SessionMcpTransport::Http { .. } | SessionMcpTransport::StreamableHttp { .. } => {
+            capabilities.http || (capabilities.stdio && crate::mcp_discovery::available())
+        }
+        SessionMcpTransport::Sse { .. } => {
+            capabilities.sse || (capabilities.stdio && crate::mcp_discovery::available())
+        }
     }
 }
 

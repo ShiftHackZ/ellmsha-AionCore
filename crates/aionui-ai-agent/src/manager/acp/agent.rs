@@ -478,6 +478,7 @@ pub enum RequiredFullAutoApplication {
 }
 
 pub struct AcpAgentManager {
+    pub(super) usage_resumed: std::sync::atomic::AtomicBool,
     /// Pre-computed, immutable session parameters assembled by the factory.
     pub(super) params: Arc<AcpSessionParams>,
 
@@ -608,6 +609,7 @@ impl AcpAgentManager {
         let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
 
         let manager = Self {
+            usage_resumed: std::sync::atomic::AtomicBool::new(false),
             params,
             session: RwLock::new(session),
             runtime,
@@ -1131,6 +1133,28 @@ impl AcpAgentManager {
         self.session.read().await.session_id().map(ToOwned::to_owned)
     }
 
+    /// Forward trusted usage outside the lifetime of any individual message relay.
+    pub(crate) fn start_usage_forwarder(&self, bus: Arc<dyn aionui_realtime::EventBroadcaster>) {
+        let mut events = self.runtime.subscribe();
+        let user = self.params.user_id.clone();
+        let conversation = self.params.conversation_id.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(AgentStreamEvent::UsageReport(data)) => bus.broadcast(aionui_api_types::WebSocketMessage::new(
+                        "usage.request",
+                        serde_json::json!({"user_id":user,"conversation_id":conversation,"data":data}),
+                    )),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(conversation_id=%conversation,skipped,"ACP accounting events lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
     /// Restore a previously persisted session_id (e.g. from DB on task rebuild).
     /// Enables resume path on next send_message instead of creating a fresh session.
     ///
@@ -1139,6 +1163,7 @@ impl AcpAgentManager {
     /// re-attach to the persisted session before the next prompt. Subsequent
     /// turns — once the resume handshake has run — take the short path.
     pub async fn set_session_id(&self, sid: String) {
+        self.usage_resumed.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut session = self.session.write().await;
         session.set_session_id(DomainSessionId::new(sid));
         session.drain_events();

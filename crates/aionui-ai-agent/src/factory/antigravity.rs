@@ -136,7 +136,7 @@ pub(super) async fn build(
             workspace: ctx.workspace.clone(),
             managed_skill_roots: &ctx.managed_skill_roots,
             config: &config,
-            required_model: None,
+            required_model: frozen_target.map(|target| target.model().to_owned()),
             metadata: &meta,
             session_snapshot: build_context.session_snapshot.as_ref(),
             backend_session_id: build_context.session_id.clone(),

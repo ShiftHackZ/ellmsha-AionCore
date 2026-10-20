@@ -82,7 +82,7 @@ async fn generation_capabilities_reject_missing_unknown_expired_and_model_mismat
 #[test]
 fn generation_context_capability_is_bound_to_conversation() {
     let service = service();
-    let env = service.mcp_env("chat-a");
+    let env = service.mcp_env("user-a", "chat-a", None);
     let token = &env[1].1;
     assert!(service.validate_context_token(token, "chat-a").is_ok());
     assert!(service.validate_context_token(token, "chat-b").is_err());
@@ -149,6 +149,8 @@ fn generation_json_object_rejects_arrays_and_scalars() {
     request.response_format = Some(json!({"type":"json_object"}));
     for content in ["[]", "123", "\"text\""] {
         let result = super::super::types::Completion {
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             content: content.into(),
             tools: vec![],
             input_tokens: 0,
@@ -157,4 +159,41 @@ fn generation_json_object_rejects_arrays_and_scalars() {
         };
         assert!(result.validate(&request).is_err());
     }
+}
+
+#[tokio::test]
+async fn auxiliary_usage_stays_bound_to_issued_conversation_and_does_not_replace_context() {
+    #[derive(Default)]
+    struct Bus(Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+    impl aionui_realtime::EventBroadcaster for Bus {
+        fn broadcast(&self, message: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+    let bus = Arc::new(Bus::default());
+    let service = service().with_usage_broadcaster(bus.clone());
+    let context = service
+        .issue_target(GenerationTarget::Native {
+            provider: Arc::new(FakeProvider::default()),
+            model: "worker".into(),
+        })
+        .unwrap();
+    service.routes.get_mut(&hash(&context.callback_token)).unwrap().owner = Some(GenerationOwner {
+        user: "owner".into(),
+        conversation: "chat-a".into(),
+        provider: Some("account-a".into()),
+    });
+    service
+        .complete(&context.callback_token, request("worker"))
+        .await
+        .unwrap();
+    let messages = bus.0.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].name, "usage.request");
+    assert_eq!(messages[0].data["conversation_id"], "chat-a");
+    assert_eq!(messages[0].data["user_id"], "owner");
+    assert_eq!(messages[0].data["data"]["provider_id"], "account-a");
+    assert_eq!(messages[0].data["data"]["input_tokens"], 12);
+    assert_eq!(messages[0].data["data"]["output_tokens"], 8);
+    assert_eq!(messages[0].data["data"]["context_reported"], false);
 }

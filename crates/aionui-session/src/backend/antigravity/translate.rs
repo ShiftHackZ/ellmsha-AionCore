@@ -93,7 +93,22 @@ impl Translator {
                 };
                 let mut out = Vec::with_capacity(3);
                 if let Some(u) = r.usage {
-                    out.push(usage_delta(&u));
+                    let mut measurement = usage_delta(&u);
+                    // Result usage is the completed run's aggregate. Step updates
+                    // remain context-only; adding both would double count one run.
+                    if let SessionEvent::UsageDelta { breakdown, .. } = &mut measurement {
+                        breakdown.accounting = Some(crate::event::UsageAccounting {
+                            model: self.current_model.clone(),
+                            input_tokens: u.input_tokens,
+                            output_tokens: u.output_tokens,
+                            cache_read_tokens: u.cache_read_tokens,
+                            cache_creation_tokens: 0,
+                            cumulative: false,
+                            source: None,
+                            report_id: None,
+                        });
+                    }
+                    out.push(measurement);
                 }
                 // BEFORE the terminal, and it MUST stay there. `StreamRelay`
                 // breaks out of its receive loop the moment it sees the turn's
@@ -349,6 +364,7 @@ fn usage_delta(u: &AgyUsage) -> SessionEvent {
             cached_read_tokens: u.cache_read_tokens,
             cached_write_tokens: 0,
             thought_tokens: u.thinking_tokens,
+            accounting: None,
         },
         context_window: None,
     }
