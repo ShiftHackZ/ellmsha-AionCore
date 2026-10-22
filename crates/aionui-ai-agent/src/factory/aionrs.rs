@@ -69,6 +69,19 @@ pub(super) async fn build(
             extra_mcp_servers.entry(name).or_insert(config);
         }
     }
+    for server in &mut overrides.session_mcp_servers {
+        if aionui_session::is_owned_browser_launcher(&crate::session_agent::session_server_to_spec(server))
+            && let SessionMcpTransport::Stdio { env, .. } = &mut server.transport
+        {
+            env.remove("AIONUI_BROWSER_SCOPE_TOKEN");
+            env.extend(
+                ctx.runtime_env
+                    .iter()
+                    .filter(|(name, _)| name == "AIONUI_BROWSER_SCOPE_TOKEN")
+                    .cloned(),
+            );
+        }
+    }
     let mcp_approval_bindings = merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,

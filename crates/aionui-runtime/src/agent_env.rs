@@ -65,6 +65,8 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
         "NODE_INSPECT",
         "NODE_DEBUG",
         "CLAUDECODE",
+        "AIONUI_BROWSER_SCOPE_KEY",
+        "AIONUI_CDP_BRIDGE_TOKEN",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     ] {

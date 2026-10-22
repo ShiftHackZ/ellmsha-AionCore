@@ -797,6 +797,7 @@ const BUILTIN_BROWSER_MCP_ENTRY: &str = "builtin-mcp-browser.js";
 const BUILTIN_BROWSER_MCP_PATH_ENV: &str = "AIONUI_BUILTIN_BROWSER_MCP_PATH";
 const BROWSER_CDP_PORT_ENV: &str = "AIONUI_CDP_ACTIVE_PORT";
 const BROWSER_CDP_TOKEN_ENV: &str = "AIONUI_CDP_BRIDGE_TOKEN";
+const BROWSER_SCOPE_TOKEN_ENV: &str = "AIONUI_BROWSER_SCOPE_TOKEN";
 const BUILTIN_BROWSER_LIFECYCLE_AUTO_TOOLS: [&str; 5] = [
     "browser_tabs_list",
     "browser_tab_open",
@@ -836,13 +837,19 @@ fn is_builtin_browser_mcp(server: &crate::backend::McpServerSpec, trusted_launch
         // receive either current bridge credentials or automatic tool approval.
         && env
             .iter()
-            .all(|(key, _)| key == BROWSER_CDP_PORT_ENV || key == BROWSER_CDP_TOKEN_ENV)
+            .all(|(key, _)| key == BROWSER_CDP_PORT_ENV || key == BROWSER_CDP_TOKEN_ENV || key == BROWSER_SCOPE_TOKEN_ENV)
 }
 
 /// Resolve live browser bridge coordinates for the exact app-owned launcher.
 /// Reused by native and Codex providers; credentials stay only in launch memory.
 pub fn builtin_browser_launch_env(server: &crate::backend::McpServerSpec) -> Vec<(String, String)> {
     builtin_browser_launch_env_with(server, |key| std::env::var(key).ok())
+}
+
+/// True only for the exact catalog-authored launcher, before runtime resolution.
+pub fn is_owned_browser_launcher(server: &crate::backend::McpServerSpec) -> bool {
+    let trusted = std::env::var(BUILTIN_BROWSER_MCP_PATH_ENV).ok();
+    is_builtin_browser_mcp(server, trusted.as_deref())
 }
 
 fn builtin_browser_launch_env_with(
@@ -858,7 +865,7 @@ fn builtin_browser_launch_env_with(
     }
     let mut env = env.clone();
     env.retain(|(key, _)| key != BROWSER_CDP_PORT_ENV && key != BROWSER_CDP_TOKEN_ENV);
-    for key in [BROWSER_CDP_PORT_ENV, BROWSER_CDP_TOKEN_ENV] {
+    for key in [BROWSER_CDP_PORT_ENV] {
         if let Some(value) = read_env(key).filter(|value| !value.trim().is_empty()) {
             env.push((key.to_owned(), value));
         }
@@ -9403,6 +9410,7 @@ mod tests {
                 env: vec![
                     (BROWSER_CDP_PORT_ENV.into(), "stale-port".into()),
                     (BROWSER_CDP_TOKEN_ENV.into(), "stale-token".into()),
+                    (BROWSER_SCOPE_TOKEN_ENV.into(), "scoped-current".into()),
                 ],
             },
         }];
@@ -9414,7 +9422,8 @@ mod tests {
         });
         let env = &value[BUILTIN_BROWSER_MCP_NAME]["env"];
         assert_eq!(env[BROWSER_CDP_PORT_ENV], "60698");
-        assert_eq!(env[BROWSER_CDP_TOKEN_ENV], "current-token");
+        assert!(env.get(BROWSER_CDP_TOKEN_ENV).is_none());
+        assert_eq!(env[BROWSER_SCOPE_TOKEN_ENV], "scoped-current");
     }
 
     #[test]

@@ -193,3 +193,74 @@ mod tests {
         ));
     }
 }
+
+/// Sign a canonical browser ownership snapshot. The signing key is backend-only;
+/// subprocesses receive only this scoped capability, never its issuer key.
+pub fn browser_scope_token(key: &str, user_id: &str, conversation_id: &str, project_id: Option<&str>) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let payload = serde_json::json!({"user_id": user_id, "conversation_id": conversation_id, "project_id": project_id})
+        .to_string();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(encoded.as_bytes());
+    format!(
+        "{encoded}.{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+#[cfg(test)]
+mod browser_scope_tests {
+    use super::browser_scope_token;
+    #[test]
+    fn capability_binds_owner_conversation_and_project() {
+        let token = browser_scope_token("issuer-key", "owner-a", "chat", Some("project-a"));
+        assert_eq!(
+            token,
+            browser_scope_token("issuer-key", "owner-a", "chat", Some("project-a"))
+        );
+        for changed in [
+            browser_scope_token("other-key", "owner-a", "chat", Some("project-a")),
+            browser_scope_token("issuer-key", "owner-b", "chat", Some("project-a")),
+            browser_scope_token("issuer-key", "owner-a", "child", Some("project-a")),
+            browser_scope_token("issuer-key", "owner-a", "chat", None),
+        ] {
+            assert_ne!(token, changed);
+        }
+    }
+}
+
+static BROWSER_SCOPE_SIGNING_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Install once at process startup, before agent runtimes exist.
+pub fn initialize_browser_scope_signing_key(key: String) {
+    if key.len() >= 32 {
+        let _ = BROWSER_SCOPE_SIGNING_KEY.set(key);
+    }
+}
+/// Issuer key remains in Core memory only, never inherited by native tools/MCP.
+pub fn browser_scope_signing_key() -> Option<&'static str> {
+    BROWSER_SCOPE_SIGNING_KEY.get().map(String::as_str)
+}
+
+/// Domain-separated main-process proof for the browser identity endpoint.
+pub fn browser_scope_request_proof(key: &str, conversation_id: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"ellmsha-browser-context-v1:");
+    mac.update(conversation_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+/// Verify the exact request without exposing timing-dependent signature prefixes.
+pub fn verify_browser_scope_request_proof(key: &str, conversation_id: &str, proof: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let Ok(proof) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(proof) else {
+        return false;
+    };
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(b"ellmsha-browser-context-v1:");
+    mac.update(conversation_id.as_bytes());
+    mac.verify_slice(&proof).is_ok()
+}

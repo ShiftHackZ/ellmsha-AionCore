@@ -107,7 +107,7 @@ fn make_aionrs_options(
     model: ProviderWithModel,
     config: AionrsBuildExtra,
 ) -> BuildTaskOptions {
-    BuildTaskOptions::new(AgentSessionContext {
+    let mut options = BuildTaskOptions::new(AgentSessionContext {
         conversation: ConversationContext {
             conversation_id: conversation_id.to_owned(),
             user_id: "system_default_user".to_owned(),
@@ -129,7 +129,10 @@ fn make_aionrs_options(
             team: None,
             belongs_to_team: false,
         })),
-    })
+    });
+    // Provider wiring is a synthetic factory test, without a host project or durable-memory service.
+    options.memory_recall.isolated_test = true;
+    options
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

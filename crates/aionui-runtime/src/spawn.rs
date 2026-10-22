@@ -283,7 +283,9 @@ fn strip_pollution(cmd: &mut Command) {
     cmd.env_remove("NODE_OPTIONS")
         .env_remove("NODE_INSPECT")
         .env_remove("NODE_DEBUG")
-        .env_remove("CLAUDECODE");
+        .env_remove("CLAUDECODE")
+        .env_remove("AIONUI_BROWSER_SCOPE_KEY")
+        .env_remove("AIONUI_CDP_BRIDGE_TOKEN");
 }
 
 #[cfg(unix)]

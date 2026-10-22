@@ -15,7 +15,11 @@ pub(crate) fn available() -> bool {
     std::env::var_os(PATH_ENV).is_some()
 }
 
-async fn wrap(name: &str, transport: SessionMcpTransport) -> Result<SessionMcpTransport, String> {
+async fn wrap(
+    name: &str,
+    transport: SessionMcpTransport,
+    runtime_env: &[(String, String)],
+) -> Result<SessionMcpTransport, String> {
     let Some(script) = std::env::var_os(PATH_ENV) else {
         // Standalone Core/test deployments without the desktop resource bundle
         // retain their transport; native aionrs implements discovery itself.
@@ -40,7 +44,18 @@ async fn wrap(name: &str, transport: SessionMcpTransport) -> Result<SessionMcpTr
                     env: env.clone().into_iter().collect(),
                 },
             };
-            env.extend(builtin_browser_launch_env(&spec));
+            let launch = builtin_browser_launch_env(&spec);
+            let owned = aionui_session::is_owned_browser_launcher(&spec);
+            env.extend(launch);
+            if owned {
+                env.remove("AIONUI_BROWSER_SCOPE_TOKEN");
+                if let Some((name, value)) = runtime_env
+                    .iter()
+                    .find(|(name, _)| name == "AIONUI_BROWSER_SCOPE_TOKEN")
+                {
+                    env.insert(name.clone(), value.clone());
+                }
+            }
             let runtime = ensure_runtime_command(&command)
                 .await
                 .map_err(|_| "MCP upstream runtime unavailable")?;
@@ -87,7 +102,10 @@ async fn wrap(name: &str, transport: SessionMcpTransport) -> Result<SessionMcpTr
     })
 }
 
-pub(crate) async fn prepare_specs(servers: &mut [McpServerSpec]) -> Result<(), String> {
+pub(crate) async fn prepare_specs(
+    servers: &mut [McpServerSpec],
+    runtime_env: &[(String, String)],
+) -> Result<(), String> {
     if !available() {
         return Ok(());
     }
@@ -107,7 +125,8 @@ pub(crate) async fn prepare_specs(servers: &mut [McpServerSpec]) -> Result<(), S
                 headers: headers.iter().cloned().collect(),
             },
         };
-        let SessionMcpTransport::Stdio { command, args, env } = wrap(&server.name, transport).await? else {
+        let SessionMcpTransport::Stdio { command, args, env } = wrap(&server.name, transport, runtime_env).await?
+        else {
             return Err("MCP discovery configuration changed during preparation".into());
         };
         server.transport = McpTransport::Stdio {
@@ -123,7 +142,7 @@ pub(crate) async fn prepare_specs(servers: &mut [McpServerSpec]) -> Result<(), S
     Ok(())
 }
 
-pub(crate) async fn prepare_sdk(servers: &mut [McpServer]) -> Result<(), String> {
+pub(crate) async fn prepare_sdk(servers: &mut [McpServer], runtime_env: &[(String, String)]) -> Result<(), String> {
     if !available() {
         return Ok(());
     }
@@ -153,7 +172,7 @@ pub(crate) async fn prepare_sdk(servers: &mut [McpServer]) -> Result<(), String>
             ),
             _ => return Err("Unsupported MCP transport for discovery".into()),
         };
-        let SessionMcpTransport::Stdio { command, args, env } = wrap(&name, transport).await? else {
+        let SessionMcpTransport::Stdio { command, args, env } = wrap(&name, transport, runtime_env).await? else {
             return Err("MCP discovery configuration changed during preparation".into());
         };
         *server = McpServer::Stdio(

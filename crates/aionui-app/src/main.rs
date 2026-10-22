@@ -17,6 +17,16 @@ use crate::error::MainError;
 // MainError has been moved to src/error.rs
 
 fn main() -> ExitCode {
+    if let Ok(key) = std::env::var("AIONUI_BROWSER_SCOPE_KEY") {
+        // SAFETY: this is the first action in main, before worker threads and
+        // Tokio exist. Remove the issuer secret before any native tool, CLI,
+        // shell, plugin or MCP process can inherit the server environment.
+        unsafe {
+            std::env::remove_var("AIONUI_BROWSER_SCOPE_KEY");
+        }
+        aionui_common::initialize_browser_scope_signing_key(key);
+    }
+
     match run_main() {
         Ok(exit_code) => exit_code,
         Err(error) => {

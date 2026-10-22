@@ -1,30 +1,10 @@
-//! User-scoped usage API and trusted runtime telemetry ingestion.
-use aionui_api_types::{ApiResponse, WebSocketMessage};
-use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
-use aionui_db::{SqlitePool, SqliteUsageRepository, UsageQuery, UsageReport};
-use axum::{
-    Json, Router,
-    extract::{Extension, Query, State},
-    routing::get,
-};
+//! Trusted runtime telemetry ingestion.
+mod routes;
 
-pub fn routes(pool: SqlitePool) -> Router {
-    Router::new().route("/api/usage", get(query)).with_state(pool)
-}
+pub use routes::routes;
 
-async fn query(
-    State(pool): State<SqlitePool>,
-    Extension(user): Extension<CurrentUser>,
-    Query(q): Query<UsageQuery>,
-) -> Result<Json<ApiResponse<aionui_db::UsageResponse>>, ApiError> {
-    q.period().map_err(|e| ApiError::BadRequest(e.into()))?;
-    let data = SqliteUsageRepository::new(pool)
-        .query(&user.id, &q)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(data)))
-}
+use aionui_api_types::WebSocketMessage;
+use aionui_db::{SqlitePool, SqliteUsageRepository, UsageReport};
 
 /// Keep database latency independent from the live WebSocket relay and agent execution.
 pub fn start(pool: SqlitePool, mut events: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>) {

@@ -2538,7 +2538,7 @@ impl ConversationService {
     /// belong to the given user (avoids leaking existence to other users).
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, ConversationError> {
-        let row = self
+        let mut row = self
             .conversation_repo
             .get(user_id, id)
             .await?
@@ -2547,11 +2547,7 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
         self.backfill_extra_inplace(user_id, &row.id, &mut extra).await;
-        // Project-bind side branch: lazily backfill owner binding on read. The
-        // `row` snapshot predates the backfill, so this response still carries
-        // the old (null) project_id; on a real None→Some backfill we broadcast
-        // `conversation.listChanged(updated)` so the client refetches and picks
-        // up the now-bound project_id (parity with create-time delivery).
+        // Resolve lazy owner binding before returning the canonical project identity.
         let project_backfilled = if row.project_id.is_none()
             && let Some(workspace) = extra
                 .get("workspace")
@@ -2562,6 +2558,13 @@ impl ConversationService {
         } else {
             false
         };
+        if project_backfilled {
+            row = self
+                .conversation_repo
+                .get(user_id, id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        }
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         self.attach_assistant_identity(user_id, &mut response).await?;
         response.runtime = Some(self.runtime_summary_for(id).await);
@@ -4604,6 +4607,17 @@ impl ConversationService {
                 .await?;
             options.routing = Some(snapshot);
         }
+        if aionui_common::browser_scope_signing_key().is_some() {
+            match self.browser_context(&row.user_id, &row.id).await {
+                Ok(browser) => options
+                    .context
+                    .runtime_env
+                    .push(("AIONUI_BROWSER_SCOPE_TOKEN".into(), browser.token)),
+                Err(_) => {
+                    warn!(conversation_id = %row.id, "Browser project context unavailable; browser tools remain disabled")
+                }
+            }
+        }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
     }
@@ -4637,8 +4651,138 @@ impl ConversationService {
                 .await?;
             options.routing = Some(snapshot);
         }
+        if aionui_common::browser_scope_signing_key().is_some() {
+            match self.browser_context(&row.user_id, &row.id).await {
+                Ok(browser) => options
+                    .context
+                    .runtime_env
+                    .push(("AIONUI_BROWSER_SCOPE_TOKEN".into(), browser.token)),
+                Err(_) => {
+                    warn!(conversation_id = %row.id, "Browser project context unavailable; browser tools remain disabled")
+                }
+            }
+        }
         self.include_managed_global_skills(&mut options).await;
         Ok(options)
+    }
+
+    /// Fresh ownership check for browser creation and every scoped bridge action.
+    /// Uses the existing lazy project binding and then rereads the canonical row.
+    pub async fn browser_context(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::BrowserContextResponse, ConversationError> {
+        let key = aionui_common::browser_scope_signing_key()
+            .ok_or_else(|| ConversationError::internal("Desktop browser identity is unavailable"))?;
+        self.resolve_browser_context(user_id, id, key).await
+    }
+
+    async fn browser_project_id(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<String>, ConversationError> {
+        let Some(project_id) = project_id else {
+            return Ok(None);
+        };
+        let service = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::internal("Browser project service is unavailable"))?;
+        // Ordinary chats have internal per-workspace project rows of canonical kind `temp`.
+        // They remain in Conversations in the UI and must share Default, including descendants.
+        let temporary = service
+            .is_temporary_project(user_id, project_id)
+            .await
+            .map_err(|_| ConversationError::internal("Browser project binding is unresolved"))?;
+        Ok((!temporary).then(|| project_id.to_owned()))
+    }
+
+    pub(crate) async fn resolve_browser_context(
+        &self,
+        user_id: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<aionui_api_types::BrowserContextResponse, ConversationError> {
+        let conversation = self.get(user_id, id).await?;
+        let row = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)
+            .map_err(|_| ConversationError::internal("Browser context contains invalid metadata"))?;
+        let mut project_id = self.browser_project_id(user_id, row.project_id.as_deref()).await?;
+        let mut ancestor = extra
+            .pointer("/subagent/parent_conversation_id")
+            .or_else(|| extra.pointer("/router_child/parent_conversation_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let mut visited = std::collections::HashSet::from([id.to_owned()]);
+        while let Some(parent) = ancestor {
+            if !visited.insert(parent.clone()) || visited.len() > 32 {
+                return Err(ConversationError::internal("Invalid browser conversation lineage"));
+            }
+            // Owned lookup; a missing/foreign parent is never Default.
+            let parent = self.get(user_id, &parent).await?;
+            let parent_project = self.browser_project_id(user_id, parent.project_id.as_deref()).await?;
+            if project_id.is_some() && project_id != parent_project {
+                return Err(ConversationError::internal("Browser child project binding changed"));
+            }
+            project_id = parent_project;
+            ancestor = parent
+                .extra
+                .pointer("/subagent/parent_conversation_id")
+                .or_else(|| parent.extra.pointer("/router_child/parent_conversation_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+        }
+        if project_id.is_none()
+            && row.project_id.is_none()
+            && visited.len() == 1
+            && let Some(workspace) = extra
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+        {
+            let agent_type = if extra.get("routing").is_some() {
+                AgentType::Acp
+            } else {
+                string_to_enum(&row.r#type)?
+            };
+            let router_backend = serde_json::json!("auto-router");
+            let backend = if extra.get("routing").is_some() {
+                Some(&router_backend)
+            } else {
+                extra.get("backend")
+            };
+            if !crate::session_context::is_auto_workspace(
+                &self.workspace_root,
+                id,
+                &agent_type,
+                backend,
+                Path::new(workspace),
+            ) {
+                return Err(ConversationError::internal("Browser project binding is unresolved"));
+            }
+        }
+        let mut scope = MemoryRecallScope {
+            project_id: project_id.clone(),
+            ..Default::default()
+        };
+        self.bind_project_memory_scope(user_id, &mut scope).await?;
+        if key.len() < 32 {
+            return Err(ConversationError::internal("Desktop browser identity is unavailable"));
+        }
+        Ok(aionui_api_types::BrowserContextResponse {
+            conversation_id: conversation.id,
+            project_name: scope.project_name,
+            token: aionui_common::browser_scope_token(key, user_id, id, project_id.as_deref()),
+            project_id,
+        })
     }
 
     async fn memory_recall_scope(

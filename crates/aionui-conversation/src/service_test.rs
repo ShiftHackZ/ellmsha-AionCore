@@ -8811,3 +8811,104 @@ async fn router_child_lineage_cannot_be_created_by_public_request() {
         assert!(matches!(error,ConversationError::BadRequest {reason} if reason.contains("server-owned")));
     }
 }
+
+#[tokio::test]
+async fn browser_context_reads_the_lazy_bound_row_and_requires_owned_project_records() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+    let conversation = svc.create("user_1", req).await.unwrap();
+    assert!(
+        repo.get("user_1", &conversation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project_id
+            .is_none()
+    );
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+    let context = svc
+        .resolve_browser_context("user_1", &conversation.id, "test-issuer-with-at-least-32-characters")
+        .await
+        .unwrap();
+    assert!(context.project_id.is_some());
+    assert_eq!(
+        context.project_id,
+        repo.get("user_1", &conversation.id).await.unwrap().unwrap().project_id
+    );
+}
+
+#[tokio::test]
+async fn browser_context_never_defaults_when_workspace_binding_is_unresolved() {
+    let (svc, _, _, _) = make_service();
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+    let conversation = svc.create("user_1", req).await.unwrap();
+    let error = svc
+        .resolve_browser_context("user_1", &conversation.id, "test-issuer-with-at-least-32-characters")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("binding is unresolved"));
+    assert!(matches!(
+        svc.resolve_browser_context("user_1", "missing", "test-issuer-with-at-least-32-characters")
+            .await,
+        Err(ConversationError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn browser_default_is_shared_by_real_created_temporary_projects_and_children() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _, repo, _) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+    let mut request = make_create_req();
+    request.extra = json!({"backend": "codex"});
+    let first = svc.create("user_1", request).await.unwrap();
+    let mut request = make_create_req();
+    request.extra = json!({"backend": "codex"});
+    let second = svc.create("user_1", request).await.unwrap();
+    let a = repo.get("user_1", &first.id).await.unwrap().unwrap();
+    let b = repo.get("user_1", &second.id).await.unwrap().unwrap();
+    assert!(a.project_id.is_some());
+    assert_ne!(
+        a.project_id, b.project_id,
+        "ordinary chats have distinct internal temporary projects"
+    );
+    let key = "test-issuer-with-at-least-32-characters";
+    assert_eq!(
+        svc.resolve_browser_context("user_1", &first.id, key)
+            .await
+            .unwrap()
+            .project_id,
+        None
+    );
+    assert_eq!(
+        svc.resolve_browser_context("user_1", &second.id, key)
+            .await
+            .unwrap()
+            .project_id,
+        None
+    );
+    let mut extra: serde_json::Value = serde_json::from_str(&b.extra).unwrap();
+    extra["subagent"] = json!({"parent_conversation_id": first.id});
+    repo.update(
+        "user_1",
+        &second.id,
+        &ConversationRowUpdate {
+            extra: Some(extra.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.resolve_browser_context("user_1", &second.id, key)
+            .await
+            .unwrap()
+            .project_id,
+        None
+    );
+}

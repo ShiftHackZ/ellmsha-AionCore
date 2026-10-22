@@ -219,7 +219,19 @@ pub(super) async fn build(
             );
             continue;
         }
-        match session_server_to_sdk_mcp_server(server).await {
+        let mut server = server.clone();
+        if aionui_session::is_owned_browser_launcher(&session_server_to_spec(&server))
+            && let SessionMcpTransport::Stdio { env, .. } = &mut server.transport
+        {
+            env.remove("AIONUI_BROWSER_SCOPE_TOKEN");
+            env.extend(
+                ctx.runtime_env
+                    .iter()
+                    .filter(|(name, _)| name == "AIONUI_BROWSER_SCOPE_TOKEN")
+                    .cloned(),
+            );
+        }
+        match session_server_to_sdk_mcp_server(&server).await {
             Ok(server) => session_mcp_servers.push(server),
             Err(err) => {
                 if server.id == "ellmsha-router" {
@@ -255,7 +267,7 @@ pub(super) async fn build(
     )
     .await;
     if mcp_capabilities.stdio {
-        crate::mcp_discovery::prepare_sdk(&mut params.mcp_servers)
+        crate::mcp_discovery::prepare_sdk(&mut params.mcp_servers, &ctx.runtime_env)
             .await
             .map_err(AgentError::internal)?;
     }

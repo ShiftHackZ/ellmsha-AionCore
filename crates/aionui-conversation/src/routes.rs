@@ -112,6 +112,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
+        .route("/api/conversations/{id}/browser-context", get(browser_context))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
@@ -555,5 +556,52 @@ mod error_mapping_tests {
         let details = app.error_details().expect("details should be present");
         assert_eq!(details["backend"], "openclaw");
         assert_eq!(details["port"], 18789);
+    }
+}
+
+/// Resolve desktop browser identity using the authenticated user's owned records.
+async fn browser_context(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<ApiResponse<aionui_api_types::BrowserContextResponse>>, ApiError> {
+    let key = aionui_common::browser_scope_signing_key()
+        .ok_or_else(|| ApiError::Forbidden("Browser host proof unavailable".into()))?;
+    verify_browser_host_request(key, &id, &headers)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.browser_context(&user.id, &id).await?,
+    )))
+}
+
+fn verify_browser_host_request(key: &str, id: &str, headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
+    let proof = headers
+        .get("x-ellmsha-browser-proof")
+        .and_then(|value| value.to_str().ok());
+    if headers.contains_key("origin")
+        || !proof.is_some_and(|proof| aionui_common::verify_browser_scope_request_proof(key, id, proof))
+    {
+        return Err(ApiError::Forbidden("Browser identity requires the desktop host".into()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod browser_host_proof_tests {
+    use super::verify_browser_host_request;
+    use axum::http::{HeaderMap, HeaderValue};
+    #[test]
+    fn only_the_exact_main_process_request_can_mint_browser_identity() {
+        let key = "private-test-issuer";
+        let mut headers = HeaderMap::new();
+        assert!(verify_browser_host_request(key, "a", &headers).is_err());
+        headers.insert("x-ellmsha-browser-proof", HeaderValue::from_static("wrong"));
+        assert!(verify_browser_host_request(key, "a", &headers).is_err());
+        let proof = aionui_common::browser_scope_request_proof(key, "a");
+        headers.insert("x-ellmsha-browser-proof", HeaderValue::from_str(&proof).unwrap());
+        assert!(verify_browser_host_request(key, "a", &headers).is_ok());
+        assert!(verify_browser_host_request(key, "b", &headers).is_err());
+        headers.insert("origin", HeaderValue::from_static("https://untrusted.test"));
+        assert!(verify_browser_host_request(key, "a", &headers).is_err());
     }
 }

@@ -1124,3 +1124,18 @@ mod tests {
         assert_eq!(raw["payload"]["name"], "daily-report");
     }
 }
+
+/// Desktop browser ownership resolved from the authenticated conversation and
+/// current project records. `project_id: null` explicitly means Default; errors
+/// must never be interpreted as an unbound conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserContextResponse {
+    /// Canonical conversation ID, including delegated conversations.
+    pub conversation_id: String,
+    /// Current registered project ID; never inferred by the client.
+    pub project_id: Option<String>,
+    /// Human-readable current project name, or None for Default.
+    pub project_name: Option<String>,
+    /// Signed owner/conversation/project capability; do not persist or log it.
+    pub token: String,
+}

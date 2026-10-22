@@ -235,6 +235,18 @@ impl ProjectService {
 
     // ── reads ──────────────────────────────────────────────────────────
 
+    /// Resolve the canonical owner-bound kind without deriving identity from a client workspace.
+    pub async fn is_temporary_project(&self, user_id: &str, project_id: &str) -> Result<bool, ProjectError> {
+        let project =
+            self.store
+                .get_project(user_id, project_id)
+                .await?
+                .ok_or_else(|| ProjectError::ProjectNotFound {
+                    project_id: project_id.to_owned(),
+                })?;
+        Ok(project.kind == "temp")
+    }
+
     pub async fn get_project(&self, user_id: &str, project_id: &str) -> Result<ProjectDetail, ProjectError> {
         let project =
             self.store

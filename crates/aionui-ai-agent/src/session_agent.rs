@@ -1506,7 +1506,7 @@ pub async fn build_antigravity_instance(
         mcp_servers = coordination;
     }
 
-    crate::mcp_discovery::prepare_specs(&mut mcp_servers)
+    crate::mcp_discovery::prepare_specs(&mut mcp_servers, runtime_env)
         .await
         .map_err(AgentError::internal)?;
     let init = SessionInit {
@@ -1646,7 +1646,7 @@ pub async fn build_session_instance(
     }
 
     // GAP #4 — preset_context + skills carried into the init surface.
-    crate::mcp_discovery::prepare_specs(&mut mcp_servers)
+    crate::mcp_discovery::prepare_specs(&mut mcp_servers, runtime_env)
         .await
         .map_err(AgentError::internal)?;
     let init = SessionInit {

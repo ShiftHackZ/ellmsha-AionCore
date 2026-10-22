@@ -554,6 +554,7 @@ dependencies = [
  "axum",
  "base64",
  "getrandom 0.2.17",
+ "hmac 0.12.1",
  "semver",
  "serde",
  "serde_json",

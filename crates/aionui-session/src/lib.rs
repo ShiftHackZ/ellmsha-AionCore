@@ -59,7 +59,7 @@ pub use backend::{
     Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionBackend,
     SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, StateSnapshot, Tier2Checkpoint,
     TransitionReason, VersionDrift, acp_capabilities, antigravity_capabilities, builtin_browser_launch_env,
-    codex_capabilities, command_name, rehydrate, slash_command_name, version_drift,
+    codex_capabilities, command_name, is_owned_browser_launcher, rehydrate, slash_command_name, version_drift,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,

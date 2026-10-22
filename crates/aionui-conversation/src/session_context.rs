@@ -670,7 +670,7 @@ fn auto_workspace_parent(workspace_root: &Path, user_id: &str) -> PathBuf {
 /// under `users/system_default_user/` after an account adoption. Structural
 /// matching fixes both. Mirrors the delete-side
 /// `is_dated_auto_workspace_relative_path` in `service.rs`.
-fn is_auto_workspace(
+pub(crate) fn is_auto_workspace(
     workspace_root: &Path,
     conversation_id: &str,
     agent_type: &AgentType,

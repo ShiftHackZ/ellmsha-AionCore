@@ -17,7 +17,10 @@ mod timestamp;
 mod types;
 
 pub use case_convert::{camel_to_snake, normalize_keys_to_snake_case};
-pub use crypto::{CryptoError, decrypt_string, encrypt_string};
+pub use crypto::{
+    CryptoError, browser_scope_request_proof, browser_scope_signing_key, browser_scope_token, decrypt_string,
+    encrypt_string, initialize_browser_scope_signing_key, verify_browser_scope_request_proof,
+};
 pub use enums::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, FileChangeOperation, McpServerStatus,
     McpSource, MessagePosition, MessageStatus, MessageType, PreviewContentType, ProtocolType, RemoteAgentAuthType,
