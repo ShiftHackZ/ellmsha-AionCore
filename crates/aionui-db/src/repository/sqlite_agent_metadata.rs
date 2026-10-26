@@ -856,8 +856,8 @@ mod tests {
     async fn seed_rows_populated_after_migrations() {
         let (repo, _db) = setup().await;
         let rows = repo.list_all().await.unwrap();
-        // 39 ACP vendors + 2 non-ACP builtins + 2 internal + Antigravity = 44.
-        assert_eq!(rows.len(), 44, "seed rows: 43 pre-existing + virtual Auto Router");
+        // Copilot IDE adds a third internal agent to the existing 44 rows.
+        assert_eq!(rows.len(), 45, "seed rows: 43 pre-existing + Auto Router + Copilot IDE");
         assert!(
             rows.iter()
                 .any(|r| r.name == "Claude Code" && r.agent_source == "builtin")

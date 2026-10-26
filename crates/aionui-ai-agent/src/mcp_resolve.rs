@@ -160,7 +160,12 @@ async fn row_to_session_mcp_server(row: &McpServerRow) -> Result<SessionMcpServe
         id: row.id.clone(),
         name: row.name.clone(),
         transport,
-        approval_identity: None,
+        approval_identity: Some(crate::mcp_approval::registration_identity(
+            &row.id,
+            &row.name,
+            &row.transport_type,
+            &value,
+        )),
         auto_approve_in_unattended: false,
     })
 }

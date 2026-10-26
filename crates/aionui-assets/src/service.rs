@@ -92,6 +92,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copilot_icon_matches_the_bundled_asset_including_release_embedding() {
+        let asset = AssetService.get_logo("tools/copilot.svg").unwrap();
+        assert_eq!(asset.bytes, include_bytes!("../assets/logos/tools/copilot.svg"));
+    }
+
+    #[test]
     fn normalize_logo_path_rejects_traversal() {
         assert!(normalize_logo_path("../brand/aion.svg").is_none());
         assert!(normalize_logo_path("/etc/passwd").is_none());

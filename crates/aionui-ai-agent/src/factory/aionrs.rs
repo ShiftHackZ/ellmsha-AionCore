@@ -56,8 +56,9 @@ pub(super) async fn build(
     } else {
         resolve_mcp_servers(&overrides)
     };
+    let mut mcp_approval_bindings = HashMap::new();
     if !isolated && let Some(repo) = deps.mcp_server_repo.as_ref() {
-        for (name, config) in load_user_mcp_servers(
+        for (name, (config, binding)) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
             &ctx.user_id,
@@ -66,7 +67,10 @@ pub(super) async fn build(
         )
         .await
         {
-            extra_mcp_servers.entry(name).or_insert(config);
+            if let std::collections::hash_map::Entry::Vacant(entry) = extra_mcp_servers.entry(name.clone()) {
+                entry.insert(config);
+                mcp_approval_bindings.insert(name, binding);
+            }
         }
     }
     for server in &mut overrides.session_mcp_servers {
@@ -82,14 +86,16 @@ pub(super) async fn build(
             );
         }
     }
-    let mcp_approval_bindings = merge_session_snapshot_mcp_servers(
-        &mut extra_mcp_servers,
-        &overrides.session_mcp_servers,
-        &ctx.user_id,
-        &ctx.conversation_id,
-        deps.broadcaster.clone(),
-    )
-    .await;
+    mcp_approval_bindings.extend(
+        merge_session_snapshot_mcp_servers(
+            &mut extra_mcp_servers,
+            &overrides.session_mcp_servers,
+            &ctx.user_id,
+            &ctx.conversation_id,
+            deps.broadcaster.clone(),
+        )
+        .await,
+    );
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -493,7 +499,7 @@ async fn load_user_mcp_servers(
     user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
-) -> HashMap<String, McpServerConfig> {
+) -> HashMap<String, (McpServerConfig, String)> {
     let rows_result = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await,
         None => repo.list(user_id).await,
@@ -521,7 +527,16 @@ async fn load_user_mcp_servers(
 
         match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
-                servers.insert(row.name.clone(), config);
+                let source = serde_json::from_str::<serde_json::Value>(&row.transport_config)
+                    .expect("configuration was parsed by row_to_mcp_server_config");
+                let identity =
+                    crate::mcp_approval::registration_identity(&row.id, &row.name, &row.transport_type, &source);
+                let binding = aionui_common::mcp_approvals::mcp_binding(&serde_json::json!([
+                    "managed-account",
+                    identity,
+                    row.name
+                ]));
+                servers.insert(row.name.clone(), (config, binding));
             }
             Err(err) => {
                 warn!(
@@ -1042,7 +1057,7 @@ mod tests {
         .await;
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
-        assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
+        assert_eq!(extra_mcp_servers["mcp-docs"].0.transport, TransportType::StreamableHttp);
     }
 
     #[cfg(unix)]

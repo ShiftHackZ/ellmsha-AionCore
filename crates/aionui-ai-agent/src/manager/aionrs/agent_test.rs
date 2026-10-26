@@ -347,3 +347,19 @@ async fn runtime_can_emit_error_and_finish() {
         other => panic!("Expected Finish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn always_choice_keeps_native_tool_approved_without_legacy_boolean_flag() {
+    let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    let pending = agent
+        .approval_manager
+        .request_approval("call", &aion_protocol::events::ToolCategory::Edit);
+    agent
+        .confirm("message", "call", serde_json::json!({"value":"proceed_always"}), false)
+        .unwrap();
+    assert!(matches!(pending.await.unwrap(), ToolApprovalResult::Approved));
+    assert!(agent.approval_manager.is_auto_approved("edit"));
+    assert!(!agent.approval_manager.is_auto_approved("execute"));
+}

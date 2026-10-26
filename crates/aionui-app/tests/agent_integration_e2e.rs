@@ -353,6 +353,11 @@ async fn agent_logos_endpoint_returns_backend_to_logo_catalog() {
         Some("/api/assets/logos/ai-major/ollama.png")
     );
 
+    assert_eq!(
+        logo_for("copilot-ide").as_deref(),
+        Some("/api/assets/logos/tools/copilot.svg")
+    );
+
     // Every entry carries a non-empty backend + logo, and backends are unique.
     let mut seen = std::collections::HashSet::new();
     for entry in entries {

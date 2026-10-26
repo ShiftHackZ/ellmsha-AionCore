@@ -41,12 +41,14 @@ pub fn resolve_agent_binding_from_rows(rows: &[AgentMetadataRow], value: &str) -
         .min_by_key(|row| agent_match_rank(row))
         .or_else(|| {
             rows.iter()
-                .filter(|row| row.backend.as_deref() == Some(value))
+                .filter(|row| row.backend.as_deref() == Some(value) && row.id != "copilot-ide")
                 .min_by_key(|row| agent_match_rank(row))
         })
         .or_else(|| {
             rows.iter()
-                .filter(|row| row.agent_type == value && row.backend.as_deref() != Some("auto-router"))
+                .filter(|row| {
+                    row.agent_type == value && row.backend.as_deref() != Some("auto-router") && row.id != "copilot-ide"
+                })
                 .min_by_key(|row| agent_match_rank(row))
         })
         .map(binding_resolution_for_agent)

@@ -578,7 +578,7 @@ impl AionrsAgentManager {
         } else {
             let scope = if value == "proceed_mcp_session" {
                 ApprovalScope::Session
-            } else if always_allow || value == "proceed_mcp_always" {
+            } else if always_allow || matches!(value, "proceed_always" | "proceed_mcp_always") {
                 ApprovalScope::Always
             } else {
                 ApprovalScope::Once

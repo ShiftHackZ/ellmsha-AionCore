@@ -1599,7 +1599,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 44, "seed rows: 43 pre-existing + virtual Auto Router");
+        assert_eq!(all.len(), 45, "seed rows: 43 pre-existing + Auto Router + Copilot IDE");
     }
 
     #[tokio::test]
@@ -1719,7 +1719,7 @@ mod tests {
         assert_eq!(count(AgentType::Acp), 39);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
-        assert_eq!(count(AgentType::Aionrs), 2);
+        assert_eq!(count(AgentType::Aionrs), 3);
     }
 
     #[tokio::test]
@@ -1928,7 +1928,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 44, "every row appears once");
+        assert_eq!(snapshot.len(), 45, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {

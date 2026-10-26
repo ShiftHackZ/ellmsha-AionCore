@@ -57,6 +57,14 @@ pub(super) async fn attach_runtime_memory(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     args.push(script.to_string_lossy().into_owned());
+    // Bind to the configured account, not the chat's runtime token/workspace.
+    // Persist only a digest; never the private configuration itself.
+    let account: serde_json::Value = serde_json::from_slice(
+        &tokio::fs::read(&config)
+            .await
+            .map_err(|_| crate::AgentError::internal("Memory configuration unavailable"))?,
+    )
+    .map_err(|_| crate::AgentError::internal("Memory configuration invalid"))?;
     let server = SessionMcpServer {
         id: "ellmsha-tencentdb-memory".into(),
         name: "ellmsha-tencentdb-memory".into(),
@@ -65,7 +73,15 @@ pub(super) async fn attach_runtime_memory(
             args,
             env,
         },
-        approval_identity: None,
+        approval_identity: Some(format!(
+            "host-memory:{}",
+            aionui_common::mcp_approvals::mcp_binding(&serde_json::json!({
+                "gatewayUrl": account["gatewayUrl"], "knowledgeUrl": account["knowledgeUrl"],
+                "serviceId": account["serviceId"], "userId": account["userId"],
+                "teamId": account["teamId"], "agentId": account["agentId"],
+                "gatewayApiKey": account["gatewayApiKey"], "knowledgeServiceKey": account["knowledgeServiceKey"]
+            }))
+        )),
         auto_approve_in_unattended: false,
     };
     let servers = match &mut context.kind {
@@ -139,7 +155,7 @@ async fn attach_chat_history(context: &mut AgentSessionContext) {
         },
         // The server exposes only bounded, authenticated GET requests and every
         // registered tool carries the MCP readOnlyHint.
-        approval_identity: None,
+        approval_identity: Some("host-chat-history-v1".into()),
         auto_approve_in_unattended: true,
     };
     let servers = match &mut context.kind {

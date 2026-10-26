@@ -88,10 +88,15 @@ impl AgentService {
             // which is the vendor `backend` for ACP agents but the `agent_type`
             // for backends without a vendor label (e.g. aionrs, where `backend`
             // is NULL). Key on `backend` when present, otherwise the agent_type.
-            let key = agent
-                .backend
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| agent.agent_type.serde_name().to_owned());
+            let key = if agent.id == "copilot-ide" {
+                // Copilot uses the native harness but owns separate branding.
+                agent.id
+            } else {
+                agent
+                    .backend
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| agent.agent_type.serde_name().to_owned())
+            };
             if key.is_empty() {
                 continue;
             }

@@ -1222,6 +1222,10 @@ impl ConversationService {
                 None => None,
             }
         };
+        validate_copilot_provider(
+            assistant_snapshot.as_ref().map(|snapshot| snapshot.agent_id.as_str()),
+            req.model.as_ref(),
+        )?;
         let is_router = assistant_snapshot
             .as_ref()
             .is_some_and(|s| s.runtime_backend == aionui_api_types::ROUTER_AGENT_ID);
@@ -2662,6 +2666,10 @@ impl ConversationService {
             .await?
             .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
 
+        if req.model.is_some() {
+            let snapshot = self.conversation_repo.get_assistant_snapshot(user_id, id).await?;
+            validate_copilot_provider(snapshot.as_ref().map(|row| row.agent_id.as_str()), req.model.as_ref())?;
+        }
         let old_extra: serde_json::Value = serde_json::from_str(&existing.extra).unwrap_or_default();
         if (old_extra.get("routing").is_some() || old_extra.get("router_child").is_some())
             && req.extra.as_ref().is_some_and(|v| !v.is_object())
@@ -6277,5 +6285,36 @@ mod tests {
         assert_eq!(target.len(), 1);
         assert_eq!(target[0].id, "user-mcp");
         assert!(!target[0].auto_approve_in_unattended);
+    }
+}
+
+// A provider-backed agent shares the native harness, never another provider's model.
+fn validate_copilot_provider(
+    agent_id: Option<&str>,
+    model: Option<&aionui_common::ProviderWithModel>,
+) -> Result<(), ConversationError> {
+    if agent_id == Some("copilot-ide") && !model.is_some_and(|model| model.provider_id == "ellmsha-copilot-ide") {
+        return Err(ConversationError::bad_request(
+            "Copilot IDE requires a model from its connected IDE provider",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copilot_provider_tests {
+    use super::*;
+    #[test]
+    fn copilot_agent_cannot_use_another_provider() {
+        let mut model = aionui_common::ProviderWithModel {
+            provider_id: "ellmsha-copilot-ide".into(),
+            model: "test-model".into(),
+            use_model: None,
+        };
+        assert!(validate_copilot_provider(Some("copilot-ide"), Some(&model)).is_ok());
+        model.provider_id = "other".into();
+        assert!(validate_copilot_provider(Some("copilot-ide"), Some(&model)).is_err());
+        assert!(validate_copilot_provider(Some("copilot-ide"), None).is_err());
+        assert!(validate_copilot_provider(Some("native"), Some(&model)).is_ok());
     }
 }

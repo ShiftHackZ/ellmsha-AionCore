@@ -301,6 +301,23 @@ async fn run_probe(
                 Some(failure.detail()),
             ),
         }
+    } else if meta.id == "copilot-ide" {
+        match provider_repo.list(user_id).await {
+            Ok(providers)
+                if providers.iter().any(|p| {
+                    p.id == "ellmsha-copilot-ide"
+                        && p.enabled
+                        && serde_json::from_str::<Vec<String>>(&p.models).is_ok_and(|models| !models.is_empty())
+                }) =>
+            {
+                (AgentSnapshotCheckStatus::Online, None, None)
+            }
+            _ => (
+                AgentSnapshotCheckStatus::Offline,
+                Some("no_provider".to_owned()),
+                Some("Connect Copilot IDE and refresh its models".to_owned()),
+            ),
+        }
     } else if meta.agent_type == AgentType::Aionrs {
         // aionrs is the built-in Rust agent: there is no external CLI to probe,
         // so its usability hinges entirely on having a configured model. It is
