@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_api_types::{
     ClockifyConnectionResponse, ClockifyConnectionsResponse, ClockifyRealm, LinearConnectionResponse,
-    LinearConnectionsResponse, SessionMcpServer, SessionMcpTransport, WebSocketMessage,
+    LinearConnectionsResponse, NotionConnectionResponse, NotionConnectionsResponse, SessionMcpServer,
+    SessionMcpTransport, WebSocketMessage,
 };
 use aionui_common::{TimestampMs, now_ms};
 use aionui_realtime::EventBroadcaster;
@@ -19,6 +20,7 @@ use crate::error::ExtensionError;
 use crate::lifecycle::{HookKind, execute_hook, needs_install_hook, resolve_hook_path};
 use crate::linear::{LINEAR_PLUGIN_NAME, LinearConnectionError, LinearConnectionManager};
 use crate::loader::{ScanPath, load_plugin_directory, resolve_scan_paths};
+use crate::notion::{NOTION_PLUGIN_NAME, NotionConnectionError, NotionConnectionManager};
 use crate::plugin_installer::copy_plugin_tree;
 use crate::registry_helpers::{
     build_state_map, load_and_validate, merge_persisted_states, run_deactivation_hooks, to_summary,
@@ -63,6 +65,7 @@ pub struct ExtensionRegistry {
     revision_counter: Arc<AtomicU64>,
     linear_connections: Option<LinearConnectionManager>,
     clockify_connections: Option<ClockifyConnectionManager>,
+    notion_connections: Option<NotionConnectionManager>,
 }
 
 struct RegistryInner {
@@ -134,6 +137,24 @@ impl ExtensionRegistry {
         linear_connections: Option<LinearConnectionManager>,
         clockify_connections: Option<ClockifyConnectionManager>,
     ) -> Self {
+        Self::new_with_account_connections(
+            state_store,
+            broadcaster,
+            app_version,
+            linear_connections,
+            clockify_connections,
+            None,
+        )
+    }
+
+    pub fn new_with_account_connections(
+        state_store: ExtensionStateStore,
+        broadcaster: Arc<dyn EventBroadcaster>,
+        app_version: String,
+        linear_connections: Option<LinearConnectionManager>,
+        clockify_connections: Option<ClockifyConnectionManager>,
+        notion_connections: Option<NotionConnectionManager>,
+    ) -> Self {
         let revision_root = state_store
             .file_path()
             .parent()
@@ -157,6 +178,7 @@ impl ExtensionRegistry {
             revision_counter: Arc::new(AtomicU64::new(0)),
             linear_connections,
             clockify_connections,
+            notion_connections,
         }
     }
 
@@ -635,6 +657,11 @@ impl ExtensionRegistry {
             .await
             .into_iter()
             .any(|extension| extension.state.enabled && extension.manifest.name == CLOCKIFY_PLUGIN_NAME);
+        let notion_enabled = self
+            .extensions_for_user(user_id)
+            .await
+            .into_iter()
+            .any(|extension| extension.state.enabled && extension.manifest.name == NOTION_PLUGIN_NAME);
         let contributions = self.get_contributions_for_binding(user_id, project_id).await;
         let (generation, revision_leases) = {
             let guard = self.inner.read().await;
@@ -648,6 +675,10 @@ impl ExtensionRegistry {
             None => (0, Vec::new()),
         };
         let (clockify_revision, clockify_servers) = match &self.clockify_connections {
+            Some(manager) => manager.runtime_servers_snapshot(user_id).await,
+            None => (0, Vec::new()),
+        };
+        let (notion_revision, notion_servers) = match &self.notion_connections {
             Some(manager) => manager.runtime_servers_snapshot(user_id).await,
             None => (0, Vec::new()),
         };
@@ -671,9 +702,13 @@ impl ExtensionRegistry {
         if clockify_enabled {
             mcp_servers.extend(clockify_servers);
         }
+        if notion_enabled {
+            mcp_servers.extend(notion_servers);
+        }
         PluginRuntimeSnapshot {
             generation,
-            linear_revision: combined_connection_revision(linear_revision, clockify_revision),
+            linear_revision: combined_connection_revision(linear_revision, clockify_revision)
+                ^ notion_revision.rotate_left(31),
             skills,
             mcp_servers,
             _revision_leases: revision_leases,
@@ -759,6 +794,21 @@ impl ExtensionRegistry {
         }
     }
 
+    pub async fn get_notion_technical_servers_for_user(&self, user_id: &str) -> Vec<SessionMcpServer> {
+        let enabled = self
+            .extensions_for_user(user_id)
+            .await
+            .into_iter()
+            .any(|extension| extension.state.enabled && extension.manifest.name == NOTION_PLUGIN_NAME);
+        if !enabled {
+            return Vec::new();
+        }
+        match &self.notion_connections {
+            Some(manager) => manager.technical_servers(user_id).await,
+            None => Vec::new(),
+        }
+    }
+
     pub async fn list_linear_connections(
         &self,
         user_id: &str,
@@ -799,6 +849,41 @@ impl ExtensionRegistry {
 
     fn linear_manager(&self) -> Result<&LinearConnectionManager, LinearConnectionError> {
         self.linear_connections.as_ref().ok_or(LinearConnectionError::NotFound)
+    }
+
+    pub async fn list_notion_connections(
+        &self,
+        user_id: &str,
+    ) -> Result<NotionConnectionsResponse, NotionConnectionError> {
+        self.notion_manager()?.list(user_id).await
+    }
+
+    pub async fn connect_new_notion_connection(
+        &self,
+        user_id: &str,
+    ) -> Result<NotionConnectionResponse, NotionConnectionError> {
+        self.notion_manager()?.connect_new(user_id).await
+    }
+
+    pub async fn connect_notion_connection(
+        &self,
+        user_id: &str,
+        connection_id: &str,
+        reconnect: bool,
+    ) -> Result<NotionConnectionResponse, NotionConnectionError> {
+        self.notion_manager()?.connect(user_id, connection_id, reconnect).await
+    }
+
+    pub async fn disconnect_notion_connection(
+        &self,
+        user_id: &str,
+        connection_id: &str,
+    ) -> Result<NotionConnectionResponse, NotionConnectionError> {
+        self.notion_manager()?.disconnect(user_id, connection_id).await
+    }
+
+    fn notion_manager(&self) -> Result<&NotionConnectionManager, NotionConnectionError> {
+        self.notion_connections.as_ref().ok_or(NotionConnectionError::NotFound)
     }
 
     pub async fn list_clockify_connections(

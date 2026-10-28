@@ -186,6 +186,86 @@ pub struct ConnectLinearConnectionRequest {
     pub reconnect: bool,
 }
 
+/// User-visible state of one independently authorized Notion connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotionConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected,
+    ReconnectRequired,
+    Error,
+}
+
+/// Identity returned by Notion after a successful MCP probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotionVerifiedIdentity {
+    /// Verified Notion user or bot ID; independent of its display name.
+    pub account_id: String,
+    /// Verified display name, falling back to the remote user ID when unnamed.
+    pub account_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional email returned by Notion; never an authentication credential.
+    pub account_email: Option<String>,
+    /// Verified Notion workspace ID for this authorization.
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional workspace display name.
+    pub workspace_name: Option<String>,
+}
+
+/// Capabilities observed from the authenticated Notion MCP tool catalog.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotionVerifiedCapabilities {
+    /// The authenticated tool catalog exposes Notion search.
+    pub search: bool,
+    /// The authenticated tool catalog exposes page fetch.
+    pub read: bool,
+    /// The catalog exposes page creation or update; user permissions still apply.
+    pub write: bool,
+}
+
+/// One Notion connection. OAuth tokens and auth-directory paths are never serialized here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotionConnectionResponse {
+    /// Local opaque connection UUID, scoped to the authenticated eLLMsha user.
+    pub id: String,
+    /// Stable MCP namespace for the verified identity; rotates if authorization changes user/workspace.
+    #[serde(default)]
+    pub namespace: String,
+    /// Display label derived from the verified remote identity.
+    pub label: String,
+    /// Current connection and authorization state.
+    pub status: NotionConnectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Verified identity; absent when disconnected or verification is incomplete.
+    pub identity: Option<NotionVerifiedIdentity>,
+    #[serde(default)]
+    /// Capabilities observed during the most recent successful connection.
+    pub capabilities: NotionVerifiedCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Credential-free recoverable authorization failure, if any.
+    pub last_error: Option<String>,
+    /// Connection creation time in Unix milliseconds.
+    pub created_at: i64,
+    /// Last connection state change in Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// Notion connection state for the current user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotionConnectionsResponse {
+    /// Connections owned by the current authenticated eLLMsha user.
+    pub connections: Vec<NotionConnectionResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConnectNotionConnectionRequest {
+    #[serde(default)]
+    /// Starts fresh authorization for this connection; retained for parity with other plugin account APIs.
+    pub reconnect: bool,
+}
+
 /// Clockify data region selected for an API-key connection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

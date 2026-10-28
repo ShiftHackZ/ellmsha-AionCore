@@ -114,11 +114,13 @@ pub use custom_agent::{
 pub use extension::{
     ClockifyConnectionResponse, ClockifyConnectionStatus, ClockifyConnectionsResponse, ClockifyRealm,
     ClockifyVerifiedIdentity, ClockifyWorkspaceIdentity, ConnectClockifyConnectionRequest,
-    ConnectLinearConnectionRequest, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse,
-    GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse,
-    HubOperationResponse, HubUpdateInfo, InstallExtensionRequest, LinearConnectionResponse, LinearConnectionStatus,
-    LinearConnectionsResponse, LinearVerifiedCapabilities, LinearVerifiedIdentity, PermissionDetailResponse,
-    PermissionSummaryResponse, PluginCompatibilityNoticeResponse, PluginSourceProvenanceResponse,
+    ConnectLinearConnectionRequest, ConnectNotionConnectionRequest, DisableExtensionRequest, EnableExtensionRequest,
+    ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, HubExtensionListItem,
+    HubExtensionListResponse, HubOperationResponse, HubUpdateInfo, InstallExtensionRequest, LinearConnectionResponse,
+    LinearConnectionStatus, LinearConnectionsResponse, LinearVerifiedCapabilities, LinearVerifiedIdentity,
+    NotionConnectionResponse, NotionConnectionStatus, NotionConnectionsResponse, NotionVerifiedCapabilities,
+    NotionVerifiedIdentity, PermissionDetailResponse, PermissionSummaryResponse, PluginCompatibilityNoticeResponse,
+    PluginSourceProvenanceResponse,
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,

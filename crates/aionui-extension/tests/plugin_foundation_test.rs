@@ -275,6 +275,7 @@ async fn repository_builtin_native_plugins_are_pinned_and_discoverable() {
     assert!(plugins.join("computer-use/skills/open-computer-use/SKILL.md").is_file());
     assert!(plugins.join("plugin-dev/skills/plugin-authoring/SKILL.md").is_file());
     assert!(plugins.join("plugin-dev/templates/basic-plugin/mcp.json").is_file());
+    assert!(plugins.join("notion/skills/notion-workspace-work/SKILL.md").is_file());
     assert!(
         !plugins.join("sd05-fixture/aion-extension.json").exists(),
         "test fixtures must not be production plugins"
@@ -307,10 +308,32 @@ async fn repository_builtin_native_plugins_are_pinned_and_discoverable() {
             .version,
         "0.3.6"
     );
+    assert_eq!(
+        registry
+            .get_extension_by_name("notion")
+            .await
+            .expect("Notion plugin must be bundled")
+            .manifest
+            .version,
+        "1.0.0"
+    );
     let snapshot = registry.runtime_snapshot("user", Some("project")).await;
     assert!(snapshot.skills.iter().any(|skill| skill.name == "mobile-automation"));
     assert!(snapshot.skills.iter().any(|skill| skill.name == "open-computer-use"));
     assert!(snapshot.skills.iter().any(|skill| skill.name == "plugin-authoring"));
+    assert!(
+        snapshot
+            .skills
+            .iter()
+            .any(|skill| skill.name == "notion-workspace-work")
+    );
+    assert!(
+        !snapshot
+            .mcp_servers
+            .iter()
+            .any(|server| server.id.starts_with("plugin:notion:")),
+        "unconnected Notion must not start MCP servers"
+    );
     assert!(!snapshot.skills.iter().any(|skill| skill.name == "sd05-safe-echo"));
     let server = snapshot
         .mcp_servers

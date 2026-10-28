@@ -6,6 +6,7 @@ mod health;
 mod item_revealer;
 mod memory_artifact;
 mod memory_generation;
+mod notion;
 mod routes;
 mod runtime_router_tools;
 mod runtime_team_tools;

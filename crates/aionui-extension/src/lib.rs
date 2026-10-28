@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod linear;
 pub mod loader;
 pub mod manifest;
+pub mod notion;
 pub mod permission;
 pub mod plugin_installer;
 pub mod registry;
@@ -80,4 +81,9 @@ pub use skill_service::{
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill, write_assistant_rule,
     write_assistant_skill,
+};
+
+pub use notion::{
+    NOTION_MCP_URL, NOTION_PLUGIN_NAME, NotionConnectionError, NotionConnectionManager, NotionConnectionProbe,
+    NotionProbeFailure, NotionProbeResult,
 };

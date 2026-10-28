@@ -971,12 +971,13 @@ pub async fn build_extension_states(
     let legacy_oauth_repo: Arc<dyn aionui_db::IOAuthTokenRepository> = Arc::new(
         aionui_db::SqliteOAuthTokenRepository::new(services.database.pool().clone()),
     );
+    let oauth_attempt = Arc::new(tokio::sync::Mutex::new(()));
     let linear_probe: Arc<dyn LinearConnectionProbe> = Arc::new(LinearMcpRemoteProbe {
         connection_test: McpConnectionTestService::new(reqwest::Client::new(), services.event_bus.clone())
             .with_timeout(Duration::from_secs(330)),
         legacy_oauth_repo,
         browser_opener: Arc::new(aionui_shell::DefaultSystemOpener),
-        oauth_attempt: tokio::sync::Mutex::new(()),
+        oauth_attempt: oauth_attempt.clone(),
     });
     let linear_connections = match LinearConnectionManager::new(&skill_data_dir, linear_probe) {
         Ok(manager) => Some(manager),
@@ -1007,12 +1008,26 @@ pub async fn build_extension_states(
             None
         }
     };
-    let registry = ExtensionRegistry::new_with_plugin_connections(
+    let notion_probe = super::notion::NotionMcpRemoteProbe::new(
+        McpConnectionTestService::new(reqwest::Client::new(), services.event_bus.clone())
+            .with_timeout(Duration::from_secs(330)),
+        oauth_attempt,
+    );
+    let notion_connections =
+        match aionui_extension::NotionConnectionManager::new(&skill_data_dir, Arc::new(notion_probe)) {
+            Ok(manager) => Some(manager),
+            Err(_) => {
+                tracing::error!(stage = "state_load", "Notion connection state is unavailable");
+                None
+            }
+        };
+    let registry = ExtensionRegistry::new_with_account_connections(
         state_store,
         services.event_bus.clone(),
         services.app_version.clone(),
         linear_connections,
         clockify_connections,
+        notion_connections,
     );
     let plugin_installer = PluginInstaller::new(resolve_plugin_install_target_dir(&skill_data_dir), registry.clone());
 
@@ -1167,16 +1182,16 @@ struct LinearMcpRemoteProbe {
     connection_test: McpConnectionTestService,
     legacy_oauth_repo: Arc<dyn aionui_db::IOAuthTokenRepository>,
     browser_opener: Arc<dyn aionui_shell::ISystemOpener>,
-    oauth_attempt: tokio::sync::Mutex<()>,
+    oauth_attempt: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Default)]
-struct LinearOAuthProbeState {
+pub(super) struct LinearOAuthProbeState {
     awaiting_authorization_url: bool,
-    authorization_url_seen: bool,
+    pub(super) authorization_url_seen: bool,
     pending_authorization_url: Option<url::Url>,
     browser_opened: bool,
-    browser_launch_failed: bool,
+    pub(super) browser_launch_failed: bool,
 }
 
 #[async_trait::async_trait]
@@ -1310,6 +1325,16 @@ fn observe_linear_oauth_stderr(
     state: &std::sync::Mutex<LinearOAuthProbeState>,
     browser_opener: &dyn aionui_shell::ISystemOpener,
 ) -> Result<(), String> {
+    observe_remote_oauth_stderr(line, state, browser_opener, "Linear", allowed_linear_authorization_url)
+}
+
+pub(super) fn observe_remote_oauth_stderr(
+    line: &str,
+    state: &std::sync::Mutex<LinearOAuthProbeState>,
+    browser_opener: &dyn aionui_shell::ISystemOpener,
+    provider: &'static str,
+    allowed_url: fn(&str) -> Option<url::Url>,
+) -> Result<(), String> {
     let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if line.contains("Please authorize this client by visiting:") {
         state.awaiting_authorization_url = true;
@@ -1319,24 +1344,26 @@ fn observe_linear_oauth_stderr(
         state.pending_authorization_url = None;
         state.browser_opened = true;
         tracing::info!(
+            provider,
             stage = "browser_opened",
-            "Linear OAuth authorization opened in system browser"
+            "OAuth authorization opened in system browser"
         );
         return Ok(());
     }
     if line.contains("Could not open a browser automatically.") {
         let Some(url) = state.pending_authorization_url.take() else {
             state.browser_launch_failed = true;
-            return Err("Linear OAuth browser launch failed".to_owned());
+            return Err(format!("{provider} OAuth browser launch failed"));
         };
         if browser_opener.open_detached(url.as_str()).is_err() {
             state.browser_launch_failed = true;
-            return Err("Linear OAuth browser launch failed".to_owned());
+            return Err(format!("{provider} OAuth browser launch failed"));
         }
         state.browser_opened = true;
         tracing::info!(
+            provider,
             stage = "browser_opened_fallback",
-            "Linear OAuth authorization opened through the application system browser"
+            "OAuth authorization opened through the application system browser"
         );
         return Ok(());
     }
@@ -1345,9 +1372,9 @@ fn observe_linear_oauth_stderr(
     }
     state.awaiting_authorization_url = false;
     state.authorization_url_seen = true;
-    let Some(url) = allowed_linear_authorization_url(line.trim()) else {
+    let Some(url) = allowed_url(line.trim()) else {
         state.browser_launch_failed = true;
-        return Err("Linear OAuth browser launch failed".to_owned());
+        return Err(format!("{provider} OAuth browser launch failed"));
     };
     // mcp-remote performs a registration preflight after printing the URL and
     // then tries its own opener. Keep the URL private until it reports that

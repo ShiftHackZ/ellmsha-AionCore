@@ -11,11 +11,13 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 
+use crate::notion::NotionConnectionError;
 use aionui_api_types::{
     ApiResponse, ClockifyConnectionResponse, ClockifyConnectionsResponse, ConnectClockifyConnectionRequest,
-    ConnectLinearConnectionRequest, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse,
-    GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, LinearConnectionResponse, LinearConnectionsResponse,
-    PermissionDetailResponse, PermissionSummaryResponse, SessionMcpTransport,
+    ConnectLinearConnectionRequest, ConnectNotionConnectionRequest, DisableExtensionRequest, EnableExtensionRequest,
+    ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, LinearConnectionResponse,
+    LinearConnectionsResponse, NotionConnectionResponse, NotionConnectionsResponse, PermissionDetailResponse,
+    PermissionSummaryResponse, SessionMcpTransport,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, now_ms};
@@ -192,6 +194,18 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route(
             "/api/plugins/linear/connections/{connection_id}/disconnect",
             post(disconnect_linear_connection),
+        )
+        .route(
+            "/api/plugins/notion/connections",
+            get(list_notion_connections).post(connect_new_notion_connection),
+        )
+        .route(
+            "/api/plugins/notion/connections/{connection_id}/connect",
+            post(connect_notion_connection),
+        )
+        .route(
+            "/api/plugins/notion/connections/{connection_id}/disconnect",
+            post(disconnect_notion_connection),
         )
         .route(
             "/api/plugins/clockify/connections",
@@ -511,6 +525,33 @@ async fn get_mcp_servers(
                     "original_json": serde_json::to_string_pretty(&original_json).unwrap_or_default(),
                     "_source": "extension",
                     "_extensionName": "linear",
+                })
+            }),
+    );
+    values.extend(
+        state
+            .registry
+            .get_notion_technical_servers_for_user(&user.id)
+            .await
+            .into_iter()
+            .map(|server| {
+                let transport = session_transport_json(server.transport);
+                let original_json = serde_json::json!({
+                    "name": server.name,
+                    "enabled": true,
+                    "transport": transport,
+                });
+                serde_json::json!({
+                    "id": server.id,
+                    "name": server.name,
+                    "description": "Notion MCP connection managed in Settings → Plugins",
+                    "enabled": true,
+                    "transport": transport,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                    "original_json": serde_json::to_string_pretty(&original_json).unwrap_or_default(),
+                    "_source": "extension",
+                    "_extensionName": "notion",
                 })
             }),
     );
@@ -1024,6 +1065,75 @@ fn linear_api_error(error: LinearConnectionError) -> ApiError {
             ApiError::coded(StatusCode::BAD_GATEWAY, "LINEAR_AUTH_FAILED", message, None)
         }
         LinearConnectionError::Persistence(message) => ApiError::Internal(message),
+    }
+}
+
+/// GET: current authenticated user’s credential-free Notion connections.
+async fn list_notion_connections(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<NotionConnectionsResponse>>, ApiError> {
+    let connections = state
+        .registry
+        .list_notion_connections(&user.id)
+        .await
+        .map_err(notion_api_error)?;
+    Ok(Json(ApiResponse::ok(connections)))
+}
+
+/// POST without body: authorize and verify a new independent Notion identity.
+async fn connect_new_notion_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<(StatusCode, Json<ApiResponse<NotionConnectionResponse>>), ApiError> {
+    let connection = state
+        .registry
+        .connect_new_notion_connection(&user.id)
+        .await
+        .map_err(notion_api_error)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(connection))))
+}
+
+/// POST {reconnect: bool}: replace this user’s connection authorization.
+async fn connect_notion_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(connection_id): Path<String>,
+    body: Result<Json<ConnectNotionConnectionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<NotionConnectionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let connection = state
+        .registry
+        .connect_notion_connection(&user.id, &connection_id, request.reconnect)
+        .await
+        .map_err(notion_api_error)?;
+    Ok(Json(ApiResponse::ok(connection)))
+}
+
+/// POST without body: remove local credentials and invalidate active snapshots.
+async fn disconnect_notion_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(connection_id): Path<String>,
+) -> Result<Json<ApiResponse<NotionConnectionResponse>>, ApiError> {
+    let connection = state
+        .registry
+        .disconnect_notion_connection(&user.id, &connection_id)
+        .await
+        .map_err(notion_api_error)?;
+    Ok(Json(ApiResponse::ok(connection)))
+}
+
+fn notion_api_error(error: NotionConnectionError) -> ApiError {
+    match error {
+        NotionConnectionError::Duplicate | NotionConnectionError::LimitReached => {
+            ApiError::coded(StatusCode::CONFLICT, "NOTION_ACCOUNT_CONFLICT", error.to_string(), None)
+        }
+        NotionConnectionError::NotFound => ApiError::NotFound(error.to_string()),
+        NotionConnectionError::Probe(message) => {
+            ApiError::coded(StatusCode::BAD_GATEWAY, "NOTION_AUTH_FAILED", message, None)
+        }
+        NotionConnectionError::Persistence(message) => ApiError::Internal(message),
     }
 }
 
