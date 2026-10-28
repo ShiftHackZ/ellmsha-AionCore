@@ -524,6 +524,7 @@ dependencies = [
  "aionui-conversation",
  "aionui-db",
  "aionui-extension",
+ "aionui-project",
  "aionui-realtime",
  "async-trait",
  "axum",
@@ -542,6 +543,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
+ "url",
  "uuid",
 ]
 

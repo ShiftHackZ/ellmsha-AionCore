@@ -630,11 +630,16 @@ async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
-        Arc::new(services.conversation_service.clone()),
-        services.worker_task_manager.clone(),
-        channel_settings,
-    ))
+    Arc::new(
+        aionui_channel::message_service::ChannelMessageService::new(
+            Arc::new(services.conversation_service.clone()),
+            services.worker_task_manager.clone(),
+            channel_settings,
+        )
+        .with_project_store(Arc::new(aionui_db::SqliteProjectStore::new(
+            services.database.pool().clone(),
+        ))),
+    )
 }
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
@@ -691,12 +696,17 @@ pub async fn build_channel_state(
     let startup_owner_user_id = startup_channel_owner_user_id(services).await;
 
     // Build orchestrator dependencies
-    let action_executor = Arc::new(aionui_channel::action::ActionExecutor::new(
-        Arc::clone(&pairing_service),
-        Arc::clone(&session_manager),
-        Arc::clone(&channel_settings),
-        startup_owner_user_id.clone(),
-    ));
+    let action_executor = Arc::new(
+        aionui_channel::action::ActionExecutor::new(
+            Arc::clone(&pairing_service),
+            Arc::clone(&session_manager),
+            Arc::clone(&channel_settings),
+            startup_owner_user_id.clone(),
+        )
+        .with_project_store(Arc::new(aionui_db::SqliteProjectStore::new(
+            services.database.pool().clone(),
+        ))),
+    );
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 

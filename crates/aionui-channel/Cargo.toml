@@ -29,6 +29,7 @@ tracing.workspace = true
 getrandom.workspace = true
 dashmap.workspace = true
 regex.workspace = true
+url.workspace = true
 reqwest = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
@@ -39,4 +40,5 @@ base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
+aionui-project.workspace = true
 aionui-ai-agent = { workspace = true, features = ["test-support"] }

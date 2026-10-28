@@ -124,12 +124,14 @@ impl IAgentTask for ScriptedAgent {
 impl IMockAgent for ScriptedAgent {}
 
 struct RecordingTaskManager {
+    builds: Mutex<Vec<BuildTaskOptions>>,
     agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
 }
 
 impl RecordingTaskManager {
     fn new() -> Self {
         Self {
+            builds: Mutex::new(Vec::new()),
             agents: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -144,8 +146,9 @@ impl IWorkerTaskManager for RecordingTaskManager {
     async fn get_or_build_task(
         &self,
         conversation_id: &str,
-        _options: BuildTaskOptions,
+        options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        self.builds.lock().unwrap().push(options);
         let mut agents = self.agents.lock().unwrap();
         if let Some(agent) = agents.get(conversation_id) {
             return Ok(agent.clone());
@@ -556,4 +559,95 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .unwrap()
         .unwrap();
     assert_eq!(conversation.name, "tg-acp-codex-70880480");
+}
+
+#[tokio::test]
+async fn selected_project_reaches_conversation_runtime_and_memory_on_every_channel() {
+    use aionui_db::IProjectStore;
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let workspace = std::env::temp_dir().join(format!("channel-scope-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let store = Arc::new(aionui_db::SqliteProjectStore::new(pool.clone()));
+    let uri = url::Url::from_file_path(&workspace).unwrap().to_string();
+    let canonical = aionui_project::canonical::canonicalize(&uri).unwrap();
+    let folder = store.upsert_folder(canonical.as_str(), &uri).await.unwrap();
+    let project = store
+        .create_project_with_workspace_entry(
+            TEST_OWNER_USER_ID,
+            &folder.folder_id,
+            "SequelCare",
+            aionui_db::ProjectKind::Standard,
+        )
+        .await
+        .unwrap()
+        .0;
+    let manager = Arc::new(RecordingTaskManager::new());
+    let tasks: Arc<dyn IWorkerTaskManager> = manager.clone();
+    let conversations = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let service = Arc::new(ConversationService::new(
+        workspace.join("temporary"),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        tasks.clone(),
+        conversations.clone(),
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+    ));
+    service.with_project_service(Arc::new(aionui_project::ProjectService::new(
+        store.clone(),
+        workspace.join("temporary"),
+    )));
+    let settings = Arc::new(ChannelSettingsService::new(Arc::new(
+        SqliteClientPreferenceRepository::new(pool),
+    )));
+    let channel = ChannelMessageService::new(service, tasks, settings).with_project_store(store.clone());
+    let mut session = AssistantSessionRow {
+        id: "project-session".into(),
+        user_id: "paired-user".into(),
+        agent_type: "aionrs".into(),
+        conversation_id: None,
+        workspace: Some(workspace.to_string_lossy().into_owned()),
+        chat_id: Some("test-chat".into()),
+        created_at: 1,
+        last_activity: 1,
+    };
+    for platform in [
+        PluginType::Telegram,
+        PluginType::Lark,
+        PluginType::Dingtalk,
+        PluginType::Weixin,
+    ] {
+        let result = channel
+            .send_to_agent(TEST_OWNER_USER_ID, &session, "project-scoped test", platform)
+            .await
+            .unwrap();
+        let saved = conversations
+            .get(TEST_OWNER_USER_ID, &result.conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.project_id.as_deref(), Some(project.project_id.as_str()));
+        let builds = manager.builds.lock().unwrap();
+        let built = builds
+            .iter()
+            .find(|o| o.conversation_id() == result.conversation_id)
+            .unwrap();
+        assert_eq!(built.context.workspace.path, workspace.to_string_lossy());
+        assert_eq!(
+            built.memory_recall.project_id.as_deref(),
+            Some(project.project_id.as_str())
+        );
+        assert_eq!(built.memory_recall.project_name.as_deref(), Some("SequelCare"));
+    }
+    session.workspace = Some(workspace.join("not-registered").to_string_lossy().into_owned());
+    let count = manager.builds.lock().unwrap().len();
+    assert!(
+        channel
+            .send_to_agent(TEST_OWNER_USER_ID, &session, "do not start", PluginType::Telegram)
+            .await
+            .is_err()
+    );
+    assert_eq!(manager.builds.lock().unwrap().len(), count);
+    std::fs::remove_dir_all(workspace).unwrap();
 }

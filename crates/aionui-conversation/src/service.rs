@@ -6293,7 +6293,7 @@ fn validate_copilot_provider(
     agent_id: Option<&str>,
     model: Option<&aionui_common::ProviderWithModel>,
 ) -> Result<(), ConversationError> {
-    if agent_id == Some("copilot-ide") && !model.is_some_and(|model| model.provider_id == "ellmsha-copilot-ide") {
+    if agent_id == Some("copilot-ide") && model.is_none_or(|model| model.provider_id != "ellmsha-copilot-ide") {
         return Err(ConversationError::bad_request(
             "Copilot IDE requires a model from its connected IDE provider",
         ));

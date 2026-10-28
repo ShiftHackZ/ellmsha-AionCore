@@ -27,6 +27,7 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
+    project_store: Option<Arc<dyn aionui_db::IProjectStore>>,
 }
 
 impl ChannelMessageService {
@@ -39,7 +40,13 @@ impl ChannelMessageService {
             conversation_svc,
             task_manager,
             settings,
+            project_store: None,
         }
+    }
+
+    pub fn with_project_store(mut self, store: Arc<dyn aionui_db::IProjectStore>) -> Self {
+        self.project_store = Some(store);
+        self
     }
 
     /// Sends a text message from a channel user to the AI agent.
@@ -151,6 +158,30 @@ impl ChannelMessageService {
         } else {
             agent_config.backend.as_deref()
         });
+        // Revalidate the saved selection before creating any writable runtime.
+        let mut selected_project_id = None;
+        if let Some(selected_workspace) = session.workspace.as_deref() {
+            let store = self
+                .project_store
+                .as_ref()
+                .ok_or_else(|| ChannelError::InvalidConfig("Project selection unavailable".into()))?;
+            for project in store.list_standard_projects(owner_user_id).await? {
+                if let Some((project, path)) =
+                    crate::action::project_sessions::workspace(store.as_ref(), owner_user_id, &project.project_id)
+                        .await?
+                    && path == selected_workspace
+                {
+                    selected_project_id = Some(project.project_id);
+                    break;
+                }
+            }
+            if selected_project_id.is_none() {
+                return Err(ChannelError::InvalidConfig(
+                    "Selected project is unavailable. Use /new to choose another project.".into(),
+                ));
+            }
+            extra["workspace"] = serde_json::json!(selected_workspace);
+        }
         let name = assistant_name.unwrap_or_else(|| {
             channel_conversation_name(
                 platform,
@@ -189,6 +220,22 @@ impl ChannelMessageService {
             .create(owner_user_id, req)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
+
+        // Create's response predates its best-effort binding write; read back
+        // the canonical row before authorizing a project-scoped runtime.
+        if selected_project_id.is_some()
+            && self
+                .conversation_svc
+                .get(owner_user_id, &response.id)
+                .await
+                .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?
+                .project_id
+                != selected_project_id
+        {
+            return Err(ChannelError::InvalidConfig(
+                "Project binding failed; no agent was started. Use /new to choose the project again.".into(),
+            ));
+        }
 
         debug!(
             conversation_id = %response.id,

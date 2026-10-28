@@ -25,6 +25,11 @@ pub trait IProjectStore: Send + Sync {
     async fn get_folder(&self, folder_id: &str) -> Result<Option<FolderRow>, DbError>;
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError>;
 
+    /// List only this owner's standard projects, sorted by display name.
+    async fn list_standard_projects(&self, _user_id: &str) -> Result<Vec<ProjectRow>, DbError> {
+        Err(DbError::Init("project listing is unsupported by this store".into()))
+    }
+
     /// The workspace entry (if any) of `user_id` whose folder is `folder_id`.
     /// At most one exists per owner (enforced by
     /// `UNIQUE(owner_user_id, folder_id) WHERE role = 'workspace'`).

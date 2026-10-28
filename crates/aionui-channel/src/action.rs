@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+#[path = "project_sessions.rs"]
+pub(crate) mod project_sessions;
+
 use tracing::{debug, info, warn};
 
 use crate::channel_settings::ChannelSettingsService;
@@ -42,6 +45,7 @@ pub struct ActionExecutor {
     session_mgr: Arc<SessionManager>,
     settings: Arc<ChannelSettingsService>,
     owner_user_id: Option<String>,
+    project_store: Option<Arc<dyn aionui_db::IProjectStore>>,
 }
 
 impl ActionExecutor {
@@ -56,7 +60,13 @@ impl ActionExecutor {
             session_mgr,
             settings,
             owner_user_id,
+            project_store: None,
         }
+    }
+
+    pub fn with_project_store(mut self, store: Arc<dyn aionui_db::IProjectStore>) -> Self {
+        self.project_store = Some(store);
+        self
     }
 
     pub fn owner_user_id(&self) -> Option<&str> {
@@ -99,6 +109,33 @@ impl ActionExecutor {
         if let Some(action) = &msg.action {
             let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
             return Ok(MessageResult::Action(response));
+        }
+
+        // Commands use the same authorized action flow as inline buttons.
+        let command = msg.content.text.trim();
+        let command = command.split_once('@').map(|(name, _)| name).unwrap_or(command);
+        let action_name = match command {
+            "/new" | "/project" => Some("session.new"),
+            "/status" => Some("session.status"),
+            "/help" | "/start" => Some("help.show"),
+            _ => None,
+        };
+        if let Some(name) = action_name {
+            let action = UnifiedAction {
+                action: name.into(),
+                category: ActionCategory::System,
+                params: None,
+                context: crate::types::ActionContext {
+                    platform: msg.platform,
+                    user_id: user_id.clone(),
+                    chat_id: chat_id.clone(),
+                    message_id: Some(msg.id.clone()),
+                    session_id: None,
+                },
+            };
+            return Ok(MessageResult::Action(
+                self.route_action(owner_user_id, &action, &internal_user_id).await?,
+            ));
         }
 
         // 3. Text message → session resolution → AI dispatch
@@ -260,6 +297,11 @@ impl ActionExecutor {
         internal_user_id: &str,
     ) -> Result<ActionResponse, ChannelError> {
         match action.action.as_str() {
+            "session.new" if self.project_store.is_some() => self.project_picker(owner_user_id, action).await,
+            "session.go" => {
+                self.start_project_session(owner_user_id, action, internal_user_id)
+                    .await
+            }
             "session.new" => {
                 let user_id = internal_user_id;
                 let chat_id = &action.context.chat_id;
@@ -304,9 +346,10 @@ impl ActionExecutor {
 
                 Ok(ActionResponse {
                     text: Some(format!(
-                        "Session: {}\nAgent: {}\nCreated: {}\nLast active: {}",
+                        "Session: {}\nAgent: {}\nWorkspace: {}\nCreated: {}\nLast active: {}",
                         &session.id[..8],
                         session.agent_type,
+                        session.workspace.as_deref().unwrap_or("Temporary chat"),
                         session.created_at,
                         session.last_activity,
                     )),
@@ -354,7 +397,7 @@ impl ActionExecutor {
             "help.tips" => Ok(ActionResponse {
                 text: Some(
                     "Tips:\n\
-                         • Start a new session to clear context\n\
+                         • Use /new or New Session to choose a project or a temporary chat\n\
                          • Use /help to see available commands\n\
                          • In group chats, @mention the bot"
                         .into(),

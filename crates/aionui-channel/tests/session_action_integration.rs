@@ -463,3 +463,223 @@ async fn action_session_isolation() {
 // Note: bind_conversation FK-constrained persistence is tested in
 // aionui-db sqlite_channel.rs::update_session_conversation_persists.
 // Unit tests for the SessionManager layer are in session.rs.
+
+// Real SQLite coverage for the project picker and its authorization boundary.
+async fn project_setup() -> (
+    ActionExecutor,
+    Arc<dyn aionui_db::IProjectStore>,
+    Arc<dyn IChannelRepository>,
+    aionui_db::Database,
+) {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IChannelRepository> = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
+    let projects: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    let executor = ActionExecutor::new(
+        Arc::new(PairingService::new(repo.clone(), Arc::new(MockBroadcaster::new()))),
+        Arc::new(SessionManager::new(repo.clone())),
+        Arc::new(ChannelSettingsService::new(Arc::new(
+            aionui_db::SqliteClientPreferenceRepository::new(db.pool().clone()),
+        ))),
+        Some(OWNER_ID.into()),
+    )
+    .with_project_store(projects.clone());
+    (executor, projects, repo, db)
+}
+
+async fn add_project(
+    store: &dyn aionui_db::IProjectStore,
+    owner: &str,
+    path: &std::path::Path,
+    name: &str,
+    kind: aionui_db::ProjectKind,
+) -> String {
+    let uri = url::Url::from_file_path(path).unwrap().to_string();
+    let folder = store.upsert_folder(&uri, &uri).await.unwrap();
+    store
+        .create_project_with_workspace_entry(owner, &folder.folder_id, name, kind)
+        .await
+        .unwrap()
+        .0
+        .project_id
+}
+
+fn select_project(user: &str, chat: &str, project: &str) -> UnifiedIncomingMessage {
+    let mut msg = make_action_message(user, chat, "session.go", ActionCategory::System);
+    msg.action.as_mut().unwrap().params = Some(std::collections::HashMap::from([("p".into(), project.into())]));
+    msg
+}
+
+#[tokio::test]
+async fn project_picker_is_non_destructive_and_selection_is_isolated_and_persisted() {
+    let (executor, projects, repo, _db) = project_setup().await;
+    let uid = create_user(&repo, "p-project", "telegram").await;
+    let dir = std::env::temp_dir().join(format!("channel-project-{}", generate_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = add_project(
+        projects.as_ref(),
+        OWNER_ID,
+        &dir,
+        "SequelCare",
+        aionui_db::ProjectKind::Standard,
+    )
+    .await;
+    executor
+        .handle_incoming_message(&make_text_message("p-project", "chat-a", "hello"))
+        .await
+        .unwrap();
+    let sessions = SessionManager::new(repo.clone());
+    let before = sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].clone();
+    let MessageResult::Action(menu) = executor
+        .handle_incoming_message(&make_text_message("p-project", "chat-a", "/new"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected project menu")
+    };
+    assert!(menu.buttons.unwrap().iter().flatten().any(|b| b.label == "SequelCare"));
+    assert_eq!(sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id, before.id);
+    executor
+        .handle_incoming_message(&select_project("p-project", "chat-a", &project))
+        .await
+        .unwrap();
+    let selected = sessions.get_active_sessions(OWNER_ID).await.unwrap().pop().unwrap();
+    assert_eq!(selected.user_id, uid);
+    assert_eq!(selected.workspace.as_deref(), dir.to_str());
+    assert_ne!(selected.id, before.id);
+    let MessageResult::Dispatched { session_id, .. } = executor
+        .handle_incoming_message(&make_text_message("p-project", "chat-a", "next task"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected dispatch")
+    };
+    assert_eq!(session_id, selected.id);
+    executor
+        .handle_incoming_message(&make_text_message("p-project", "chat-b", "hello"))
+        .await
+        .unwrap();
+    executor
+        .handle_incoming_message(&select_project("p-project", "chat-a", "default"))
+        .await
+        .unwrap();
+    let all = sessions.get_active_sessions(OWNER_ID).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().all(|s| s.workspace.is_none()));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn project_picker_rejects_foreign_missing_and_unavailable_projects_without_resetting() {
+    use aionui_db::IUserRepository;
+    let (executor, projects, repo, db) = project_setup().await;
+    create_user(&repo, "p-owner", "telegram").await;
+    let foreign = aionui_db::SqliteUserRepository::new(db.pool().clone())
+        .create_user("foreign-channel-owner", "test-only-hash")
+        .await
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("channel-foreign-{}", generate_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let foreign_id = add_project(
+        projects.as_ref(),
+        &foreign.id,
+        &dir,
+        "Private project",
+        aionui_db::ProjectKind::Standard,
+    )
+    .await;
+    let missing_path = dir.join("missing");
+    let unavailable = add_project(
+        projects.as_ref(),
+        OWNER_ID,
+        &missing_path,
+        "Unavailable",
+        aionui_db::ProjectKind::Standard,
+    )
+    .await;
+    executor
+        .handle_incoming_message(&make_text_message("p-owner", "chat", "hello"))
+        .await
+        .unwrap();
+    let sessions = SessionManager::new(repo.clone());
+    let before = sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id.clone();
+    for id in [foreign_id, unavailable, "not-a-project".into()] {
+        let MessageResult::Action(reply) = executor
+            .handle_incoming_message(&select_project("p-owner", "chat", &id))
+            .await
+            .unwrap()
+        else {
+            panic!("expected refusal")
+        };
+        assert!(reply.text.unwrap().contains("unavailable"));
+        assert_eq!(sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id, before);
+    }
+    assert!(
+        projects
+            .list_standard_projects(OWNER_ID)
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.name != "Private project")
+    );
+    let unauthorized = executor
+        .handle_incoming_message(&select_project("unpaired", "chat", "default"))
+        .await
+        .unwrap();
+    assert!(matches!(unauthorized, MessageResult::Action(_)));
+    assert_eq!(sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id, before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn project_picker_paginates_owned_standard_projects_and_bounds_callback_size() {
+    let (executor, projects, repo, _db) = project_setup().await;
+    create_user(&repo, "p-pages", "telegram").await;
+    let dir = std::env::temp_dir().join(format!("channel-pages-{}", generate_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..10 {
+        add_project(
+            projects.as_ref(),
+            OWNER_ID,
+            &dir.join(i.to_string()),
+            &format!("Project {i:02}"),
+            aionui_db::ProjectKind::Standard,
+        )
+        .await;
+    }
+    add_project(
+        projects.as_ref(),
+        OWNER_ID,
+        &dir.join("temp"),
+        "Hidden temp",
+        aionui_db::ProjectKind::Temp,
+    )
+    .await;
+    let MessageResult::Action(menu) = executor
+        .handle_incoming_message(&make_text_message("p-pages", "chat", "/project"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected menu")
+    };
+    let buttons = menu.buttons.unwrap();
+    assert!(buttons.iter().flatten().all(|b| b.label != "Hidden temp"));
+    for b in buttons.iter().flatten() {
+        let pairs: Vec<_> = b
+            .params
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        assert!(format!("system:{}:{}", b.action, pairs.join(",")).len() <= 64);
+    }
+    let next = buttons.iter().flatten().find(|b| b.label == "More projects").unwrap();
+    let mut msg = make_action_message("p-pages", "chat", &next.action, ActionCategory::System);
+    msg.action.as_mut().unwrap().params = next.params.clone();
+    let MessageResult::Action(page) = executor.handle_incoming_message(&msg).await.unwrap() else {
+        panic!("expected second page")
+    };
+    assert!(page.text.unwrap().contains("page 2 of 2"));
+    assert!(page.buttons.unwrap().iter().flatten().any(|b| b.label == "Project 09"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
