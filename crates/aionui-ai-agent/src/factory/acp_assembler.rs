@@ -3,7 +3,9 @@ use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio, 
 use aionui_api_types::AgentMetadata;
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 use aionui_common::CommandSpec;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Pre-computed workspace information.
 #[derive(Debug, Clone)]
@@ -34,9 +36,60 @@ pub struct AcpSessionParams {
     pub data_dir: PathBuf,
     /// Whether prompt diagnostics should be dumped under `data_dir/prompt-dumps`.
     pub dump_prompts: bool,
+    /// Private launch configuration lives as long as the session, including resume/retry.
+    launch_mcp_config: Option<Arc<tempfile::NamedTempFile>>,
 }
 
 impl AcpSessionParams {
+    /// Copilot CLI 1.0.105 ignores stdio entries on the ACP wire, but accepts
+    /// them through its documented session-local --additional-mcp-config flag.
+    /// Verified against the real CLI with isolated local MCP/model fixtures.
+    pub(crate) fn prepare_mcp_launch(&mut self) -> Result<(), crate::AgentError> {
+        if self.metadata.backend.as_deref() != Some("copilot") || self.launch_mcp_config.is_some() {
+            return Ok(());
+        }
+        let mut servers = serde_json::Map::new();
+        for server in &self.mcp_servers {
+            let McpServer::Stdio(server) = server else { continue };
+            let env: std::collections::HashMap<_, _> =
+                server.env.iter().map(|entry| (&entry.name, &entry.value)).collect();
+            let value = serde_json::json!({
+                "type": "local", "command": server.command, "args": server.args,
+                "env": env, "tools": ["*"]
+            });
+            if servers.insert(server.name.clone(), value).is_some() {
+                return Err(crate::AgentError::bad_request("Duplicate Copilot MCP server name"));
+            }
+        }
+        if servers.is_empty() {
+            return Ok(());
+        }
+        // NamedTempFile creates an exclusive 0600 file on Unix. Only its path
+        // reaches argv/process diagnostics; credentials stay inside the file.
+        let mut file = tempfile::NamedTempFile::new()
+            .map_err(|_| crate::AgentError::internal("Could not create private Copilot MCP configuration"))?;
+        let content = serde_json::to_vec(&serde_json::json!({"mcpServers": servers}))
+            .map_err(|_| crate::AgentError::internal("Could not encode Copilot MCP configuration"))?;
+        file.write_all(&content)
+            .and_then(|()| file.flush())
+            .map_err(|_| crate::AgentError::internal("Could not write private Copilot MCP configuration"))?;
+        self.command_spec
+            .args
+            .extend(["--additional-mcp-config".into(), format!("@{}", file.path().display())]);
+        let count = self
+            .mcp_servers
+            .iter()
+            .filter(|s| matches!(s, McpServer::Stdio(_)))
+            .count();
+        self.mcp_servers.retain(|s| !matches!(s, McpServer::Stdio(_)));
+        self.launch_mcp_config = Some(Arc::new(file));
+        tracing::info!(
+            servers = count,
+            "Copilot stdio MCP servers prepared through private launch configuration"
+        );
+        Ok(())
+    }
+
     /// Build a `NewSessionRequest` using the pre-computed MCP servers.
     pub fn new_session_request(&self) -> NewSessionRequest {
         let req = NewSessionRequest::new(&self.workspace.path);
@@ -85,6 +138,7 @@ pub async fn assemble_acp_params(
         session_snapshot,
         data_dir,
         dump_prompts,
+        launch_mcp_config: None,
     }
 }
 
@@ -139,6 +193,108 @@ mod tests {
 
     fn user_stdio(name: &str) -> McpServer {
         McpServer::Stdio(McpServerStdio::new(name, "/bin/sh"))
+    }
+
+    async fn launch_params(backend: &str, servers: Vec<McpServer>) -> AcpSessionParams {
+        let mut metadata = test_metadata();
+        metadata.backend = Some(backend.into());
+        assemble_acp_params(
+            "conv-launch".into(),
+            "user-launch".into(),
+            WorkspaceInfo {
+                path: "/tmp/fixture".into(),
+                is_custom: false,
+            },
+            metadata,
+            CommandSpec::default(),
+            AcpBuildExtra::default(),
+            servers,
+            None,
+            PathBuf::from("/tmp/data"),
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn copilot_launch_preserves_stdio_tools_env_and_private_lifetime() {
+        use agent_client_protocol::schema::v1::{HttpHeader, McpServerHttp};
+        let private = "fixture-private-value";
+        let stdio = McpServer::Stdio(
+            McpServerStdio::new("ellmsha-memory", "/fixture/node")
+                .args(vec!["discovery.js".into()])
+                .env(vec![EnvVariable::new("PRIVATE", private)]),
+        );
+        let http = McpServer::Http(
+            McpServerHttp::new("remote", "http://127.0.0.1:9/mcp")
+                .headers(vec![HttpHeader::new("X-Fixture", "fixture-header")]),
+        );
+        let mut params = launch_params("copilot", vec![stdio, http]).await;
+        params.prepare_mcp_launch().unwrap();
+        let args = params.command_spec.args.clone();
+        assert_eq!(args[0], "--additional-mcp-config");
+        assert!(!args.join(" ").contains(private));
+        let path = PathBuf::from(args[1].strip_prefix('@').unwrap());
+        let content: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            content["mcpServers"]["ellmsha-memory"],
+            serde_json::json!({
+                "type":"local", "command":"/fixture/node", "args":["discovery.js"],
+                "env":{"PRIVATE":private}, "tools":["*"]
+            })
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let wire = serde_json::to_value(params.new_session_request()).unwrap();
+        assert_eq!(wire["mcpServers"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["mcpServers"][0]["name"], "remote");
+        assert!(!wire.to_string().contains(private));
+        params.prepare_mcp_launch().unwrap();
+        assert_eq!(params.command_spec.args, args);
+        let retained = params.clone();
+        drop(params);
+        assert!(
+            path.exists(),
+            "resume/startup retry must retain the launch configuration"
+        );
+        drop(retained);
+        assert!(
+            !path.exists(),
+            "dropping the last session owner must remove private configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn copilot_launch_rejects_duplicate_names_without_partial_mutation() {
+        let mut params = launch_params("copilot", vec![user_stdio("duplicate"), user_stdio("duplicate")]).await;
+        assert!(
+            params
+                .prepare_mcp_launch()
+                .unwrap_err()
+                .to_string()
+                .contains("Duplicate Copilot MCP")
+        );
+        assert!(params.command_spec.args.is_empty());
+        assert_eq!(params.mcp_servers.len(), 2);
+        assert!(params.launch_mcp_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn other_agents_and_empty_copilot_sessions_keep_their_existing_wire() {
+        for backend in ["claude", "codex", "gemini", "custom"] {
+            let mut params = launch_params(backend, vec![user_stdio("fixture")]).await;
+            params.prepare_mcp_launch().unwrap();
+            assert_eq!(params.mcp_servers.len(), 1);
+            assert!(params.command_spec.args.is_empty());
+            assert!(params.launch_mcp_config.is_none());
+        }
+        let mut params = launch_params("copilot", vec![]).await;
+        params.prepare_mcp_launch().unwrap();
+        assert!(params.launch_mcp_config.is_none());
+        assert!(params.command_spec.args.is_empty());
     }
 
     fn team_cfg() -> TeamMcpStdioConfig {

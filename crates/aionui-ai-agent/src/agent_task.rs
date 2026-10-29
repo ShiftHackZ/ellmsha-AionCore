@@ -633,7 +633,7 @@ mod aionrs_config_option_tests {
     use super::*;
     use crate::types::AionrsResolvedConfig;
 
-    fn make_test_config() -> AionrsResolvedConfig {
+    pub(super) fn make_test_config() -> AionrsResolvedConfig {
         AionrsResolvedConfig {
             host_delegation: false,
             mcp_approval_bindings: Default::default(),
@@ -731,6 +731,10 @@ mod aionrs_config_option_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "agent_task_rules_tests.rs"]
+mod rules_dispatch_tests;
 
 #[cfg(test)]
 mod required_full_auto_dispatch_tests {

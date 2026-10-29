@@ -271,6 +271,7 @@ pub(super) async fn build(
             .await
             .map_err(AgentError::internal)?;
     }
+    params.prepare_mcp_launch()?;
     let params = Arc::new(params);
 
     let skill_mgr = deps.skill_manager.clone();
