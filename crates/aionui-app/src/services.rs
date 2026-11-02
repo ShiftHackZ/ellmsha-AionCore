@@ -22,6 +22,7 @@ use aionui_project::{ManagedUploadStore, ProjectService};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
+    pub background_process_service: Arc<aionui_shell::BackgroundProcessService>,
     pub router_service: Arc<aionui_ai_agent::routing::RouterService>,
     pub generation_service: Arc<aionui_ai_agent::generation::GenerationService>,
     pub database: Database,
@@ -304,6 +305,9 @@ impl AppServices {
         .with_router_service(router.clone());
 
         Ok(Self {
+            background_process_service: Arc::new(aionui_shell::BackgroundProcessService::new(
+                conversation_repo.clone(),
+            )),
             router_service: router,
             generation_service,
             database,

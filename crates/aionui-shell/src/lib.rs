@@ -1,7 +1,10 @@
 #![warn(clippy::disallowed_types)]
 
 //! OS shell integration: file/folder opener, tool detection, and speech-to-text.
+pub mod background_process;
+mod background_routes;
 pub mod error;
+pub use background_process::BackgroundProcessService;
 pub mod opener;
 pub mod routes;
 pub mod shell;

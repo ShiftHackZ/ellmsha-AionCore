@@ -9,6 +9,11 @@ mod agent_error;
 mod antigravity_hook;
 mod assistant;
 mod auth;
+mod background_process;
+pub use background_process::{
+    BackgroundProcessSnapshot, StartBackgroundProcessRequest, TerminalInputRequest, TerminalOutput,
+    TerminalResizeRequest, TerminalWaitRequest,
+};
 mod channel;
 mod chat_file;
 mod confirmation;

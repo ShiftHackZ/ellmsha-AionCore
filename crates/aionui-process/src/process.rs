@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use aionui_common::CommandSpec;
 use aionui_runtime::Builder;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
@@ -162,6 +162,19 @@ impl ManagedProcess {
     /// stderr-drain + exit-monitor tasks. `extra_env` is applied per-child via
     /// the Builder (IC-5: never mutates global env).
     pub async fn spawn(spec: CommandSpec, extra_env: &[(String, String)]) -> Result<Self, ProcessError> {
+        Self::spawn_with_diagnostics(spec, extra_env, true).await
+    }
+
+    /// Capture application output privately without mirroring it into host logs.
+    pub async fn spawn_background(spec: CommandSpec, extra_env: &[(String, String)]) -> Result<Self, ProcessError> {
+        Self::spawn_with_diagnostics(spec, extra_env, false).await
+    }
+
+    async fn spawn_with_diagnostics(
+        spec: CommandSpec,
+        extra_env: &[(String, String)],
+        diagnostics: bool,
+    ) -> Result<Self, ProcessError> {
         let cwd = match spec.cwd.as_deref() {
             Some(c) => Some(prepare_command_cwd(c)?),
             None => None,
@@ -230,7 +243,23 @@ impl ManagedProcess {
         // Background: drain stderr into a bounded ring buffer.
         let stderr_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
         let buf_clone = Arc::clone(&stderr_buffer);
+        let (stderr_done_tx, stderr_done_rx) = tokio::sync::oneshot::channel();
         let stderr_task = tokio::spawn(async move {
+            if !diagnostics {
+                let mut stderr = stderr;
+                let mut chunk = [0u8; 8192];
+                while let Ok(count) = stderr.read(&mut chunk).await {
+                    if count == 0 {
+                        break;
+                    }
+                    let mut buf = buf_clone.lock().await;
+                    buf.extend_from_slice(&chunk[..count]);
+                    let cut = buf.len().saturating_sub(256 * 1024);
+                    buf.drain(..cut);
+                }
+                let _ = stderr_done_tx.send(());
+                return;
+            }
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = line.trim();
@@ -247,6 +276,7 @@ impl ManagedProcess {
                     buf.drain(..cut);
                 }
             }
+            let _ = stderr_done_tx.send(());
             debug!(pid, "stderr drain finished");
         });
 
@@ -271,6 +301,11 @@ impl ManagedProcess {
                     error!(pid, error = %e, "wait() on subprocess errored");
                     let _ = exit_tx.send(Some(TerminalExit::WaitErrored));
                 }
+            }
+            if !diagnostics {
+                // Publish the reaped exit before awaiting final bytes: teardown
+                // must never treat a potentially recycled PID as still owned.
+                let _ = tokio::time::timeout(Duration::from_millis(200), stderr_done_rx).await;
             }
             // Direct child is gone: stop the stderr drain so a surviving
             // grandchild on the same pipe cannot pin the fd/task (F48).
@@ -385,6 +420,33 @@ impl ManagedProcess {
     /// and winds down on its own. Distinct from kill (which force-terminates).
     pub async fn interrupt(&self) -> Result<(), ProcessError> {
         self.close_stdin().await;
+        Ok(())
+    }
+
+    /// Stop an owned background command: request Unix process-group shutdown
+    /// first, then use the existing bounded subtree teardown as the fallback.
+    pub async fn terminate(&self, grace: Duration) -> Result<(), ProcessError> {
+        if self.has_exited() {
+            return Ok(());
+        }
+        // Capture identities before TERM can sever parent links. In particular,
+        // the shell may exit promptly while its server ignores TERM.
+        let descendants = crate::proc_tree::escaped_descendants(self.pid, self.process_group_id);
+        #[cfg(unix)]
+        if let Some(group) = self.process_group_id.filter(|group| *group > 1) {
+            let result = unsafe { libc::kill(-(group as i32), libc::SIGTERM) };
+            if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(ProcessError::internal("Could not signal owned background process"));
+            }
+        }
+        let result = self.kill(grace).await;
+        let remaining = crate::proc_tree::reap(&descendants);
+        result?;
+        if remaining != 0 {
+            return Err(ProcessError::internal(
+                "Could not confirm background descendant teardown",
+            ));
+        }
         Ok(())
     }
 
@@ -537,6 +599,15 @@ pub(crate) mod job_windows {
         /// the child's threads for resume (std/tokio expose no primary-thread
         /// handle, hence the toolhelp walk).
         pub(crate) fn assign_and_resume(child_raw: RawHandle, pid: u32) -> Result<Self, String> {
+            let this = Self::assign(child_raw)?;
+            resume_threads(pid).map_err(|e| format!("resume failed: {e}"))?;
+            Ok(this)
+        }
+
+        /// Assign a gated PTY shell before any user input may run. ConPTY's
+        /// spawn API does not expose CREATE_SUSPENDED; the caller uses cmd /D
+        /// with no command/AutoRun and writes only after assignment succeeds.
+        pub(crate) fn assign(child_raw: RawHandle) -> Result<Self, String> {
             // SAFETY: CreateJobObjectW with null attrs/name returns a job handle
             // or null on failure.
             let job = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
@@ -575,12 +646,6 @@ pub(crate) mod job_windows {
                     std::io::Error::last_os_error()
                 ));
             }
-
-            // Resume the child (it was spawned CREATE_SUSPENDED). std/tokio give
-            // no primary-thread handle, so enumerate the system thread table and
-            // resume every thread owned by our pid (process-wrap's documented
-            // "terrible hack" — the only option without reimplementing spawn).
-            resume_threads(pid).map_err(|e| format!("resume failed: {e}"))?;
 
             Ok(this)
         }

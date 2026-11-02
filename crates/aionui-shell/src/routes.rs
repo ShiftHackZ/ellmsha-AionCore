@@ -50,6 +50,7 @@ impl From<SttError> for ApiError {
 
 pub fn shell_routes(state: ShellRouterState) -> Router {
     Router::new()
+        .merge(crate::background_routes::routes())
         .route("/api/shell/open-file", post(open_file))
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
         .route("/api/shell/open-external", post(open_external))
@@ -377,10 +378,12 @@ mod tests {
         use crate::stt::SttService;
 
         let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let conversations = Arc::new(aionui_db::SqliteConversationRepository::new(pool.clone()));
         let repo = Arc::new(aionui_db::SqliteClientPreferenceRepository::new(pool));
         let client_pref_service = aionui_system::ClientPrefService::new(repo);
 
         ShellRouterState {
+            background_process_service: Arc::new(crate::BackgroundProcessService::new(conversations)),
             shell_service: Arc::new(ShellService::new(Arc::new(NoopSystemOpener))),
             stt_service: Arc::new(SttService::new(reqwest::Client::new())),
             client_pref_service,

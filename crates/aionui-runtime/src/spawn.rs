@@ -47,6 +47,7 @@ enum Mode {
 pub struct Builder {
     inner: Command,
     mode: Mode,
+    clear_env: bool,
 }
 
 /// Force-kill a spawned child and wait for the direct child handle to exit.
@@ -102,6 +103,7 @@ impl Builder {
         Self {
             inner,
             mode: Mode::Default,
+            clear_env: false,
         }
     }
 
@@ -126,6 +128,7 @@ impl Builder {
         Self {
             inner,
             mode: Mode::CleanCli,
+            clear_env: false,
         }
     }
 
@@ -143,6 +146,7 @@ impl Builder {
         Self {
             inner,
             mode: Mode::Default,
+            clear_env: false,
         }
     }
 
@@ -180,6 +184,7 @@ impl Builder {
     }
 
     pub fn env_clear(&mut self) -> &mut Self {
+        self.clear_env = true;
         self.inner.env_clear();
         self
     }
@@ -212,6 +217,40 @@ impl Builder {
     /// Spawn the process and return the standard `tokio::process::Child`.
     pub fn spawn(mut self) -> io::Result<Child> {
         self.inner.spawn()
+    }
+
+    /// Spawn through a real PTY using the same resolved program and sanitized
+    /// environment as ordinary children. The caller must supervise the returned
+    /// child and contain its descendants; portable-pty does not kill on drop.
+    pub fn spawn_pty(
+        self,
+        size: portable_pty::PtySize,
+    ) -> io::Result<(portable_pty::PtyPair, Box<dyn portable_pty::Child + Send + Sync>)> {
+        let configured = self.inner.as_std();
+        let mut command = portable_pty::CommandBuilder::new(configured.get_program());
+        command.args(configured.get_args());
+        if let Some(cwd) = configured.get_current_dir() {
+            command.cwd(cwd);
+        }
+        // Materialize the effective environment rather than leaking removed
+        // runtime credentials/debug flags through portable-pty's inheritance.
+        command.env_clear();
+        if !self.clear_env {
+            for (key, value) in std::env::vars_os() {
+                command.env(key, value);
+            }
+        }
+        for (key, value) in configured.get_envs() {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            }
+        }
+        let pair = portable_pty::native_pty_system()
+            .openpty(size)
+            .map_err(io::Error::other)?;
+        let child = pair.slave.spawn_command(command).map_err(io::Error::other)?;
+        Ok((pair, child))
     }
 
     /// Run to completion and collect stdout/stderr.

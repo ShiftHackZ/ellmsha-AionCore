@@ -21,6 +21,8 @@ mod instance_lock;
 mod proc_control;
 mod proc_tree;
 mod process;
+mod pty;
+pub use pty::ManagedPty;
 mod registry_store;
 mod spawner;
 mod supervisor;

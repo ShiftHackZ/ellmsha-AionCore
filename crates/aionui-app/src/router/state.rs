@@ -947,6 +947,7 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
     let client_pref_service = ClientPrefService::new(client_pref_repo);
 
     ShellRouterState {
+        background_process_service: services.background_process_service.clone(),
         shell_service: Arc::new(aionui_shell::ShellService::new(Arc::new(
             aionui_shell::DefaultSystemOpener,
         ))),

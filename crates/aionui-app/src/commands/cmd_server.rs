@@ -285,6 +285,7 @@ pub(crate) async fn run_server(
     // watch channel propagates graceful-shutdown so the scanner exits on
     // SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let background_process_service = services.background_process_service.clone();
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
         Arc::new(TeamIdleCleanupCoordinator::new(
@@ -326,6 +327,7 @@ pub(crate) async fn run_server(
                         ShutdownReason::ParentExit => info!("Detected desktop parent exit, shutting down..."),
                     }
                     let active_turn_count = conversation_runtime_state.mark_shutting_down();
+                    background_process_service.shutdown().await;
                     info!(
                         reason = "graceful_shutdown",
                         active_turn_count, "conversation runtime shutdown prepared"

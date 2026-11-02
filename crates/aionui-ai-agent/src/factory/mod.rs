@@ -84,6 +84,7 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     let mut context = options.context;
     if !routing_scope.isolated_test {
         tencent_memory::attach_required_guidance(&mut context).await?;
+        tencent_memory::attach_background_processes(&mut context).await?;
     }
     if !context.is_session_only() {
         tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await?;

@@ -26,6 +26,8 @@ Requires the sibling patched `aionrs` checkout. Build with `cargo build --locked
 
 The parent repository's installer and integration checks are authoritative for the bundled product. A passing upstream test suite alone does not prove eLLMsha integration acceptance. This local documentation update does not publish a release or make unpublished revisions available remotely.
 
+See the [background terminal API](docs/api/background-process.md) for owned development servers, scoped agent tools and shutdown behavior.
+
 ## Contributing
 
 Keep changes focused, preserve upstream licenses and notices, and separate an upstream version update from a harness patch. Record both in the parent application's About provenance. Do not commit credentials, user profiles or commercial project contents. Validate behavior on the platform being changed.
