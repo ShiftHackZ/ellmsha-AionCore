@@ -33,3 +33,5 @@ pub(crate) use cmd_server::{bind_http_listener, run_server};
 pub(crate) use cmd_team::run_team;
 pub(crate) use cmd_team_stdio::run_team_stdio;
 pub(crate) use error::{CliBoundaryCode, CliBoundaryError};
+
+pub(crate) use aionui_app::run_figma_stdio;

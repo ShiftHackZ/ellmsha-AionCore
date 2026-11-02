@@ -10,6 +10,7 @@ pub mod constants;
 pub mod dependency;
 pub mod error;
 pub mod external_paths;
+pub mod figma;
 pub mod fs_adopt;
 pub mod hub;
 pub mod hub_routes;
@@ -87,3 +88,5 @@ pub use notion::{
     NOTION_MCP_URL, NOTION_PLUGIN_NAME, NotionConnectionError, NotionConnectionManager, NotionConnectionProbe,
     NotionProbeFailure, NotionProbeResult,
 };
+
+pub use figma::{FigmaConnectionError, FigmaConnectionManager, FigmaConnectionProbe, FigmaProbeFailure};

@@ -14,8 +14,9 @@ use axum::routing::{get, post};
 use crate::notion::NotionConnectionError;
 use aionui_api_types::{
     ApiResponse, ClockifyConnectionResponse, ClockifyConnectionsResponse, ConnectClockifyConnectionRequest,
-    ConnectLinearConnectionRequest, ConnectNotionConnectionRequest, DisableExtensionRequest, EnableExtensionRequest,
-    ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, LinearConnectionResponse,
+    ConnectFigmaConnectionRequest, ConnectLinearConnectionRequest, ConnectNotionConnectionRequest,
+    DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, FigmaConnectionResponse,
+    FigmaConnectionsResponse, GetI18nRequest, GetPermissionsRequest, GetRiskLevelRequest, LinearConnectionResponse,
     LinearConnectionsResponse, NotionConnectionResponse, NotionConnectionsResponse, PermissionDetailResponse,
     PermissionSummaryResponse, SessionMcpTransport,
 };
@@ -206,6 +207,18 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route(
             "/api/plugins/notion/connections/{connection_id}/disconnect",
             post(disconnect_notion_connection),
+        )
+        .route(
+            "/api/plugins/figma/connections",
+            get(list_figma_connections).post(connect_new_figma_connection),
+        )
+        .route(
+            "/api/plugins/figma/connections/{connection_id}/connect",
+            post(reconnect_figma_connection),
+        )
+        .route(
+            "/api/plugins/figma/connections/{connection_id}/disconnect",
+            post(disconnect_figma_connection),
         )
         .route(
             "/api/plugins/clockify/connections",
@@ -1199,6 +1212,91 @@ fn clockify_api_error(error: ClockifyConnectionError) -> ApiError {
             ApiError::coded(StatusCode::BAD_GATEWAY, "CLOCKIFY_AUTH_FAILED", message, None)
         }
         ClockifyConnectionError::Persistence(message) => ApiError::Internal(message),
+    }
+}
+
+async fn list_figma_connections(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<FigmaConnectionsResponse>>, ApiError> {
+    let connections = state
+        .registry
+        .list_figma_connections(&user.id)
+        .await
+        .map_err(figma_api_error)?;
+    Ok(Json(ApiResponse::ok(connections)))
+}
+
+async fn connect_new_figma_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ConnectFigmaConnectionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<FigmaConnectionResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    if request
+        .expected_user_id
+        .as_ref()
+        .is_some_and(|expected| expected != &user.id)
+    {
+        return Err(ApiError::Forbidden(
+            "Browser account ownership changed. Reopen the conversation.".into(),
+        ));
+    }
+    let connection = state
+        .registry
+        .connect_new_figma_connection(&user.id, request.personal_access_token)
+        .await
+        .map_err(figma_api_error)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(connection))))
+}
+
+async fn reconnect_figma_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(connection_id): Path<String>,
+    body: Result<Json<ConnectFigmaConnectionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<FigmaConnectionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    if request
+        .expected_user_id
+        .as_ref()
+        .is_some_and(|expected| expected != &user.id)
+    {
+        return Err(ApiError::Forbidden(
+            "Browser account ownership changed. Reopen the conversation.".into(),
+        ));
+    }
+    let connection = state
+        .registry
+        .reconnect_figma_connection(&user.id, &connection_id, request.personal_access_token)
+        .await
+        .map_err(figma_api_error)?;
+    Ok(Json(ApiResponse::ok(connection)))
+}
+
+async fn disconnect_figma_connection(
+    State(state): State<ExtensionRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(connection_id): Path<String>,
+) -> Result<Json<ApiResponse<FigmaConnectionResponse>>, ApiError> {
+    let connection = state
+        .registry
+        .disconnect_figma_connection(&user.id, &connection_id)
+        .await
+        .map_err(figma_api_error)?;
+    Ok(Json(ApiResponse::ok(connection)))
+}
+
+fn figma_api_error(error: crate::figma::FigmaConnectionError) -> ApiError {
+    match error {
+        crate::figma::FigmaConnectionError::NotFound => ApiError::NotFound(error.to_string()),
+        crate::figma::FigmaConnectionError::InvalidInput(message) => ApiError::BadRequest(message),
+        crate::figma::FigmaConnectionError::Probe(message) => {
+            ApiError::coded(StatusCode::BAD_GATEWAY, "FIGMA_AUTH_FAILED", message, None)
+        }
+        crate::figma::FigmaConnectionError::Persistence(_) => {
+            ApiError::Internal("Figma account state could not be saved".into())
+        }
     }
 }
 

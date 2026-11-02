@@ -127,6 +127,8 @@ pub(crate) enum Command {
     McpRouterStdio,
     /// MCP stdio server for one verified Clockify account.
     McpClockifyStdio,
+    /// MCP stdio server for one verified Figma account.
+    McpFigmaStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
     /// and print a per-agent availability table. Useful when the user
     /// reports "no agent works" — running this from the same shell the
@@ -149,6 +151,7 @@ impl Command {
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::McpRouterStdio => "mcp-router-stdio",
             Self::McpClockifyStdio => "mcp-clockify-stdio",
+            Self::McpFigmaStdio => "mcp-figma-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
         }

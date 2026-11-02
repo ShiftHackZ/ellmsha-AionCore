@@ -1000,7 +1000,7 @@ pub async fn build_extension_states(
     let clockify_connections = match ClockifyConnectionManager::new(
         &skill_data_dir,
         derive_encryption_key(&services.jwt_secret_raw),
-        mcp_command,
+        mcp_command.clone(),
         clockify_probe,
     ) {
         Ok(manager) => Some(manager),
@@ -1022,6 +1022,21 @@ pub async fn build_extension_states(
                 None
             }
         };
+    let figma_connections = match crate::figma::FigmaApi::new().and_then(|probe| {
+        aionui_extension::FigmaConnectionManager::new(
+            &skill_data_dir,
+            derive_encryption_key(&services.jwt_secret_raw),
+            mcp_command,
+            Arc::new(probe),
+        )
+        .map_err(|_| "Figma account storage unavailable".to_owned())
+    }) {
+        Ok(manager) => Some(manager),
+        Err(_) => {
+            tracing::error!(stage = "state_load", "Figma connection service unavailable");
+            None
+        }
+    };
     let registry = ExtensionRegistry::new_with_account_connections(
         state_store,
         services.event_bus.clone(),
@@ -1029,7 +1044,8 @@ pub async fn build_extension_states(
         linear_connections,
         clockify_connections,
         notion_connections,
-    );
+    )
+    .with_figma_connections(figma_connections);
     let plugin_installer = PluginInstaller::new(resolve_plugin_install_target_dir(&skill_data_dir), registry.clone());
 
     let hub_dir = resolve_install_target_dir_for_data_dir(&skill_data_dir);

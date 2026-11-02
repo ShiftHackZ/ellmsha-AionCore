@@ -96,6 +96,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::McpBridge) => Ok(commands::run_mcp_bridge().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::McpRouterStdio) => Ok(commands::run_router_stdio().await),
+        Some(Command::McpFigmaStdio) => Ok(commands::run_figma_stdio().await),
         Some(Command::McpClockifyStdio) => Ok(commands::run_clockify_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),

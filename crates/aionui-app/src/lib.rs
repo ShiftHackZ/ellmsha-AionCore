@@ -18,3 +18,7 @@ pub use router::{
 pub use services::AppServices;
 
 mod usage;
+
+pub(crate) mod figma;
+
+pub use figma::mcp::run_figma_stdio;

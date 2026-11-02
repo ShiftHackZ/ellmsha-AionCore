@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::clockify::{CLOCKIFY_PLUGIN_NAME, ClockifyConnectionError, ClockifyConnectionManager};
 use crate::error::ExtensionError;
+use crate::figma::{FIGMA_PLUGIN_NAME, FigmaConnectionError, FigmaConnectionManager};
 use crate::lifecycle::{HookKind, execute_hook, needs_install_hook, resolve_hook_path};
 use crate::linear::{LINEAR_PLUGIN_NAME, LinearConnectionError, LinearConnectionManager};
 use crate::loader::{ScanPath, load_plugin_directory, resolve_scan_paths};
@@ -66,6 +67,7 @@ pub struct ExtensionRegistry {
     linear_connections: Option<LinearConnectionManager>,
     clockify_connections: Option<ClockifyConnectionManager>,
     notion_connections: Option<NotionConnectionManager>,
+    figma_connections: Option<FigmaConnectionManager>,
 }
 
 struct RegistryInner {
@@ -179,7 +181,14 @@ impl ExtensionRegistry {
             linear_connections,
             clockify_connections,
             notion_connections,
+            figma_connections: None,
         }
+    }
+
+    /// Add the independently persisted Figma account service at composition time.
+    pub fn with_figma_connections(mut self, manager: Option<FigmaConnectionManager>) -> Self {
+        self.figma_connections = manager;
+        self
     }
 
     fn prepare_revision_root(&self) -> Result<(), ExtensionError> {
@@ -662,6 +671,11 @@ impl ExtensionRegistry {
             .await
             .into_iter()
             .any(|extension| extension.state.enabled && extension.manifest.name == NOTION_PLUGIN_NAME);
+        let figma_enabled = self
+            .extensions_for_user(user_id)
+            .await
+            .into_iter()
+            .any(|extension| extension.state.enabled && extension.manifest.name == FIGMA_PLUGIN_NAME);
         let contributions = self.get_contributions_for_binding(user_id, project_id).await;
         let (generation, revision_leases) = {
             let guard = self.inner.read().await;
@@ -679,6 +693,10 @@ impl ExtensionRegistry {
             None => (0, Vec::new()),
         };
         let (notion_revision, notion_servers) = match &self.notion_connections {
+            Some(manager) => manager.runtime_servers_snapshot(user_id).await,
+            None => (0, Vec::new()),
+        };
+        let (figma_revision, figma_servers) = match &self.figma_connections {
             Some(manager) => manager.runtime_servers_snapshot(user_id).await,
             None => (0, Vec::new()),
         };
@@ -705,10 +723,14 @@ impl ExtensionRegistry {
         if notion_enabled {
             mcp_servers.extend(notion_servers);
         }
+        if figma_enabled {
+            mcp_servers.extend(figma_servers);
+        }
         PluginRuntimeSnapshot {
             generation,
             linear_revision: combined_connection_revision(linear_revision, clockify_revision)
-                ^ notion_revision.rotate_left(31),
+                ^ notion_revision.rotate_left(31)
+                ^ figma_revision.rotate_left(47),
             skills,
             mcp_servers,
             _revision_leases: revision_leases,
@@ -926,6 +948,38 @@ impl ExtensionRegistry {
         self.clockify_connections
             .as_ref()
             .ok_or(ClockifyConnectionError::NotFound)
+    }
+
+    pub async fn list_figma_connections(
+        &self,
+        user_id: &str,
+    ) -> Result<aionui_api_types::FigmaConnectionsResponse, FigmaConnectionError> {
+        self.figma_manager()?.list(user_id).await
+    }
+    pub async fn connect_new_figma_connection(
+        &self,
+        user_id: &str,
+        token: String,
+    ) -> Result<aionui_api_types::FigmaConnectionResponse, FigmaConnectionError> {
+        self.figma_manager()?.connect_new(user_id, token).await
+    }
+    pub async fn reconnect_figma_connection(
+        &self,
+        user_id: &str,
+        connection_id: &str,
+        token: String,
+    ) -> Result<aionui_api_types::FigmaConnectionResponse, FigmaConnectionError> {
+        self.figma_manager()?.reconnect(user_id, connection_id, token).await
+    }
+    pub async fn disconnect_figma_connection(
+        &self,
+        user_id: &str,
+        connection_id: &str,
+    ) -> Result<aionui_api_types::FigmaConnectionResponse, FigmaConnectionError> {
+        self.figma_manager()?.disconnect(user_id, connection_id).await
+    }
+    fn figma_manager(&self) -> Result<&FigmaConnectionManager, FigmaConnectionError> {
+        self.figma_connections.as_ref().ok_or(FigmaConnectionError::NotFound)
     }
 
     pub async fn get_skills(&self) -> Vec<ResolvedSkill> {
