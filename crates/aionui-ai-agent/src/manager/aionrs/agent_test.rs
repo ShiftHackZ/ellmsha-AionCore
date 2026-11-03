@@ -160,7 +160,8 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
         inject_skills: Vec::new(),
     };
 
-    let value = build_aionrs_final_input_dump_value("conv-aionrs", "/workspace", &context, &data);
+    let value =
+        build_aionrs_final_input_dump_value("conv-aionrs", "/workspace", &context, &data, Some("CURRENT_RULES"));
 
     assert_eq!(value["kind"], "aionrs-final-input");
     assert_eq!(value["backend"], "aionrs");
@@ -169,6 +170,7 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
     assert_eq!(value["turn_id"], "turn-aionrs-final");
     assert_eq!(value["input"]["system_prompt"], "assistant rule raw");
     assert_eq!(value["input"]["user_content"], "team wake raw content");
+    assert_eq!(value["input"]["required_guidance"], "CURRENT_RULES");
     assert_eq!(value["resolved_context"]["provider"], "openai");
     assert_eq!(value["resolved_context"]["model"], "gpt-test");
     assert_eq!(value["resolved_context"]["workspace"]["path"], "/workspace");

@@ -179,11 +179,21 @@ pub enum AgentInstance {
 pub struct PreparedAgentMessage {
     agent: AgentInstance,
     data: SendMessageData,
+    /// Native requests can project current guidance without saving another copy
+    /// in conversation history. This never comes from the client message DTO.
+    native_guidance: Option<String>,
 }
 
 impl PreparedAgentMessage {
     pub async fn send(self) -> Result<(), AgentSendError> {
-        self.agent.as_task().send_message(self.data).await
+        match &self.agent {
+            AgentInstance::Aionrs(manager) => {
+                manager
+                    .send_message_with_guidance(self.data, self.native_guidance)
+                    .await
+            }
+            _ => self.agent.as_task().send_message(self.data).await,
+        }
     }
 }
 
@@ -289,12 +299,20 @@ impl AgentInstance {
             }
             data.content = format!("{}\n\n{}", memory.text, data.content);
         }
-        if let Some(rules) = rules {
-            data.content = format!("{rules}\n\n{}", data.content);
-        }
+        let native_guidance = if matches!(self, Self::Aionrs(_)) {
+            rules
+        } else {
+            // External agents own their history. Keep their full fresh guidance
+            // in the turn payload; do not guess whether compaction retained it.
+            if let Some(rules) = rules {
+                data.content = format!("{rules}\n\n{}", data.content);
+            }
+            None
+        };
         Ok(PreparedAgentMessage {
             agent: self.clone(),
             data,
+            native_guidance,
         })
     }
 

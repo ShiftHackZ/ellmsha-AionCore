@@ -135,7 +135,7 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
                 .respond_with(move |_: &wiremock::Request| {
                     let revision = revisions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
-                        "path":source,"content":format!("{scope}_FULL_RULE_{revision}_END")
+                        "path":source,"content":format!("{scope}_FULL_RULE_{revision}_BEGIN\n{}\n{scope}_FULL_RULE_{revision}_END", "complete scoped guidance\n".repeat(100))
                     }}))
                 })
                 .mount(&server)
@@ -164,10 +164,29 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
         return;
     }
     let directory = tempfile::tempdir().unwrap();
+    let provider = MockServer::start().await;
+    // Exercise the real native manager/provider serializer against loopback.
+    // The fixture returns text only and cannot request tools or reach an account.
+    let response = [
+        ("message_start", json!({"type":"message_start","message":{"id":"fixture","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":0}}})),
+        ("content_block_start", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
+        ("content_block_delta", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"fixture complete"}})),
+        ("content_block_stop", json!({"type":"content_block_stop","index":0})),
+        ("message_delta", json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})),
+        ("message_stop", json!({"type":"message_stop"})),
+    ].into_iter().map(|(event, data)| format!("event: {event}\ndata: {data}\n\n")).collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(response, "text/event-stream"))
+        .expect(2)
+        .mount(&provider)
+        .await;
     let mut native_config = super::aionrs_config_option_tests::make_test_config();
+    native_config.tool_scope = aionui_api_types::ConversationToolScope::SessionOnly;
     // Even a regression must never send the fixture credential to a real API.
-    native_config.base_url = Some("http://127.0.0.1:9".into());
+    native_config.base_url = Some(provider.uri());
     native_config.session_directory = directory.path().join("native-sessions");
+    let native_session_directory = native_config.session_directory.clone();
     let native = AionrsAgentManager::new(
         "rules-native-fixture".into(),
         directory.path().to_string_lossy().into_owned(),
@@ -201,15 +220,65 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
             },
         );
         let mut previous = None;
-        for _ in 0..2 {
+        for turn in 0..2 {
             let prepared = instance.prepare_message(message()).await.unwrap();
-            let text = prepared.data.content;
+            let is_native = matches!(instance, AgentInstance::Aionrs(_));
+            let text = if is_native {
+                assert_eq!(prepared.data.content, "SYNTHETIC_USER_TASK");
+                format!(
+                    "{}\n\n{}",
+                    prepared.native_guidance.as_deref().unwrap(),
+                    prepared.data.content
+                )
+            } else {
+                assert!(prepared.native_guidance.is_none());
+                prepared.data.content.clone()
+            };
             assert!(text.starts_with("<ellmsha_required_rules"));
+            assert_eq!(text.matches("<ellmsha_required_rules ").count(), 1);
+            assert_eq!(text.matches("</ellmsha_required_rules>").count(), 1);
+            for scope in ["global", "project"] {
+                assert_eq!(text.matches(&format!("{scope}_FULL_RULE_")).count(), 2);
+            }
+            assert_eq!(text.matches("complete scoped guidance\n").count(), 200);
             let global = text.find("global_FULL_RULE_").unwrap();
             let project = text.find("project_FULL_RULE_").unwrap();
             assert!(global < project && project < text.find("SYNTHETIC_USER_TASK").unwrap());
             assert_eq!(text.matches("SYNTHETIC_USER_TASK").count(), 1);
             assert_ne!(previous.as_ref(), Some(&text), "rules must reload on the next turn");
+            if is_native {
+                let current_rules = prepared.native_guidance.clone().unwrap();
+                prepared.send().await.unwrap();
+                let requests = provider.received_requests().await.unwrap();
+                assert_eq!(requests.len(), turn + 1);
+                let request: serde_json::Value = serde_json::from_slice(&requests[turn].body).unwrap();
+                let request_text = serde_json::to_string(&request).unwrap();
+                assert_eq!(request_text.matches("<ellmsha_required_rules ").count(), 1);
+                for scope in ["global", "project"] {
+                    assert_eq!(request_text.matches(&format!("{scope}_FULL_RULE_")).count(), 2);
+                }
+                let blocks = request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|message| message["content"].as_array().unwrap())
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    blocks.contains(&current_rules.as_str()),
+                    "complete current rules must reach the provider unchanged"
+                );
+                assert!(!request["system"].to_string().contains("FULL_RULE_"));
+                let saved = aion_agent::session::SessionManager::new(native_session_directory.clone(), 10)
+                    .load(instance.conversation_id())
+                    .unwrap();
+                let saved_text = serde_json::to_string(&saved.messages).unwrap();
+                assert!(
+                    !saved_text.contains("FULL_RULE_"),
+                    "mandatory snapshots must not accumulate in saved history"
+                );
+                assert_eq!(saved_text.matches("SYNTHETIC_USER_TASK").count(), turn + 1);
+            }
             previous = Some(text);
         }
         let child = NativeChildRules {

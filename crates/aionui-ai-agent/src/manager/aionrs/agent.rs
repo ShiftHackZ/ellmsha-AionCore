@@ -74,6 +74,7 @@ fn build_aionrs_final_input_dump_value(
     workspace: &str,
     context: &AionrsFinalInputDumpContext,
     data: &SendMessageData,
+    guidance: Option<&str>,
 ) -> Value {
     let mut value = serde_json::json!({
         "kind": "aionrs-final-input",
@@ -85,6 +86,7 @@ fn build_aionrs_final_input_dump_value(
         "input": {
             "system_prompt": context.system_prompt.as_deref(),
             "user_content": &data.content,
+            "required_guidance": guidance,
         },
         "resolved_context": {
             "provider": &context.provider,
@@ -356,7 +358,7 @@ impl AionrsAgentManager {
         was_running
     }
 
-    fn dump_aionrs_final_input(&self, data: &SendMessageData) {
+    fn dump_aionrs_final_input(&self, data: &SendMessageData, guidance: Option<&str>) {
         let Some(context) = self.final_input_dump.as_ref() else {
             return;
         };
@@ -366,6 +368,7 @@ impl AionrsAgentManager {
             self.runtime.workspace(),
             context,
             data,
+            guidance,
         );
         let input = value.get("input").cloned().unwrap_or(Value::Null);
         let resolved_context = value.get("resolved_context").cloned().unwrap_or(Value::Null);
@@ -430,6 +433,26 @@ impl IAgentTask for AionrsAgentManager {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.send_message_with_guidance(data, None).await
+    }
+
+    async fn cancel(&self) -> Result<(), AgentError> {
+        self.request_stop(None, "cancel");
+        Ok(())
+    }
+
+    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        self.request_stop(reason, "kill");
+        Ok(())
+    }
+}
+
+impl AionrsAgentManager {
+    pub(crate) async fn send_message_with_guidance(
+        &self,
+        data: SendMessageData,
+        guidance: Option<String>,
+    ) -> Result<(), AgentSendError> {
         let started_at = now_ms();
         info!(
             conversation_id = %self.runtime.conversation_id(),
@@ -439,7 +462,7 @@ impl IAgentTask for AionrsAgentManager {
         );
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
-        self.dump_aionrs_final_input(&data);
+        self.dump_aionrs_final_input(&data, guidance.as_deref());
 
         // Keep attachment paths in the provider-independent history. Images
         // are loaded on demand by aionrs's ViewImage tool.
@@ -456,7 +479,7 @@ impl IAgentTask for AionrsAgentManager {
         let mut engine = self.engine.lock().await;
 
         let result = tokio::select! {
-            res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
+            res = engine.run_with_blocks_and_guidance(content_blocks, &data.msg_id, guidance) => Some(res),
             _ = self.cancel_notify.notified() => {
                 info!(
                     conversation_id = %self.runtime.conversation_id(),
@@ -513,16 +536,6 @@ impl IAgentTask for AionrsAgentManager {
         };
         self.turn_finished_notify.notify_waiters();
         send_result
-    }
-
-    async fn cancel(&self) -> Result<(), AgentError> {
-        self.request_stop(None, "cancel");
-        Ok(())
-    }
-
-    fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
-        self.request_stop(reason, "kill");
-        Ok(())
     }
 }
 

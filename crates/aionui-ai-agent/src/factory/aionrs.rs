@@ -1979,10 +1979,26 @@ mod tests {
             .await;
         assert!(!search.is_error);
         let matches: Value = serde_json::from_str(&search.content)
-            .expect("ToolSearch must return actual schemas, not a no-match message");
+            .expect("ToolSearch must return a discovered tool, not a no-match message");
         assert_eq!(matches[0]["name"], "tdai_wiki_ingest");
-        assert_eq!(matches[0]["parameters"]["properties"]["content"]["type"], "string");
-        assert_eq!(matches[0]["parameters"]["required"], json!(["content"]));
+        assert_eq!(matches[0]["loaded"], true);
+        assert!(
+            matches[0].get("parameters").is_none(),
+            "do not duplicate schemas in chat history"
+        );
+        let definition = result
+            .engine
+            .registry_mut()
+            .to_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "tdai_wiki_ingest")
+            .unwrap();
+        assert!(
+            !definition.deferred,
+            "the next request must advertise the complete discovered schema"
+        );
+        assert_eq!(definition.input_schema["properties"]["content"]["type"], "string");
+        assert_eq!(definition.input_schema["required"], json!(["content"]));
         let call = result
             .engine
             .registry_mut()
