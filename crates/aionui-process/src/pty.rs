@@ -44,7 +44,10 @@ fn initialize_conpty(
             let previous = startup.len();
             startup.extend_from_slice(&chunk[..count]);
             let start = previous.saturating_sub(REQUEST.len() - 1);
-            if let Some(index) = startup[start..].windows(REQUEST.len()).position(|bytes| bytes == REQUEST) {
+            if let Some(index) = startup[start..]
+                .windows(REQUEST.len())
+                .position(|bytes| bytes == REQUEST)
+            {
                 startup.drain(start + index..start + index + REQUEST.len());
                 let _ = send.send(std::io::Cursor::new(startup).chain(reader));
                 return;
