@@ -21,6 +21,43 @@ pub struct ManagedPty {
     #[cfg(windows)]
     job: crate::process::job_windows::JobObject,
 }
+// portable-pty opens ConPTY with INHERIT_CURSOR. Until the host replies to
+// its initial device status request, cmd can wait indefinitely on an empty
+// screen. Do this before exposing the writer to command or interactive input.
+#[cfg(windows)]
+fn initialize_conpty(
+    mut reader: Box<dyn Read + Send>,
+    process: &ManagedPty,
+) -> Result<Box<dyn Read + Send>, ProcessError> {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        const REQUEST: &[u8] = b"\x1b[6n";
+        let mut startup = Vec::new();
+        let mut chunk = [0; 512];
+        while startup.len() < 8192 {
+            let count = match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let previous = startup.len();
+            startup.extend_from_slice(&chunk[..count]);
+            let start = previous.saturating_sub(REQUEST.len() - 1);
+            if let Some(index) = startup[start..].windows(REQUEST.len()).position(|bytes| bytes == REQUEST) {
+                startup.drain(start + index..start + index + REQUEST.len());
+                let _ = send.send(std::io::Cursor::new(startup).chain(reader));
+                return;
+            }
+        }
+    });
+    let reader = receive
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| ProcessError::internal("ConPTY cursor handshake failed"))?;
+    process.write(b"\x1b[1;1R")?;
+    Ok(Box::new(reader))
+}
+
 impl ManagedPty {
     /// Spawn a persistent interactive shell, or a single foreground command.
     /// On Windows cmd /D waits for input until its Job Object is assigned.
@@ -119,6 +156,8 @@ impl ManagedPty {
             #[cfg(windows)]
             job,
         });
+        #[cfg(windows)]
+        let reader = initialize_conpty(reader, &process)?;
         #[cfg(windows)]
         if !command.is_empty() {
             process.write(format!("{command}\r\nexit\r\n").as_bytes())?;

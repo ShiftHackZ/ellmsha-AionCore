@@ -215,16 +215,13 @@ async fn screen_keeps_up_with_redraw_and_output_overflow_without_splitting_utf8(
 async fn native_shell_accepts_input_and_shutdown_closes_its_pty_on_every_os() {
     let (service, _dir, id) = fixture().await;
     #[cfg(windows)]
-    let data = "echo NATIVE_&&echo SHELL\r";
+    let data = "echo NATIVE_^SHELL\r";
     #[cfg(not(windows))]
     let data = "printf 'NATIVE_%s\\n' SHELL\r";
     service
         .write(OWNER, "chat", &id, input(data, Some(0)), true)
         .await
         .unwrap();
-    #[cfg(windows)]
-    let marker = "SHELL";
-    #[cfg(not(windows))]
     let marker = "NATIVE_SHELL";
     let snap = wait(&service, &id, marker).await;
     service.shutdown().await;
