@@ -208,9 +208,27 @@ impl ManagedPty {
         let mut exit = self.exit.lock().unwrap();
         if exit.is_none()
             && let Some(child) = child.as_mut()
-            && let Ok(Some(status)) = child.try_wait()
         {
-            *exit = Some(status.exit_code());
+            #[cfg(windows)]
+            {
+                use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+                use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+                // GetExitCodeProcess alone can expose the termination code before
+                // Windows signals the process object. The owned handle also avoids PID reuse.
+                if let Some(handle) = child.as_raw_handle() {
+                    let mut code = 0;
+                    // SAFETY: child owns this handle under its mutex for both calls.
+                    if unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0
+                        && unsafe { GetExitCodeProcess(handle, &mut code) } != 0
+                    {
+                        *exit = Some(code);
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            if let Ok(Some(status)) = child.try_wait() {
+                *exit = Some(status.exit_code());
+            }
         }
         exit.is_some()
     }
@@ -274,10 +292,10 @@ impl ManagedPty {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let process = self.clone();
         tokio::task::spawn_blocking(move || {
-            let mut owned = process.child.lock().unwrap();
             #[cfg(windows)]
             process.job.terminate();
-            if let Some(child) = owned.as_mut()
+            #[cfg(not(windows))]
+            if let Some(child) = process.child.lock().unwrap().as_mut()
                 && process.exit.lock().unwrap().is_none()
             {
                 match child.try_wait() {

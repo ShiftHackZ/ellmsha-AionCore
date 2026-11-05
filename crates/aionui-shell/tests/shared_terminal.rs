@@ -226,10 +226,13 @@ async fn native_shell_accepts_input_and_shutdown_closes_its_pty_on_every_os() {
     let snap = wait(&service, &id, marker).await;
     service.shutdown().await;
     assert!(service.list(OWNER, "chat").await.unwrap().is_empty());
-    assert!(matches!(
-        aionui_process::probe(snap.pid),
-        aionui_process::ObservedLiveness::Gone
-    ));
+    let observed = aionui_process::probe(snap.pid);
+    assert_eq!(
+        observed,
+        aionui_process::ObservedLiveness::Gone,
+        "shell PID {} after shutdown",
+        snap.pid
+    );
 }
 
 #[cfg(unix)]
