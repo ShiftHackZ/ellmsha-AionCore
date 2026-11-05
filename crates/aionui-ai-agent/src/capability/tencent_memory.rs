@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use crate::types::MemoryRecallScope;
 
 mod rules;
-pub(crate) use rules::{NativeChildRules, required_rules_from_env};
+pub(crate) use rules::{NativeChildRules, startup_rules_from_env};
+pub(crate) use rules::{RulesDelivery, prepare_rules_delivery};
+pub use rules::{invoke_rules_tool, mutate_chat_rule, read_chat_rules};
 
 const CONFIG_ENV: &str = "AIONUI_TDAI_MEMORY_CONFIG";
 const CONTEXT_BYTES: usize = 16 * 1024;
@@ -27,6 +29,34 @@ const EXACT_ID_LIMIT: usize = 32;
 const EXACT_ID_BYTES: usize = 64;
 
 static SESSION_RECALL: LazyLock<DashMap<String, SessionRecall>> = LazyLock::new(DashMap::new);
+/// Only the host-owned project roots may provide project skills. Session-only
+/// chats explicitly exclude them, including when the chat belongs to a project.
+pub(crate) async fn project_skills_for_turn(
+    conversation: &str,
+    content: &str,
+    workspace: &str,
+    native_dirs: Vec<String>,
+) -> Result<Option<String>, crate::AgentError> {
+    let Some(roots) = SESSION_RECALL.get(conversation).and_then(|entry| {
+        let scope = &entry.scope;
+        (scope.project_id.is_some() && !scope.isolated_test && !scope.guidance_only && !scope.temporary_project)
+            .then(|| scope.roots.iter().map(std::path::PathBuf::from).collect::<Vec<_>>())
+    }) else {
+        return Ok(None);
+    };
+    let command = content
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.strip_prefix('/'))
+        .map(str::to_owned);
+    let cwd = std::path::PathBuf::from(workspace);
+    tokio::task::spawn_blocking(move || {
+        aionui_common::project_skills::render_for_turn(&roots, command.as_deref(), &cwd, &native_dirs)
+    })
+    .await
+    .map_err(|_| crate::AgentError::internal("Project skill discovery failed"))?
+    .map_err(|_| crate::AgentError::bad_request("Project skills could not be read from the registered roots"))
+}
 #[cfg(test)]
 pub(crate) fn registered_workspace(conversation_id: &str) -> Option<String> {
     SESSION_RECALL
@@ -53,6 +83,9 @@ static SCOPE_NEGATION: LazyLock<Regex> = LazyLock::new(|| {
 struct SessionRecall {
     scope: MemoryRecallScope,
     recent_goal: Arc<Mutex<Option<String>>>,
+    rule_sources: rules::SourceCache,
+    delivered_rules: Arc<tokio::sync::Mutex<Option<(u64, Value)>>>,
+    rule_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Deserialize)]
@@ -129,10 +162,11 @@ pub(crate) struct RecallContext {
 }
 
 pub(crate) fn register_session(conversation_id: &str, mut scope: MemoryRecallScope) {
+    scope.conversation_id = Some(conversation_id.to_owned());
     if scope.workspace.trim().is_empty() {
         scope.workspace = scope.roots.first().cloned().unwrap_or_default();
     }
-    if scope.roots.is_empty() && !scope.workspace.is_empty() {
+    if scope.project_id.is_none() && scope.roots.is_empty() && !scope.workspace.is_empty() {
         scope.roots.push(scope.workspace.clone());
     }
     let mut seed = None;
@@ -155,6 +189,15 @@ pub(crate) fn register_session(conversation_id: &str, mut scope: MemoryRecallSco
     match SESSION_RECALL.entry(conversation_id.to_owned()) {
         dashmap::mapref::entry::Entry::Occupied(mut existing) => {
             let existing = existing.get_mut();
+            if existing.scope.project_id != scope.project_id
+                || existing.scope.roots != scope.roots
+                || existing.scope.temporary_project != scope.temporary_project
+                || existing.scope.guidance_only != scope.guidance_only
+                || existing.scope.rule_workspace != scope.rule_workspace
+            {
+                existing.rule_sources = Arc::default();
+                existing.delivered_rules = Arc::default();
+            }
             existing.scope = scope;
             if let Ok(mut recent) = existing.recent_goal.lock()
                 && recent.is_none()
@@ -166,8 +209,28 @@ pub(crate) fn register_session(conversation_id: &str, mut scope: MemoryRecallSco
             vacant.insert(SessionRecall {
                 scope,
                 recent_goal: Arc::new(Mutex::new(seed)),
+                rule_sources: Arc::default(),
+                delivered_rules: Arc::default(),
+                rule_epoch: Arc::default(),
             });
         }
+    }
+}
+
+/// A running session can have a host-selected module cwd distinct from the
+/// persisted project workspace. Reuse only its cwd, never its authorization.
+pub(crate) fn live_rule_workspace(scope: &MemoryRecallScope) -> Option<String> {
+    let session = SESSION_RECALL.get(scope.conversation_id.as_deref()?)?;
+    (session.scope.project_id == scope.project_id
+        && session.scope.roots == scope.roots
+        && !session.scope.rule_workspace.is_empty())
+    .then(|| session.scope.rule_workspace.clone())
+}
+
+/// A compacted or reset provider context must be hydrated again on its next turn.
+pub(crate) fn forget_delivered_rules(conversation_id: &str) {
+    if let Some(session) = SESSION_RECALL.get(conversation_id) {
+        session.rule_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -838,6 +901,9 @@ async fn call(
         .send()
         .await
         .map_err(|_| "request_failed")?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err("conflict");
+    }
     if !response.status().is_success() {
         return Err("http_error");
     }
@@ -849,6 +915,9 @@ async fn call(
         bytes.extend_from_slice(&chunk);
     }
     let envelope: Value = serde_json::from_slice(&bytes).map_err(|_| "invalid_json")?;
+    if envelope.get("code").and_then(Value::as_i64) == Some(409) {
+        return Err("conflict");
+    }
     if envelope.get("code").and_then(Value::as_i64) != Some(0) {
         return Err("memory_error");
     }
@@ -982,7 +1051,27 @@ fn full_source_candidate(plan: &RecallPlan, search: &Value) -> Option<String> {
     })
 }
 
-async fn recall(config: &MemoryConfig, workspace: &str, scope: &MemoryRecallScope, plan: &RecallPlan) -> RecallContext {
+/// Automatic recall is for historical evidence. Verified guidance is delivered by
+/// tdai_rules_read, and out-of-scope instructions must not come back as excerpts.
+fn exclude_recalled_rules(search: &mut Value, delivered: Option<&serde_json::Map<String, Value>>) {
+    if let Some(items) = search.get_mut("items").and_then(Value::as_array_mut) {
+        items.retain(|item| {
+            !matches!(item["type"].as_str(), Some("instruction" | "persona"))
+                && item["guidance_status"] != "active"
+                && !item["source_path"]
+                    .as_str()
+                    .is_some_and(|p| delivered.is_some_and(|d| d.contains_key(p)))
+        });
+    }
+}
+
+async fn recall(
+    config: &MemoryConfig,
+    workspace: &str,
+    scope: &MemoryRecallScope,
+    plan: &RecallPlan,
+    delivered: Option<&serde_json::Map<String, Value>>,
+) -> RecallContext {
     let (project_scope, scopes, aliases) = derive_aliases(scope, workspace);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -993,7 +1082,7 @@ async fn recall(config: &MemoryConfig, workspace: &str, scope: &MemoryRecallScop
         return render(&project_scope, plan, Err("client_error"), Err("client_error"), None);
     };
     let requests = async {
-        let (core, search) = tokio::join!(call(&client, config, "core/read", json!({})), async {
+        let (core, mut search) = tokio::join!(call(&client, config, "core/read", json!({})), async {
             if plan.history_required {
                 Ok(json!({"items": [], "complete": false, "returned": 0}))
             } else if !plan.exact_ids.is_empty() && plan.request_ids().is_empty() {
@@ -1004,6 +1093,9 @@ async fn recall(config: &MemoryConfig, workspace: &str, scope: &MemoryRecallScop
                 call(&client, config, "atomic/search", search_body(plan, &scopes, &aliases)).await
             }
         },);
+        if let Ok(value) = &mut search {
+            exclude_recalled_rules(value, delivered);
+        }
         let full_source = if let Ok(value) = search.as_ref()
             && let Some(path) = full_source_candidate(plan, value)
         {
@@ -1045,20 +1137,9 @@ pub(crate) async fn recall_for_router(
             "Memory configuration missing; classification was not started".into(),
         )
     })?;
-    let rules = if local_only {
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            rules::load(&config, scope, &scope.workspace, true),
-        )
-        .await
-        .map_err(|_| {
-            crate::AgentError::RequiredGuidanceUnavailable(
-                "Local guidance deadline exceeded; classification was not started".into(),
-            )
-        })??
-    } else {
-        rules::required_rules_for_scope(&config, scope, &scope.workspace).await?
-    };
+    let snapshot = invoke_rules_tool("tdai_rules_read", &json!({}), scope, &scope.workspace, local_only).await?;
+    let rules = rules::render_delivery(&snapshot, "full", snapshot["rules"].as_array().unwrap(), &[], true)?;
+    let delivered = rules::revisions(&snapshot);
     if local_only || scope.guidance_only {
         return Ok(Some(RecallContext {
             text: rules,
@@ -1073,12 +1154,17 @@ pub(crate) async fn recall_for_router(
     }
     let mut plan = plan(query, None);
     plan.scope_mode = "current_project";
-    let mut context = recall(&config, &scope.workspace, scope, &plan).await;
+    let mut context = recall(&config, &scope.workspace, scope, &plan, delivered.as_object()).await;
     context.text = format!("{rules}\n\n{}", context.text);
     Ok(Some(context))
 }
 
-pub(crate) async fn recall_from_env(conversation_id: &str, workspace: &str, query: &str) -> Option<RecallContext> {
+pub(crate) async fn recall_from_env(
+    conversation_id: &str,
+    workspace: &str,
+    query: &str,
+    delivered: Option<&serde_json::Map<String, Value>>,
+) -> Option<RecallContext> {
     let session = SESSION_RECALL
         .get(conversation_id)
         .map(|entry| entry.clone())
@@ -1089,6 +1175,9 @@ pub(crate) async fn recall_from_env(conversation_id: &str, workspace: &str, quer
                 ..Default::default()
             },
             recent_goal: Arc::new(Mutex::new(None)),
+            rule_sources: Arc::default(),
+            delivered_rules: Arc::default(),
+            rule_epoch: Arc::default(),
         });
     if session.scope.isolated_test || session.scope.guidance_only {
         return None;
@@ -1103,7 +1192,7 @@ pub(crate) async fn recall_from_env(conversation_id: &str, workspace: &str, quer
     let config = load_config();
     let (resolved_scope, _, _) = derive_aliases(&session.scope, workspace);
     Some(match config {
-        Some(config) => recall(&config, workspace, &session.scope, &plan).await,
+        Some(config) => recall(&config, workspace, &session.scope, &plan, delivered).await,
         None => render(&resolved_scope, &plan, Err("config_error"), Err("config_error"), None),
     })
 }
@@ -1273,6 +1362,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optional_recall_reads_evidence_without_repeating_or_crossing_rule_scope() {
+        let server = MockServer::start().await;
+        let config = MemoryConfig {
+            gateway_url: server.uri(),
+            service_id: "fixture".into(),
+            team_id: "t".into(),
+            user_id: "u".into(),
+            agent_id: "a".into(),
+            gateway_api_key: String::new(),
+        };
+        Mock::given(path("/v3/core/read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{}})))
+            .mount(&server)
+            .await;
+        Mock::given(path("/v3/atomic/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"items":[
+                {"source_path":"global.md","content":"RULE_SENT_ONLY_ONCE"},
+                {"source_path":"foreign.md","type":"instruction","content":"OTHER_PROJECT_RULE"},
+                {"source_path":"history.md","type":"episodic","content":"RELEVANT_TICKET"}
+            ],"complete":true}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/v3/scenario/read"))
+            .and(body_partial_json(json!({"path":"history.md"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"content":"FULL_TICKET"}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let scope = MemoryRecallScope {
+            temporary_project: true,
+            workspace: "/tmp/work".into(),
+            ..Default::default()
+        };
+        let manifest = json!({"global.md":"known-digest"});
+        let result = recall(
+            &config,
+            &scope.workspace,
+            &scope,
+            &plan("Inspect DEV-123", None),
+            manifest.as_object(),
+        )
+        .await;
+        assert!(result.text.contains("FULL_TICKET") && result.text.contains("RELEVANT_TICKET"));
+        assert!(!result.text.contains("RULE_SENT_ONLY_ONCE") && !result.text.contains("OTHER_PROJECT_RULE"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.iter().filter(|r| r.url.path() == "/v3/scenario/read").count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn active_project_guidance_is_injected_on_fresh_and_resumed_recall_without_core_persona() {
         let server = MockServer::start().await;
         let workspace = "/tmp/owned-guidance-fixture";
@@ -1314,6 +1457,7 @@ mod tests {
             register_session(
                 &id,
                 MemoryRecallScope {
+                    project_id: Some("fixture".into()),
                     workspace: workspace.into(),
                     roots: vec![workspace.into()],
                     recent_user_goals: if resumed {
@@ -1331,7 +1475,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(required.contains("PROJECT_RULE: Use owned staging fixtures."));
-            let context = recall(&config, workspace, &session.scope, &planned).await;
+            let context = recall(&config, workspace, &session.scope, &planned, None).await;
             assert_eq!(context.status, "ready");
             assert!(
                 !context.text.contains("PROJECT_RULE"),
@@ -1359,10 +1503,70 @@ mod tests {
             },
         );
         assert!(
-            recall_from_env(id, "/tmp/synthetic", "fixture question")
+            recall_from_env(id, "/tmp/synthetic", "fixture question", None)
                 .await
                 .is_none()
         );
+        unregister_session(id);
+    }
+
+    #[tokio::test]
+    async fn project_skills_restrict_expansion_to_direct_commands_in_nonisolated_registered_chats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let dir = root.join(".claude/skills/release-now");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"),"---\nname: release-now\ndescription: Synthetic manual procedure\ndisable-model-invocation: true\n---\nEXPLICIT PROCEDURE").unwrap();
+        let workspace = root.to_str().unwrap();
+        let id = "project-skill-leading-command-fixture";
+        let scope = MemoryRecallScope {
+            project_id: Some("owned-project".into()),
+            workspace: workspace.into(),
+            roots: vec![workspace.into()],
+            ..Default::default()
+        };
+        register_session(id, scope.clone());
+        for text in [
+            "Do not run /release-now",
+            "See /release-now/file",
+            "/release-now/file",
+            "```\n/release-now\n```",
+        ] {
+            assert!(
+                project_skills_for_turn(id, text, workspace, vec![])
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{text}"
+            );
+        }
+        let explicit = project_skills_for_turn(id, "/release-now example", workspace, vec![])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(explicit.contains("EXPLICIT PROCEDURE"));
+        for scope in [
+            MemoryRecallScope {
+                temporary_project: true,
+                ..scope.clone()
+            },
+            MemoryRecallScope {
+                guidance_only: true,
+                ..scope.clone()
+            },
+            MemoryRecallScope {
+                isolated_test: true,
+                ..scope
+            },
+        ] {
+            register_session(id, scope);
+            assert!(
+                project_skills_for_turn(id, "/release-now", workspace, vec![])
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
         unregister_session(id);
     }
 
@@ -1623,11 +1827,13 @@ mod tests {
     #[test]
     fn aliases_cover_registered_root_nested_workspace_and_legacy_name() {
         let scope = MemoryRecallScope {
+            rule_workspace: String::new(),
             conversation_id: None,
             isolated_test: false,
             guidance_only: false,
             project_id: Some("project-1".into()),
             project_name: Some("DemoProject".into()),
+            temporary_project: false,
             workspace: "/product/DemoProject".into(),
             roots: vec!["/product/DemoProject".into(), "/product/DemoProject/mobile".into()],
             recent_user_goals: vec![],
@@ -1647,11 +1853,13 @@ mod tests {
             ("a".repeat(161), "b".repeat(161)),
         ] {
             let scope = MemoryRecallScope {
+                rule_workspace: String::new(),
                 conversation_id: None,
                 isolated_test: false,
                 guidance_only: false,
                 project_name: Some(name),
                 project_id: Some(id),
+                temporary_project: false,
                 workspace: "/tmp/Проект".into(),
                 roots: vec!["/tmp/Проект".into(), "/tmp/Приложение".into()],
                 recent_user_goals: vec![],
@@ -1887,7 +2095,14 @@ mod tests {
             roots: vec!["/tmp/project".into()],
             ..Default::default()
         };
-        let context = recall(&config, "/tmp/project", &scope, &plan("Какой проект главный?", None)).await;
+        let context = recall(
+            &config,
+            "/tmp/project",
+            &scope,
+            &plan("Какой проект главный?", None),
+            None,
+        )
+        .await;
         assert_eq!(context.status, "partial");
         assert_eq!(context.evidence_status, "unavailable");
         assert!(context.text.contains("Some memory retrieval failed"));
@@ -1930,6 +2145,7 @@ mod tests {
             "/tmp/project",
             &scope,
             &plan("What did I ask in the last chat?", None),
+            None,
         )
         .await;
         assert_eq!(context.status, "ready");
@@ -1959,7 +2175,7 @@ mod tests {
             ..Default::default()
         };
         let started = std::time::Instant::now();
-        let context = recall(&config, "/tmp/project", &scope, &empty_plan()).await;
+        let context = recall(&config, "/tmp/project", &scope, &empty_plan(), None).await;
         assert_eq!(context.status, "unavailable");
         assert!(started.elapsed() < Duration::from_secs(5));
     }

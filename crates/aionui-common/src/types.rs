@@ -57,6 +57,8 @@ pub struct Confirmation {
     pub description: String,
     pub command_type: Option<String>,
     pub options: Vec<ConfirmationOption>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::UserQuestion>,
 }
 
 /// A single option within a confirmation dialog.
@@ -136,6 +138,7 @@ mod tests {
     #[test]
     fn test_confirmation_serde() {
         let c = Confirmation {
+            questions: Vec::new(),
             id: "c1".into(),
             call_id: "call1".into(),
             title: Some("Run command?".into()),

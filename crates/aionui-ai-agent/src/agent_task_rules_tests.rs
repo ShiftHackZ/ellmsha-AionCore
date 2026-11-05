@@ -106,12 +106,20 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
     const CHILD: &str = "ELLMSHA_RULES_DISPATCH_FIXTURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let server = MockServer::start().await;
+        // Match the real inventory: global namespace or the bound project's V2 alias.
+        let source_path = |scope: &str| {
+            if scope == "global" {
+                "knowledge/global/global.md"
+            } else {
+                "v2/projects/fixture/project.md"
+            }
+        };
         let records: Vec<_> = ["global", "project"]
             .into_iter()
             .map(|scope| {
                 json!({
                     "id":scope,"guidance_status":"active","source_status":"active","type":"instruction",
-                    "guidance_scope":scope,"source_path":format!("knowledge/fixture/{scope}.md")
+                    "guidance_scope":scope,"source_path":source_path(scope)
                 })
             })
             .collect();
@@ -120,14 +128,23 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
             .and(body_partial_json(
                 json!({"guidance_inventory":true,"include_global":true}),
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
-                "guidance_inventory":true,"degraded":false,"returned":2,"items":records,
-                "total_candidates":2,"complete":true,"next_offset":null
-            }})))
+            .respond_with(move |req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                let rows: Vec<_> = records
+                    .iter()
+                    .filter(|r| {
+                        r["guidance_scope"] == "global" || !body["project_scopes"].as_array().unwrap().is_empty()
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{
+                    "guidance_inventory":true,"degraded":false,"returned":rows.len(),"items":rows,
+                    "total_candidates":rows.len(),"complete":true,"next_offset":null
+                }}))
+            })
             .mount(&server)
             .await;
         for scope in ["global", "project"] {
-            let source = format!("knowledge/fixture/{scope}.md");
+            let source = source_path(scope);
             let revisions = std::sync::atomic::AtomicUsize::new(0);
             Mock::given(method("POST"))
                 .and(path("/v3/scenario/read"))
@@ -152,9 +169,11 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
             .unwrap(),
         )
         .unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
         let output = tokio::task::spawn_blocking(move || std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "agent_task::rules_dispatch_tests::all_production_routes_reload_complete_rules_and_block_without_host_binding", "--nocapture"])
-            .env(CHILD, "1").env("AIONUI_TDAI_MEMORY_CONFIG", config).output().unwrap()).await.unwrap();
+            .env_clear().env("PATH", std::env::var_os("PATH").unwrap()).env("HOME", &home).env("XDG_CONFIG_HOME", home.join("config")).env("XDG_DATA_HOME", home.join("data")).env(CHILD, "1").env("AIONUI_TDAI_MEMORY_CONFIG", config).output().unwrap()).await.unwrap();
         assert!(
             output.status.success(),
             "{}\n{}",
@@ -178,11 +197,12 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(response, "text/event-stream"))
-        .expect(2)
+        .expect(3)
         .mount(&provider)
         .await;
     let mut native_config = super::aionrs_config_option_tests::make_test_config();
-    native_config.tool_scope = aionui_api_types::ConversationToolScope::SessionOnly;
+    native_config.tool_scope = Default::default(); // Ordinary host engine, not session-only isolation.
+    std::fs::write(directory.path().join("AGENTS.md"), "NATIVE_REPOSITORY_SENTINEL").unwrap();
     // Even a regression must never send the fixture credential to a real API.
     native_config.base_url = Some(provider.uri());
     native_config.session_directory = directory.path().join("native-sessions");
@@ -215,6 +235,7 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
                 project_id: Some("fixture-project".into()),
                 project_name: Some("Fixture".into()),
                 workspace: instance.workspace().into(),
+                roots: vec![instance.workspace().into()],
                 guidance_only: true,
                 ..Default::default()
             },
@@ -269,6 +290,12 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
                     "complete current rules must reach the provider unchanged"
                 );
                 assert!(!request["system"].to_string().contains("FULL_RULE_"));
+                assert!(!request["system"].to_string().contains("NATIVE_REPOSITORY_SENTINEL"));
+                assert_eq!(
+                    request_text.matches("NATIVE_REPOSITORY_SENTINEL").count(),
+                    1,
+                    "Host-owned project rule reaches ordinary native input exactly once"
+                );
                 let saved = aion_agent::session::SessionManager::new(native_session_directory.clone(), 10)
                     .load(instance.conversation_id())
                     .unwrap();
@@ -286,6 +313,34 @@ async fn all_production_routes_reload_complete_rules_and_block_without_host_bind
             workspace: instance.workspace().into(),
         };
         assert!(child.instructions().await.unwrap().contains("project_FULL_RULE_"));
+        if matches!(instance, AgentInstance::Aionrs(_)) {
+            // The same repository cwd in an ordinary temporary chat must not leak
+            // native project files into system, user input, or delegated agents.
+            register_session(
+                instance.conversation_id(),
+                MemoryRecallScope {
+                    workspace: instance.workspace().into(),
+                    roots: vec![instance.workspace().into()],
+                    temporary_project: true,
+                    guidance_only: true,
+                    ..Default::default()
+                },
+            );
+            instance.send_message(message()).await.unwrap();
+            let requests = provider.received_requests().await.unwrap();
+            let body = String::from_utf8(requests.last().unwrap().body.clone()).unwrap();
+            assert!(body.contains("global_FULL_RULE_"));
+            assert!(
+                !body.contains("project_FULL_RULE_") && !body.contains("NATIVE_REPOSITORY_SENTINEL"),
+                "Temporary chat leaked project guidance"
+            );
+            let child_text = child.instructions().await.unwrap();
+            assert!(
+                child_text.contains("global_FULL_RULE_")
+                    && !child_text.contains("project_FULL_RULE_")
+                    && !child_text.contains("NATIVE_REPOSITORY_SENTINEL")
+            );
+        }
         // A bound chat must also fail closed when its knowledge configuration
         // becomes unreadable. This file belongs only to the fixture subprocess.
         let config = std::env::var_os("AIONUI_TDAI_MEMORY_CONFIG").unwrap();

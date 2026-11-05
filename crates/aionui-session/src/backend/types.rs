@@ -134,21 +134,7 @@ pub enum PermissionDecision {
     AllowAlways,
 }
 
-/// One answered claude `AskUserQuestion` question (§C1 / task #83). `question` is
-/// the exact question TEXT (claude's `answers` map is keyed by it — the input
-/// schema guarantees question texts are unique). `labels` are the chosen option
-/// labels: exactly one for a single-select question, one-or-more for a
-/// `multiSelect:true` question. Carried on `Command::AnswerPermission.answers`;
-/// the claude adapter emits `labels` as a JSON array, which claude's own zod
-/// preprocess joins with ", " (live-captured 2.1.178).
-/// `#[derive(Deserialize)]` so the conversation layer can parse the frontend's
-/// `[{question, labels}]` answer payload (threaded as JSON through `ConfirmRequest`
-/// → `ConvCommand::Confirm`) directly into this type at the session bridge.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub struct QuestionAnswer {
-    pub question: String,
-    pub labels: Vec<String>,
-}
+pub use aionui_common::QuestionAnswer;
 
 /// Read-only snapshot of ONE currently-open (unanswered) permission request, for
 /// REST recovery (`GET /confirmations`) of a reloaded `waiting_confirmation`

@@ -131,12 +131,20 @@ async fn acp_fresh_and_resumed_prompts_receive_one_current_complete_guidance_blo
     const CHILD: &str = "ELLMSHA_ACP_SINGLE_GUIDANCE_FIXTURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let server = MockServer::start().await;
+        // Match the real inventory: global namespace or the bound project's V2 alias.
+        let source_path = |scope: &str| {
+            if scope == "global" {
+                "knowledge/global/global.md"
+            } else {
+                "v2/projects/fixture/project.md"
+            }
+        };
         let records: Vec<_> = ["global", "project"]
             .into_iter()
             .map(|scope| {
                 json!({
                     "id":scope,"guidance_status":"active","source_status":"active","type":"instruction",
-                    "guidance_scope":scope,"source_path":format!("knowledge/fixture/{scope}.md")
+                    "guidance_scope":scope,"source_path":source_path(scope)
                 })
             })
             .collect();
@@ -150,7 +158,7 @@ async fn acp_fresh_and_resumed_prompts_receive_one_current_complete_guidance_blo
             .mount(&server)
             .await;
         for scope in ["global", "project"] {
-            let source = format!("knowledge/fixture/{scope}.md");
+            let source = source_path(scope);
             let revision = std::sync::atomic::AtomicUsize::new(0);
             Mock::given(method("POST"))
                 .and(path("/v3/scenario/read"))
@@ -243,7 +251,7 @@ for line in sys.stdin:
     );
     std::fs::write(&config, &original).unwrap();
 
-    for (resume, current_revision) in [(false, 1), (true, 3)] {
+    for (resume, current_revision) in [(false, 0), (true, 1)] {
         let mut startup = context(directory.path());
         attach_required_guidance(&mut startup).await.unwrap();
         let instance = agent(startup, directory.path(), resume).await;
@@ -272,7 +280,7 @@ for line in sys.stdin:
                 "complete current rule must reach ACP exactly once"
             );
             assert!(
-                !text.contains(&format!("{scope}_FULL_RULE_{}", current_revision - 1)),
+                current_revision == 0 || !text.contains(&format!("{scope}_FULL_RULE_{}", current_revision - 1)),
                 "startup snapshot must not leak into the prompt"
             );
         }

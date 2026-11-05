@@ -114,36 +114,18 @@ fn isolated_config(original: &str, source: &Path) -> Result<String, Box<dyn std:
 fn strip_legacy_memory_block(text: &str) -> String {
     const START: &str = "<!-- BEGIN PROJECT-MEMORY MANAGED BLOCK -->";
     const END: &str = "<!-- END PROJECT-MEMORY MANAGED BLOCK -->";
-    let Some(start) = text.find(START) else {
-        return text.to_owned();
-    };
-    let Some(relative_end) = text[start..].find(END) else {
-        return text.to_owned();
-    };
-    let end = start + relative_end + END.len();
-    let block = &text[start..end];
-    let mut result = text[..start].to_owned();
-    // These are user workflow preferences embedded in the old compiled snapshot,
-    // not memory storage rules. Retain their actual guidance, without old links.
-    for subject in [
-        "user-git-commit-workflow-preference",
-        "git-branch-naming-policy",
-        "git-feature-branch-upstream-policy",
-    ] {
-        let heading = format!("## Global context: wiki/{subject}.md");
-        if let Some(section) = block
-            .split_once(&heading)
-            .map(|(_, rest)| rest.split("## Global context:").next().unwrap_or(rest))
-            && let Some(body) = section
-                .split_once("## For future agents\n")
-                .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest))
-        {
-            result.push('\n');
-            result.push_str(body.trim());
-            result.push('\n');
-        }
+    // The agent already receives current managed rules from tdai_rules_read.
+    // Preserve everything outside complete generated blocks in the source profile.
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some((before, after_start)) = remaining.split_once(START) {
+        let Some((_, after_end)) = after_start.split_once(END) else {
+            break;
+        };
+        result.push_str(before);
+        remaining = after_end;
     }
-    result.push_str(&text[end..]);
+    result.push_str(remaining);
     result
 }
 
@@ -187,7 +169,12 @@ mod tests {
         let filtered = strip_legacy_memory_block(original);
         assert!(filtered.contains("custom before"));
         assert!(filtered.contains("custom after"));
-        assert!(filtered.contains("Use feature/ branches."));
+        assert!(!filtered.contains("Use feature/ branches."));
+        assert_eq!(filtered, "custom before\n\ncustom after");
+        assert_eq!(
+            strip_legacy_memory_block(&format!("{original}\n{original}")),
+            format!("{filtered}\n{filtered}")
+        );
         assert!(!filtered.contains("old memory"));
         assert!(!filtered.contains("old evidence"));
     }

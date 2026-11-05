@@ -445,6 +445,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         services.worker_task_manager.clone(),
         services.conversation_repo.clone(),
         services.project_service.clone(),
+        services.conversation_service.clone(),
     ))
     .merge(office_proxy)
     .merge(public_assets)

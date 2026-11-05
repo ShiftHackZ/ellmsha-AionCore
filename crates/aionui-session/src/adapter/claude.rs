@@ -344,7 +344,13 @@ impl ClaudeAdapter {
                 // carries the system prompt and tools — the next turn measured
                 // 23_779, ~20k higher. Different baselines.
                 self.last_call_tokens = None;
-                vec![SessionEvent::Heartbeat]
+                vec![
+                    SessionEvent::Heartbeat,
+                    SessionEvent::AdapterSpecific {
+                        tag: "context_compacted".into(),
+                        payload: Value::Null,
+                    },
+                ]
             }
             // network backoff + the no-chunk compaction window both = liveness.
             "api_retry" | "compacting" => vec![SessionEvent::Heartbeat],
@@ -2606,7 +2612,10 @@ mod tests {
         assert!(sys("init").is_empty(), "init carries no signal");
 
         // network backoff + compaction window → Heartbeat (liveness).
-        for subtype in ["api_retry", "compact_boundary", "compacting"] {
+        assert!(
+            matches!(sys("compact_boundary").as_slice(), [SessionEvent::Heartbeat, SessionEvent::AdapterSpecific {tag,..}] if tag=="context_compacted")
+        );
+        for subtype in ["api_retry", "compacting"] {
             assert!(
                 matches!(sys(subtype).as_slice(), [SessionEvent::Heartbeat]),
                 "`{subtype}` must normalize to a single Heartbeat"

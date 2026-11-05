@@ -824,6 +824,9 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     service.with_project_service(Arc::new(services.project_service.clone()));
+    services
+        .conversation_service
+        .with_team_question_replies(service.clone());
     TeamRouterState {
         service,
         active_leases: services.active_lease_registry.clone(),
@@ -1491,7 +1494,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1676,15 +1679,16 @@ mod tests {
 
     type CapturedRuntimeEnv = Arc<Mutex<Vec<Vec<(String, String)>>>>;
 
+    pub(in crate::router) fn noop_test_agent(opts: BuildTaskOptions) -> AgentInstance {
+        AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
+            conversation_id: opts.conversation_id().to_owned(),
+            workspace: opts.context.workspace.path,
+        }))
+    }
+
     fn mock_worker_task_manager() -> Arc<dyn IWorkerTaskManager> {
-        let factory = Arc::new(|opts: BuildTaskOptions| {
-            Box::pin(async move {
-                Ok(AgentInstance::Mock(Arc::new(ChannelStateNoopAgent {
-                    conversation_id: opts.conversation_id().to_owned(),
-                    workspace: opts.context.workspace.path,
-                })))
-            }) as futures_util::future::BoxFuture<'static, Result<AgentInstance, AgentError>>
-        });
+        let factory: aionui_ai_agent::task_manager::AgentFactory =
+            Arc::new(|opts| Box::pin(async move { Ok(noop_test_agent(opts)) }));
 
         Arc::new(WorkerTaskManagerImpl::new(factory))
     }

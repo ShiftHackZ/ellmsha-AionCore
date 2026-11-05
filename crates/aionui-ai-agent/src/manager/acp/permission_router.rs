@@ -282,6 +282,7 @@ mod tests {
 
     fn sample_confirmation(call_id: &str) -> Confirmation {
         Confirmation {
+            questions: Vec::new(),
             id: call_id.to_owned(),
             call_id: call_id.to_owned(),
             title: Some("Write file".to_owned()),

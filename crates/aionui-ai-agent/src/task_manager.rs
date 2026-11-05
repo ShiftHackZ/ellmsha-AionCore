@@ -33,6 +33,11 @@ pub trait IWorkerTaskManager: Send + Sync {
     /// Get an existing task by conversation ID.
     fn get_task(&self, conversation_id: &str) -> Option<AgentInstance>;
 
+    /// Authorize the private memory MCP against the same live slot as its agent.
+    fn memory_runtime(&self, _id: &str, _token: &str) -> Option<(crate::generation::MemoryCapability, AgentInstance)> {
+        None
+    }
+
     /// Get an existing task or build a new one if none exists.
     ///
     /// Concurrent callers with the same `conversation_id` block on a shared
@@ -81,6 +86,7 @@ pub trait IWorkerTaskManager: Send + Sync {
 #[derive(Clone)]
 struct ManagedAgentTask {
     agent: AgentInstance,
+    memory_capability: Option<crate::generation::MemoryCapability>,
     runtime_capabilities: RuntimeCapabilities,
     frozen_target: Option<aionui_api_types::RouterTarget>,
 }
@@ -188,6 +194,13 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         self.initialised_instance(conversation_id)
     }
 
+    fn memory_runtime(&self, id: &str, token: &str) -> Option<(crate::generation::MemoryCapability, AgentInstance)> {
+        let slot = self.tasks.get(id)?;
+        let task = slot.get()?;
+        let capability = task.memory_capability.as_ref().filter(|cap| cap.matches(token, id))?;
+        Some((capability.clone(), task.agent.clone()))
+    }
+
     async fn get_or_build_task(
         &self,
         conversation_id: &str,
@@ -236,6 +249,10 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                     &build_conversation_id,
                     options.memory_recall.clone(),
                 );
+                // Publish the private capability only on the successfully initialized slot.
+                // Removing this slot revokes it, even when its factory is still running.
+                options.memory_capability = Default::default();
+                let memory_capability = options.memory_capability.clone();
                 let agent = match factory(options).await {
                     Ok(agent) => agent,
                     Err(error) => {
@@ -245,6 +262,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 };
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
+                    memory_capability: memory_capability.get().cloned(),
                     runtime_capabilities,
                     frozen_target: build_target,
                 })
@@ -572,6 +590,7 @@ mod tests {
     fn managed_instance(agent: AgentInstance) -> ManagedAgentTask {
         ManagedAgentTask {
             agent,
+            memory_capability: None,
             runtime_capabilities: RuntimeCapabilities::default(),
             frozen_target: None,
         }
@@ -1114,6 +1133,57 @@ mod tests {
 
         assert_eq!(killed.load(Ordering::SeqCst), 1);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn frozen_generation_callback_survives_worker_teardown() {
+        let service = Arc::new(crate::generation::GenerationService::new("http://127.0.0.1".into()));
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = WorkerTaskManagerImpl::new(Arc::new({
+            let service = service.clone();
+            let captured = captured.clone();
+            let workspace = temp.path().to_owned();
+            move |opts| {
+                let env = service.mcp_env(&opts).unwrap();
+                *captured.lock().unwrap() = env[1].1.clone();
+                let workspace = workspace.clone();
+                async move {
+                    let mut config = crate::agent_task::aionrs_config_option_tests::make_test_config();
+                    config.session_directory = workspace.join("sessions");
+                    let agent = crate::manager::aionrs::AionrsAgentManager::new(
+                        opts.conversation_id().into(),
+                        workspace.to_string_lossy().into(),
+                        config,
+                        None,
+                    )
+                    .await?;
+                    Ok(AgentInstance::Aionrs(Arc::new(agent)))
+                }
+                .boxed()
+            }
+        }));
+        mgr.get_or_build_task("conv-job", make_options("conv-job"))
+            .await
+            .unwrap();
+        let token = captured.lock().unwrap().clone();
+        assert!(mgr.memory_runtime("other-chat", &token).is_none());
+        assert!(mgr.memory_runtime("conv-job", "invalid").is_none());
+        let job = service.issue_context(&token, "conv-job", &mgr).await.unwrap();
+        mgr.kill_and_wait("conv-job", None).await;
+        assert!(matches!(
+            service.issue_context(&token, "conv-job", &mgr).await,
+            Err(AgentError::Unauthorized(_))
+        ));
+        // The existing job still authenticates and enforces its frozen model after teardown.
+        // Rejecting a different model exercises callback validation without any provider request.
+        let request = serde_json::from_value(
+            serde_json::json!({"model":"different","messages":[{"role":"user","content":"fixture"}]}),
+        )
+        .unwrap();
+        assert!(
+            matches!(service.complete(&job.callback_token, request).await, Err(AgentError::BadRequest(reason)) if reason.contains("captured primary-agent model"))
+        );
     }
 
     #[tokio::test]

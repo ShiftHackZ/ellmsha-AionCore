@@ -209,6 +209,85 @@ async fn session_only_project_chat_keeps_required_guidance_but_not_optional_reca
         !options.memory_recall.isolated_test,
         "a registered project must not bypass required rules"
     );
+    let (editor_scope, local_only) = svc.chat_rules_scope("user_1", &chat.id, None).await.unwrap();
+    assert_eq!(editor_scope, options.memory_recall);
+    assert!(!local_only);
+}
+
+#[tokio::test]
+async fn classifier_reads_only_an_owned_registered_workspace_or_its_minted_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("repo");
+    let nested = workspace.join("unregistered");
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    let (svc, _, repo, _) = make_service_with_workspace_root(temp.path().to_owned());
+    let parent = svc.create("user_1", make_create_req()).await.unwrap();
+    let projects = make_injected_project_service(&temp.path().join("auto")).await;
+    let project = projects
+        .create_standard("user_1", aionui_project::canonical::to_file_uri(&workspace).unwrap())
+        .await
+        .unwrap();
+    svc.with_project_service(projects);
+    let workspace = workspace.to_str().unwrap();
+    let nested = nested.to_str().unwrap();
+    let registered = svc
+        .classifier_rules_scope("user_1", workspace, None, false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        registered.project_id.as_deref(),
+        Some(project.project.project_id.as_str())
+    );
+    assert!(!registered.temporary_project && !registered.roots.is_empty());
+    for (user, cwd, parent_id, auto) in [
+        ("user_1", nested, None, false),          // shared Git ancestry cannot create a project
+        ("another-user", workspace, None, false), // workspace belongs to somebody else
+        ("user_1", workspace, None, true),
+        ("user_1", workspace, Some(parent.id.as_str()), false), // a temporary parent stays temporary
+    ] {
+        let scope = svc
+            .classifier_rules_scope(user, cwd, parent_id, auto, false)
+            .await
+            .unwrap();
+        assert!(scope.temporary_project && scope.project_id.is_none() && scope.roots.is_empty());
+    }
+    let update = ConversationRowUpdate {
+        project_id: Some(project.project.project_id.clone()),
+        ..Default::default()
+    };
+    repo.update("user_1", &parent.id, &update).await.unwrap();
+    let child = svc
+        .classifier_rules_scope("user_1", nested, Some(&parent.id), false, false)
+        .await
+        .unwrap();
+    assert_eq!(child.project_id, registered.project_id);
+    assert_eq!(child.roots, registered.roots);
+    assert_eq!(child.rule_workspace, nested);
+    assert!(child.conversation_id.is_none());
+    assert!(matches!(
+        svc.classifier_rules_scope("another-user", workspace, Some(&parent.id), false, false)
+            .await,
+        Err(ConversationError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn rules_editor_recognizes_internal_temporary_projects_and_checks_ownership() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _, repo, _) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+    let mut request = make_create_req();
+    request.extra = json!({"backend": "codex"});
+    let chat = svc.create("user_1", request).await.unwrap();
+    let row = repo.get("user_1", &chat.id).await.unwrap().unwrap();
+    let (scope, _) = svc.chat_rules_scope("user_1", &chat.id, None).await.unwrap();
+    assert!(scope.project_id.is_some() && scope.temporary_project);
+    assert_eq!(scope, svc.build_task_options(&row).await.unwrap().memory_recall);
+    assert!(matches!(
+        svc.chat_rules_scope("another-user", &chat.id, None).await,
+        Err(ConversationError::NotFound { .. })
+    ));
 }
 
 #[tokio::test]

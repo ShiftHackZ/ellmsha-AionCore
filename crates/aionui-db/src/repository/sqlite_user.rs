@@ -288,6 +288,17 @@ impl IUserRepository for SqliteUserRepository {
         Ok(matches == 1)
     }
 
+    async fn owns_machine_memory(&self, user_id: &str) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM users machine JOIN users owner \
+             ON owner.id = COALESCE(machine.adopted_by, machine.id) \
+             WHERE machine.id = 'system_default_user' AND owner.id = ? AND owner.status = 'active')",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
             .bind(id)

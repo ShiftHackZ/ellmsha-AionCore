@@ -18,7 +18,10 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer};
+use aionui_api_types::{
+    ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ProjectSkillSummary,
+    ProjectWorkspaceSelection,
+};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
@@ -44,9 +47,81 @@ pub struct ProjectRouterState {
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
         .route("/api/projects/{project_id}", get(get_project))
+        .route("/api/projects/{project_id}/skills", get(project_skills))
+        .route(
+            "/api/projects/selected-workspace",
+            get(lookup_workspace).post(select_workspace),
+        )
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .with_state(state)
+}
+
+/// Resolve an existing selection (including a new chat opened from a project).
+async fn lookup_workspace(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    axum::extract::Query(selection): axum::extract::Query<ProjectWorkspaceSelection>,
+) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
+    let id = state
+        .project
+        .standard_project_at(&user.id, selection.workspace.as_ref())
+        .await?;
+    Ok(Json(ApiResponse::ok(id)))
+}
+
+/// An explicit folder selection uses the same standard-project binding as the
+/// first chat. A WebUI account can look up only its registered workspaces here.
+async fn select_workspace(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(selection): Json<ProjectWorkspaceSelection>,
+) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
+    let workspace = std::path::Path::new(&selection.workspace);
+    let registered = state.project.standard_project_at(&user.id, workspace).await?;
+    if registered.is_some() || user.id != CurrentUser::local_default().id {
+        return Ok(Json(ApiResponse::ok(registered)));
+    }
+    let project = state
+        .project
+        .create_standard(&user.id, canonical::to_file_uri(workspace)?)
+        .await?;
+    Ok(Json(ApiResponse::ok(Some(project.project.project_id))))
+}
+
+/// Lists only summaries; skill bodies are loaded from disk at invocation time.
+async fn project_skills(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<Vec<ProjectSkillSummary>>>, ApiError> {
+    let detail = state.project.get_project(&user.id, &id).await?;
+    if detail.kind != "standard" {
+        return Ok(Json(ApiResponse::ok(vec![])));
+    }
+    let roots = detail
+        .explorer
+        .entries
+        .iter()
+        .map(|e| canonical::uri_to_path(&e.folder.resource_uri))
+        .collect::<Result<Vec<_>, _>>()?;
+    let skills = tokio::task::spawn_blocking(move || aionui_common::project_skills::discover(&roots))
+        .await
+        .map_err(|_| ApiError::Internal("Project skill discovery failed".into()))?
+        .map_err(|_| {
+            ApiError::UnprocessableEntity("Project skills could not be read from the registered roots".into())
+        })?;
+    Ok(Json(ApiResponse::ok(
+        skills
+            .into_iter()
+            .filter(|s| s.user_invocable)
+            .map(|s| ProjectSkillSummary {
+                name: s.name,
+                description: s.description,
+                source: s.source,
+            })
+            .collect(),
+    )))
 }
 
 /// `GET /api/projects/{project_id}` — full project detail + all roots in one

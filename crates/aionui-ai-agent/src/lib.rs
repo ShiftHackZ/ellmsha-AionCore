@@ -47,7 +47,9 @@ pub use capability::skill_manager::{
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
     prepare_first_message_with_skills_index,
 };
-pub use capability::tencent_memory::read_project_memory_artifact;
+pub use capability::tencent_memory::{
+    invoke_rules_tool, mutate_chat_rule, read_chat_rules, read_project_memory_artifact,
+};
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{
@@ -73,4 +75,5 @@ pub use session_context::{
 };
 pub use task_manager::{IWorkerTaskManager, WorkerTaskManagerImpl};
 
+pub mod project_rules;
 pub mod routing;

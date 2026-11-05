@@ -434,6 +434,7 @@ impl HandshakeParams {
 /// dispatch-side discriminator (no new shared state). The conversation layer
 /// echoes the request_id back verbatim, so the prefix survives the round-trip.
 const ELICIT_PREFIX: &str = "elicit:";
+const QUESTION_PREFIX: &str = "question:";
 
 #[derive(Debug, Clone)]
 struct PendingToolApproval {
@@ -607,6 +608,12 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // explicitly enabling network access. The same table is installed at
     // process startup because settings updates reload process configuration.
     if !config.generation_only {
+        // Codex honors a zero project-doc budget for start, resume and fork.
+        // The host tool applies supported repository sources and strips its generated memory blocks.
+        if config.host_manages_project_instructions {
+            params["config"]["project_doc_max_bytes"] = json!(0);
+        }
+        params["config"]["features"]["default_mode_request_user_input"] = json!(true);
         params["config"]["default_permissions"] = json!(custom_profile.as_deref().unwrap_or(match sandbox {
             "read-only" => "ellmsha-read-network",
             "danger-full-access" => ":danger-full-access",
@@ -1148,7 +1155,7 @@ pub struct CodexSessionBackend {
     /// every post-wake reader via `reader_state`) shares the one registry.
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
-    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
+    rpc_replies: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
     /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
     /// client: `turn/start` gets a synchronous response
@@ -1358,7 +1365,7 @@ struct CodexReaderState {
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
-    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
+    rpc_replies: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1401,7 +1408,7 @@ fn start_codex_reader(
             state.pending_auth_id,
             state.pending_tool_approvals,
             state.mcp_approvals,
-            state.app_discovery,
+            state.rpc_replies,
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
@@ -1546,7 +1553,7 @@ impl CodexSessionBackend {
                 &config.mcp_approval_bindings,
             )))
         };
-        let app_discovery = Arc::new(Mutex::new(HashMap::new()));
+        let rpc_replies = Arc::new(Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
@@ -1581,7 +1588,7 @@ impl CodexSessionBackend {
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
             mcp_approvals: mcp_approvals.clone(),
-            app_discovery: app_discovery.clone(),
+            rpc_replies: rpc_replies.clone(),
             pending_sends: pending_sends.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
@@ -1647,7 +1654,7 @@ impl CodexSessionBackend {
             pending_auth_id,
             pending_tool_approvals,
             mcp_approvals,
-            app_discovery,
+            rpc_replies,
             current_model,
             pending_sends,
             pending_discovery,
@@ -1780,14 +1787,14 @@ impl CodexSessionBackend {
         for _ in 0..8 {
             let id = self.next_rpc_id();
             let (sender, receiver) = tokio::sync::oneshot::channel();
-            self.app_discovery.lock().await.insert(id, sender);
+            self.rpc_replies.lock().await.insert(id, sender);
             let write = self.write_frame(json!({"jsonrpc":"2.0","id":id,"method":"app/list","params":{"limit":100,"cursor":cursor,"forceRefetch":false}})).await;
             if let Err(error) = write {
-                self.app_discovery.lock().await.remove(&id);
+                self.rpc_replies.lock().await.remove(&id);
                 return Err(error);
             }
             let reply = tokio::time::timeout_at(deadline, receiver).await;
-            self.app_discovery.lock().await.remove(&id);
+            self.rpc_replies.lock().await.remove(&id);
             let reply = reply.ok().and_then(Result::ok).ok_or_else(|| BackendError::SetupRejected("Could not verify the provider Linear catalog. Retry or explicitly enable the provider Linear integration for this chat.".into()))?;
             let result = reply
                 .get("result")
@@ -2035,7 +2042,7 @@ async fn reader_task(
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     mcp_approvals: Arc<std::sync::Mutex<CodexMcpApprovals>>,
-    app_discovery: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
+    rpc_replies: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -2176,7 +2183,7 @@ async fn reader_task(
                         if let (Some(root), Some(thread_id)) = (root_thread.as_deref(), request_thread)
                             && thread_id != root
                         {
-                            if m == "mcpServer/elicitation/request" {
+                            if matches!(m, "mcpServer/elicitation/request" | "item/tool/requestUserInput") {
                                 // A spawned Codex child inherits the root thread's
                                 // MCP inventory and approval policy. Its view is
                                 // read-only, so route the approval to the writable
@@ -2324,6 +2331,35 @@ async fn reader_task(
                             tracing::info!(session_id = %session_id, method = m, "discarding item from completed Codex turn");
                             continue;
                         }
+                        if matches!(m, "item/started" | "item/completed")
+                            && let Some((request_id, input)) = async_user_questions(&params["item"])
+                        {
+                            // Async questions carry explicit provider metadata. The accompanying
+                            // fallback Markdown is for clients that cannot render a form.
+                            if m == "item/completed" {
+                                let mut registry = pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+                                if !registry.contains_key(&request_id) {
+                                    registry.insert(
+                                        request_id.clone(),
+                                        PendingToolApproval {
+                                            tool_name: "request_user_input_async".into(),
+                                            input: Some(input.clone()),
+                                            answered: false,
+                                        },
+                                    );
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        SessionEvent::AdapterSpecific {
+                                            tag: "codex_async_question".into(),
+                                            payload: json!({"id":request_id,"input":input}),
+                                        },
+                                    );
+                                }
+                            }
+                            continue;
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -2435,7 +2471,7 @@ async fn reader_task(
                             // by the surfaced request_id (raw for tool/file approvals,
                             // ELICIT_PREFIX-tagged for elicitation), matching the id shape
                             // stored on the requestApproval emit below.
-                            remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
+                            let resolved_id = remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
                             emit(
                                 &event_tx,
                                 &session_id,
@@ -2497,7 +2533,7 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
-                            if let Some(reply) = app_discovery.lock().await.remove(&rid) {
+                            if let Some(reply) = rpc_replies.lock().await.remove(&rid) {
                                 let _ = reply.send(frame.clone());
                                 continue;
                             }
@@ -3398,11 +3434,18 @@ fn rollback_to_turn(result: &Value) -> u64 {
 fn remove_pending_tool_approval(
     pending: &Arc<std::sync::Mutex<HashMap<String, PendingToolApproval>>>,
     request_id: &str,
-) {
+) -> String {
     let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
-    if map.remove(request_id).is_none() {
-        map.remove(&format!("{ELICIT_PREFIX}{request_id}"));
+    for key in [
+        request_id.to_owned(),
+        format!("{ELICIT_PREFIX}{request_id}"),
+        format!("{QUESTION_PREFIX}{request_id}"),
+    ] {
+        if map.remove(&key).is_some() {
+            return key;
+        }
     }
+    request_id.to_owned()
 }
 
 fn has_pending_tool_approval(
@@ -3410,7 +3453,9 @@ fn has_pending_tool_approval(
     request_id: &str,
 ) -> bool {
     let map = pending.lock().unwrap_or_else(|e| e.into_inner());
-    map.contains_key(request_id) || map.contains_key(&format!("{ELICIT_PREFIX}{request_id}"))
+    map.contains_key(request_id)
+        || map.contains_key(&format!("{ELICIT_PREFIX}{request_id}"))
+        || map.contains_key(&format!("{QUESTION_PREFIX}{request_id}"))
 }
 
 fn mark_pending_tool_approval_answered(
@@ -3427,6 +3472,55 @@ fn mark_pending_tool_approval_answered(
 /// The desktop card already renders `command` as its main detail; `description`
 /// carries the remaining cwd/reason/file/MCP context instead of leaving a blank
 /// or generic approval prompt.
+fn async_user_questions(item: &Value) -> Option<(String, Value)> {
+    if item["type"] != "agentMessage" || item["delivery"] != "async" {
+        return None;
+    }
+    let item_id = item["id"].as_str()?.trim();
+    let raw = item["questions"].as_array()?;
+    if item_id.is_empty() || item_id.len() > 1024 || raw.is_empty() || raw.len() > 12 {
+        return None;
+    }
+    let questions = raw
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let title = q["title"].as_str()?.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let options: Vec<String> = if q["options"].is_null() {
+                vec![]
+            } else {
+                serde_json::from_value(q["options"].clone()).ok()?
+            };
+            let choices = options
+                .into_iter()
+                .map(|label| aionui_common::QuestionOption {
+                    label,
+                    description: String::new(),
+                })
+                .collect();
+            Some(aionui_common::UserQuestion {
+                id: json!(["request_user_input_async", item_id, i]).to_string(),
+                header: String::new(),
+                question: title.to_owned(),
+                options: choices,
+                multi_select: false,
+                is_other: true,
+                is_secret: false,
+                optional: false,
+                allow_empty: false,
+                default_labels: vec![],
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if !aionui_common::UserQuestion::valid_form(&questions) {
+        return None;
+    }
+    Some((format!("async-question:{item_id}"), json!({"questions":questions})))
+}
+
 fn permission_context(input: Option<&Value>) -> Option<Value> {
     let mut input = input?.clone();
     let description = input
@@ -3579,8 +3673,35 @@ async fn handle_reverse_rpc(
             // advertises supported persistence scopes in `_meta.persist`; dropping
             // those fields makes an "Allow Always" click indistinguishable from a
             // one-time accept. The payload is shown only to the approver, never logged.
-            let input = permission_context(frame.get("params")).expect("elicitation context is an object");
-            let title = mcp_elicitation_title(&input);
+            let Some(mut input) = permission_context(frame.get("params").filter(|params| params.is_object())) else {
+                write_reverse_error(stdin, &id, -32602, "Invalid elicitation params").await;
+                return;
+            };
+            // This field is host-generated for recognized forms, never trusted from the wire.
+            input
+                .as_object_mut()
+                .expect("permission context object")
+                .remove("questions");
+            let mut title = mcp_elicitation_title(&input);
+            if input["mode"] == "url" {
+                write_reader_frame(stdin, &json!({"jsonrpc":"2.0","id":id,"result":{"action":"cancel"}})).await;
+                return;
+            }
+            match super::codex_elicitation::questions(&input) {
+                Ok(Some(_)) if is_mcp_tool_approval(Some(&input)) => {
+                    write_reverse_error(stdin, &id, -32602, "A tool approval cannot also request form fields").await;
+                    return;
+                }
+                Ok(Some(form)) => {
+                    title = "McpElicitationForm".into();
+                    input["questions"] = json!(form);
+                }
+                Ok(None) => {}
+                Err(reason) => {
+                    write_reverse_error(stdin, &id, -32602, reason).await;
+                    return;
+                }
+            }
             // Register for REST recovery, keyed by the ELICIT_PREFIX-tagged request_id
             // (the same id we surface + dispatch(AnswerPermission) answers), with
             // the same elicitation context used by the live permission card.
@@ -3605,22 +3726,36 @@ async fn handle_reverse_rpc(
                 },
             );
         }
-        // Any other reverse-RPC → unblock with a -32601 error (never let an unknown
-        // blocking request hang the turn) + opaque diagnostic. This matches the
-        // ACP-audit finding: an unhandled reverse method should be clean-rejected,
-        // not silently dropped (which deadlocks a blocking request).
-        //
-        // KNOWN deferred case: `item/tool/requestUserInput` (codex's native
-        // ask-the-user tool, the AskUserQuestion analog) currently falls here and is
-        // rejected, so the user never sees the question and the tool gets the empty
-        // fallback. Wiring it (surface Permission{questions} + answer
-        // {answers:{<id>:{answers}}} via ELICIT_PREFIX, claude AskUserQuestion is the
-        // template) is a reachable FOLLOW-UP — gap-reaudit confirmed the schema is fully
-        // defined. NOT wired yet because we could not capture a LIVE requestUserInput
-        // frame: it is mode-gated (`available_modes`, spec_plan.rs:729) and codex
-        // refused to invoke it in default OR plan mode in this env ("unavailable in the
-        // current mode"). Per the no-parser-for-an-unprobed-shape discipline, deferred
-        // until the trigger/mode is found and a real frame is captured.
+        // Codex app-server v2 keys each answer by the opaque question id.
+        "item/tool/requestUserInput" => {
+            let input = json!({"questions":frame["params"]["questions"]});
+            if aionui_common::UserQuestion::from_native(&input["questions"], false).is_none() {
+                write_reverse_error(stdin, &id, -32602, "invalid user input questions").await;
+                return;
+            }
+            let request_id = format!("{QUESTION_PREFIX}{id}");
+            pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                request_id.clone(),
+                PendingToolApproval {
+                    tool_name: "request_user_input".into(),
+                    input: Some(input.clone()),
+                    answered: false,
+                },
+            );
+            emit(
+                event_tx,
+                session_id,
+                cur,
+                SessionEvent::Permission {
+                    request_id,
+                    kind: crate::event::PermissionKind::Tool,
+                    metadata: None,
+                    tool_name: Some("request_user_input".into()),
+                    input: Some(input),
+                },
+            );
+        }
+        // An unhandled blocking request must receive a response.
         _ => {
             write_reverse_error(stdin, &id, -32601, "method not handled by aionui-session").await;
             emit(
@@ -3706,6 +3841,15 @@ async fn request_resumed_memory_catalog(
 /// data (→ AdapterSpecific), not a panic.
 fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
     match method {
+        // Both shapes are emitted by the Codex app-server protocol (CLI 0.162.1 ServerNotification schema).
+        "thread/compacted" => vec![SessionEvent::AdapterSpecific {
+            tag: "context_compacted".into(),
+            payload: Value::Null,
+        }],
+        "item/completed" if params["item"]["type"] == "contextCompaction" => vec![SessionEvent::AdapterSpecific {
+            tag: "context_compacted".into(),
+            payload: Value::Null,
+        }],
         "turn/started" => vec![], // optimistic; the orchestrator already lowered TurnStarted
         "item/agentMessage/delta" => {
             let item_id = params.get("itemId").and_then(Value::as_str).unwrap_or("").to_string();
@@ -5300,7 +5444,7 @@ impl SessionBackend for CodexSessionBackend {
                 request_id,
                 decision,
                 selected,
-                answers: _, // codex has no AskUserQuestion; per-question answers N/A
+                answers,
             } => {
                 let approved = matches!(
                     decision,
@@ -5321,46 +5465,101 @@ impl SessionBackend for CodexSessionBackend {
                 // wire id we surfaced as Permission.request_id (prefix stripped for
                 // elicitation). The reducer never read the request_id, so the prefix
                 // is purely a dispatch-side wire-shape selector.
-                let frame = if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX) {
-                    let id: Value = serde_json::from_str(raw_id).unwrap_or(Value::String(raw_id.to_string()));
-                    let pending = self
-                        .pending_tool_approvals
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&request_id)
-                        .cloned();
-                    let is_tool_approval = is_mcp_tool_approval(pending.as_ref().and_then(|p| p.input.as_ref()));
-                    // MCP tool approvals use the normal elicitation accept/decline
-                    // action plus optional `_meta.persist`. Codex owns that scoped
-                    // grant; eLLMsha forwards it only when the request advertised the
-                    // scope. Ordinary MCP forms retain their existing empty-object
-                    // content until a structured form editor is available.
-                    let mut result = json!({
-                        "action": if approved { "accept" } else { "decline" },
-                        "content": if approved && !is_tool_approval { json!({}) } else { Value::Null }
-                    });
-                    let host_saved = if approved {
-                        self.mcp_approvals
-                            .lock()
-                            .map_err(|_| BackendError::Transport("MCP approval lock unavailable".into()))?
-                            .approve(raw_id, selected.as_deref())
-                            .map_err(BackendError::Transport)?
-                    } else {
-                        false
-                    };
-                    if !host_saved
-                        && matches!(decision, super::types::PermissionDecision::AllowAlways)
-                        && let Some(scope) = mcp_tool_approval_persistence(
-                            pending.as_ref().and_then(|pending| pending.input.as_ref()),
-                            selected.as_deref(),
-                        )
-                    {
-                        result["_meta"] = json!({ "persist": scope });
+                let frame = if let Some(raw_id) = request_id.strip_prefix(QUESTION_PREFIX) {
+                    let id: Value = serde_json::from_str(raw_id)
+                        .map_err(|_| BackendError::Transport("invalid question request id".into()))?;
+                    let mut pending = self.pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+                    let entry = pending
+                        .get_mut(&request_id)
+                        .filter(|p| !p.answered)
+                        .ok_or_else(|| BackendError::Transport("question is no longer pending".into()))?;
+                    let mut result = serde_json::Map::new();
+                    if approved {
+                        let questions = entry
+                            .input
+                            .as_ref()
+                            .and_then(|v| aionui_common::UserQuestion::from_native(&v["questions"], false))
+                            .ok_or_else(|| BackendError::Transport("invalid pending questions".into()))?;
+                        super::types::QuestionAnswer::validate(&questions, &answers)
+                            .map_err(|e| BackendError::Transport(e.into()))?;
+                        for answer in &answers {
+                            result.insert(answer.question.clone(), json!({"answers":answer.labels}));
+                        }
                     }
-                    json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": result
-                    })
+                    // Reserve the answer before writing so a concurrent submit cannot reply twice.
+                    entry.answered = true;
+                    json!({"jsonrpc":"2.0","id":id,"result":{"answers":result}})
+                } else if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX) {
+                    let id: Value = serde_json::from_str(raw_id).unwrap_or(Value::String(raw_id.to_string()));
+                    let form_result = {
+                        let mut requests = self.pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+                        let entry = requests
+                            .get_mut(&request_id)
+                            .filter(|p| !p.answered)
+                            .ok_or_else(|| BackendError::Transport("Elicitation is no longer pending".into()))?;
+                        if let Some(input) = entry
+                            .input
+                            .as_ref()
+                            .filter(|input| entry.tool_name == "McpElicitationForm" && input.get("questions").is_some())
+                        {
+                            let value = if approved {
+                                if decision == super::types::PermissionDecision::AllowAlways {
+                                    return Err(BackendError::Transport("Forms do not allow persistent grants".into()));
+                                }
+                                let content = super::codex_elicitation::content(input, &answers)
+                                    .map_err(|e| BackendError::Transport(e.into()))?;
+                                json!({"action":"accept","content":content})
+                            } else {
+                                json!({"action":if selected.as_deref()==Some("cancel") {"cancel"} else {"decline"}})
+                            };
+                            entry.answered = true;
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(result) = form_result {
+                        json!({"jsonrpc":"2.0","id":id,"result":result})
+                    } else {
+                        let pending = self
+                            .pending_tool_approvals
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&request_id)
+                            .cloned();
+                        let is_tool_approval = is_mcp_tool_approval(pending.as_ref().and_then(|p| p.input.as_ref()));
+                        // MCP tool approvals use the normal elicitation accept/decline
+                        // action plus optional `_meta.persist`. Codex owns that scoped
+                        // grant; eLLMsha forwards it only when the request advertised the
+                        // scope. Ordinary MCP forms retain their existing empty-object
+                        // content until a structured form editor is available.
+                        let mut result = json!({
+                            "action": if approved { "accept" } else { "decline" },
+                            "content": if approved && !is_tool_approval && !pending.as_ref().is_some_and(|p| p.input.as_ref().is_some_and(|i| i["mode"]=="url")) { json!({}) } else { Value::Null }
+                        });
+                        let host_saved = if approved {
+                            self.mcp_approvals
+                                .lock()
+                                .map_err(|_| BackendError::Transport("MCP approval lock unavailable".into()))?
+                                .approve(raw_id, selected.as_deref())
+                                .map_err(BackendError::Transport)?
+                        } else {
+                            false
+                        };
+                        if !host_saved
+                            && matches!(decision, super::types::PermissionDecision::AllowAlways)
+                            && let Some(scope) = mcp_tool_approval_persistence(
+                                pending.as_ref().and_then(|pending| pending.input.as_ref()),
+                                selected.as_deref(),
+                            )
+                        {
+                            result["_meta"] = json!({ "persist": scope });
+                        }
+                        json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "result": result
+                        })
+                    }
                 } else {
                     let id: Value = serde_json::from_str(&request_id).unwrap_or(Value::String(request_id.clone()));
                     json!({
@@ -5368,7 +5567,18 @@ impl SessionBackend for CodexSessionBackend {
                         "result": { "decision": decision_str }
                     })
                 };
-                self.write_frame(frame).await?;
+                if let Err(error) = self.write_frame(frame).await {
+                    if (request_id.starts_with(QUESTION_PREFIX) || request_id.starts_with(ELICIT_PREFIX))
+                        && let Some(entry) = self
+                            .pending_tool_approvals
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_mut(&request_id)
+                    {
+                        entry.answered = false;
+                    }
+                    return Err(error);
+                }
                 // Hide an answered request from REST recovery immediately, but retain
                 // its correlation entry until `serverRequest/resolved`. Child MCP
                 // approvals resolve on the child's thread id; keeping the entry lets
@@ -5505,19 +5715,83 @@ impl SessionBackend for CodexSessionBackend {
         caps
     }
 
-    /// REST-recovery (`GET /confirmations`) source: the transient registry of
-    /// currently-open (unanswered) codex approval requests — command/file
-    /// approvals (`*/requestApproval`) and MCP elicitations. The reader inserts on
-    /// each such reverse-RPC, marks it hidden when `dispatch(AnswerPermission)`
-    /// answers, and removes it on `serverRequest/resolved`. Without
-    /// this override (the default empty `Vec`), a codex tool/file approval raised
-    /// before the client subscribed — or lost on a page reload — could never be
-    /// rebuilt, and the turn hung forever waiting for an answer. The recovered
-    /// card's id==call_id==request_id, matching the live `Permission` frame so a
-    /// duplicate live+recovered pair de-dups. codex approvals carry no question
-    /// payload (AskUserQuestion is claude-only), so `questions` is always `None`.
-    /// The transient input is retained so recovered dialogs show the same command
-    /// or elicitation context as the live event.
+    /// Steer a live turn exactly once. An unconfirmed reply stays reserved while
+    /// its RPC acknowledgement is pending, including after the caller times out.
+    async fn steer_async_question_reply(&self, question_id: &str, text: &str) -> Result<bool, BackendError> {
+        let Some(turn) = self.active_turn_id.lock().await.clone() else {
+            return Ok(false);
+        };
+        let thread = self.bound_thread().await?;
+        let id = self.next_rpc_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Reserve before writing. A lost/delayed ACK cannot safely be treated as
+        // permission to submit a second copy of an already accepted user answer.
+        {
+            let mut pending = self.pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = pending
+                .get_mut(question_id)
+                .filter(|p| !p.answered)
+                .ok_or_else(|| BackendError::Transport("Question is no longer pending".into()))?;
+            entry.answered = true;
+        }
+        self.rpc_replies.lock().await.insert(id, tx);
+        let write = self
+            .write_frame(json!({"jsonrpc":"2.0","id":id,"method":"turn/steer","params":{
+                "threadId":thread,"expectedTurnId":turn,"clientUserMessageId":question_id,
+                "input":[{"type":"text","text":text,"text_elements":[]}]
+            }}))
+            .await;
+        if let Err(e) = write {
+            self.rpc_replies.lock().await.remove(&id);
+            return Err(e);
+        }
+        let pending = self.pending_tool_approvals.clone();
+        let event_tx = self.event_tx.clone();
+        let session_id = self.session_id.clone();
+        let generation = self.turn_gen.load(Ordering::SeqCst);
+        let request = question_id.to_owned();
+        let worker = tokio::spawn(async move {
+            let response = rx
+                .await
+                .map_err(|_| BackendError::Transport("Question answer delivery could not be confirmed".into()))?;
+            let mut forms = pending.lock().unwrap_or_else(|e| e.into_inner());
+            if response.get("error").is_some() {
+                if let Some(entry) = forms.get_mut(&request) {
+                    entry.answered = false;
+                }
+                return Err(BackendError::Transport(
+                    "The active turn rejected the answer; retry from the question".into(),
+                ));
+            }
+            forms.remove(&request);
+            emit(
+                &event_tx,
+                &session_id,
+                generation,
+                SessionEvent::AdapterSpecific {
+                    tag: "codex_async_question_resolved".into(),
+                    payload: json!({"id":request}),
+                },
+            );
+            Ok(true)
+        });
+        // Dropping the join handle on timeout leaves the worker receiving the
+        // original ACK. It broadcasts resolution, or reopens only on confirmed rejection.
+        tokio::time::timeout(std::time::Duration::from_secs(15), worker)
+            .await
+            .map_err(|_| BackendError::Transport("Waiting for provider acknowledgement of this answer".into()))?
+            .map_err(|_| BackendError::Transport("Question answer interrupted".into()))?
+    }
+
+    fn finish_async_question(&self, id: &str) {
+        self.pending_tool_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+    }
+
+    /// The recovery endpoint reconstructs open approvals and forms from the same
+    /// provider request IDs and structured input sent to the live client.
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         self.pending_tool_approvals
             .lock()
@@ -5527,7 +5801,11 @@ impl SessionBackend for CodexSessionBackend {
             .map(|(request_id, pending)| PendingPermissionView {
                 request_id: request_id.clone(),
                 tool_name: pending.tool_name.clone(),
-                questions: None,
+                questions: (request_id.starts_with(QUESTION_PREFIX)
+                    || request_id.starts_with("async-question:")
+                    || (request_id.starts_with(ELICIT_PREFIX) && pending.tool_name == "McpElicitationForm"))
+                    .then(|| pending.input.as_ref()?.get("questions").cloned())
+                    .flatten(),
                 input: pending.input.clone(),
             })
             .collect()
@@ -6366,12 +6644,124 @@ mod tests {
             "request_id is tagged with the elicit prefix (so dispatch writes {{action,content}}), got {}",
             perm.0
         );
-        assert_eq!(perm.1.as_deref(), Some("Elicitation"));
+        assert_eq!(perm.1.as_deref(), Some("McpElicitationForm"));
+        assert_eq!(perm.2.as_ref().unwrap()["questions"][0]["id"], "color");
         let input = perm.2.expect("elicitation carries its context as input");
         assert_eq!(input["message"], "Pick a color");
         assert_eq!(input["description"], "Pick a color");
         assert_eq!(input["mode"], "form");
         assert!(input["requestedSchema"]["properties"].get("color").is_some());
+    }
+
+    #[test]
+    fn compaction_notifications_invalidate_previous_host_tool_results() {
+        for (method, params) in [
+            ("thread/compacted", json!({"threadId":"root"})),
+            (
+                "item/completed",
+                json!({"item":{"id":"compact","type":"contextCompaction"}}),
+            ),
+        ] {
+            assert!(
+                matches!(map_notification(method,&params).as_slice(),[SessionEvent::AdapterSpecific{tag,..}] if tag=="context_compacted")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_elicitation_and_url_requests_do_not_block_the_next_form() {
+        let frames = [
+            json!({"id":15,"method":"mcpServer/elicitation/request","params":null}),
+            json!({"id":16,"method":"mcpServer/elicitation/request","params":{"serverName":"s","_meta":{"codex_approval_kind":"mcp_tool_call"},"requestedSchema":{"type":"object","properties":{"x":{"type":"string"}}}}}),
+            json!({"id":17,"method":"mcpServer/elicitation/request","params":[]}),
+            json!({"id":18,"method":"mcpServer/elicitation/request","params":{"mode":"url","serverName":"s","url":"https://example.invalid/auth"}}),
+            json!({"id":19,"method":"mcpServer/elicitation/request","params":{"serverName":"s","message":"Pick","requestedSchema":{"type":"object","properties":{"part":{"type":"string"}}}}}),
+        ];
+        let lines = frames.iter().map(|f| format!("{f}\n")).collect::<String>();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(lines.into_bytes());
+        let release = fake.stdout_releaser();
+        let stdin = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-recovery", Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(e) = events.next().await {
+                if let SessionEvent::Permission { request_id, .. } = e.event {
+                    assert_eq!(request_id, "elicit:19");
+                    return;
+                }
+            }
+            panic!("Next form was lost")
+        })
+        .await
+        .unwrap();
+        let written = captured_str(&stdin).await;
+        let replies = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect::<Vec<_>>();
+        for id in [15, 16, 17] {
+            assert!(replies.iter().any(|r| r["id"] == id && r["error"]["code"] == -32602));
+        }
+        assert!(
+            replies
+                .iter()
+                .any(|r| r["id"] == 18 && r["result"]["action"] == "cancel")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_elicitation_returns_field_values_and_consumes_the_form_once() {
+        let frame = json!({"jsonrpc":"2.0","id":19,"method":"mcpServer/elicitation/request","params":{"serverName":"example","message":"Select settings","requestedSchema":{"type":"object","required":["threads"],"properties":{"threads":{"type":"integer","minimum":1}}},"questions":[{"id":"untrusted"}]}});
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{frame}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let written = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-typed", Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        let call = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Permission {
+                    request_id,
+                    tool_name,
+                    input,
+                    ..
+                } = env.event
+                {
+                    assert_eq!(tool_name.as_deref(), Some("McpElicitationForm"));
+                    assert_eq!(input.unwrap()["questions"][0]["id"], "threads");
+                    return request_id;
+                }
+            }
+            panic!("Missing typed form")
+        })
+        .await
+        .unwrap();
+        assert!(
+            backend
+                .pending_permission_requests()
+                .iter()
+                .any(|p| p.request_id == call && p.questions.is_some())
+        );
+        let answer = |v: &str| Command::AnswerPermission {
+            request_id: call.clone(),
+            decision: super::super::types::PermissionDecision::Approved,
+            selected: None,
+            answers: vec![aionui_common::QuestionAnswer {
+                question: "threads".into(),
+                labels: vec![v.into()],
+            }],
+        };
+        assert!(backend.dispatch(answer("0")).await.is_err());
+        backend.dispatch(answer("2")).await.unwrap();
+        assert!(backend.dispatch(answer("3")).await.is_err());
+        assert!(
+            captured_str(&written)
+                .await
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|v| v["id"] == 19 && v["result"] == json!({"action":"accept","content":{"threads":2}}))
+        );
     }
 
     #[tokio::test]
@@ -6509,7 +6899,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                SessionEvent::PermissionResolved { request_id, .. } if request_id == "32"
+                SessionEvent::PermissionResolved { request_id, .. } if request_id == &format!("{ELICIT_PREFIX}32")
             )),
             "child cancellation clears the parent confirmation: {events:?}"
         );
@@ -7396,9 +7786,23 @@ mod tests {
         // An elicit-prefixed request_id → dispatch writes the MCP elicitation body
         // `{action, content}` (NOT `{decision}`), keyed by the stripped wire id.
         // A plain (un-prefixed) request_id still writes `{decision}`.
-        let fake = fake_with_binding("th-1", None);
+        let frame = json!({"jsonrpc":"2.0","id":5,"method":"mcpServer/elicitation/request","params":{"serverName":"fixture","mode":"form","message":"Confirm","requestedSchema":{"type":"object","properties":{}}}});
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{frame}\n").into_bytes());
+        let release = fake.stdout_releaser();
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut stream = backend.events();
+        release();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(e) = stream.next().await {
+                if matches!(e.event, SessionEvent::Permission { .. }) {
+                    return;
+                }
+            }
+            panic!("Missing elicitation")
+        })
+        .await
+        .unwrap();
         backend
             .dispatch(Command::AnswerPermission {
                 request_id: format!("{ELICIT_PREFIX}5"),
@@ -7429,9 +7833,23 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_answer_permission_elicit_rejects_without_form_content() {
-        let fake = fake_with_binding("th-1", None);
+        let frame = json!({"jsonrpc":"2.0","id":6,"method":"mcpServer/elicitation/request","params":{"serverName":"fixture","mode":"form","message":"Confirm","requestedSchema":{"type":"object","properties":{}}}});
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{frame}\n").into_bytes());
+        let release = fake.stdout_releaser();
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut stream = backend.events();
+        release();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(e) = stream.next().await {
+                if matches!(e.event, SessionEvent::Permission { .. }) {
+                    return;
+                }
+            }
+            panic!("Missing elicitation")
+        })
+        .await
+        .unwrap();
         backend
             .dispatch(Command::AnswerPermission {
                 request_id: format!("{ELICIT_PREFIX}6"),
@@ -8869,6 +9287,28 @@ mod tests {
             "experimentalApi must NOT be top-level (codex ignores it there)"
         );
         assert_eq!(frame["params"]["clientInfo"]["name"], "aionui-session");
+    }
+
+    #[test]
+    fn host_owned_project_instructions_disable_only_codex_project_docs_on_start_resume_and_fork() {
+        for host_manages_project_instructions in [false, true] {
+            let config = SessionConfig {
+                host_manages_project_instructions,
+                ..Default::default()
+            };
+            for params in [
+                thread_start_params(&config).0,
+                thread_resume_params(&config, "resume").0,
+                thread_fork_params(&config, "parent", None).0,
+            ] {
+                assert_eq!(
+                    params["config"].get("project_doc_max_bytes"),
+                    host_manages_project_instructions.then_some(&json!(0))
+                );
+                assert_eq!(params["config"]["features"]["default_mode_request_user_input"], true);
+                assert!(params["config"].get("skills").is_none());
+            }
+        }
     }
 
     /// thread/start params thread cwd from config; approvalPolicy/sandbox are valid

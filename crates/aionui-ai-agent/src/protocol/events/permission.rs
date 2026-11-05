@@ -30,6 +30,8 @@ pub struct AcpPermissionRequestData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpPermissionToolCall {
     pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<aionui_common::UserQuestion>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<AcpToolCallStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +80,7 @@ impl AcpPermissionEventData {
 impl AcpPermissionRequestData {
     pub fn to_confirmation(&self) -> Confirmation {
         Confirmation {
+            questions: self.tool_call.questions.clone(),
             id: self.tool_call.tool_call_id.clone(),
             call_id: self.tool_call.tool_call_id.clone(),
             title: self.tool_call.title.clone(),

@@ -436,6 +436,9 @@ impl AcpAgentManager {
         // the signal is correlated strictly to the turn/near-window — signals
         // seen earlier in the session lifetime are never attributed here.
         let observations = drain_turn_observations(&mut probe_rx);
+        if observations.dialect_signal {
+            crate::capability::tencent_memory::forget_delivered_rules(&self.params.conversation_id);
+        }
         let empty_turn = observations.empty;
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
             return Ok(PromptOutcome::TerminalError {

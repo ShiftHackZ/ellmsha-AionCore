@@ -46,6 +46,7 @@ use common::MockTeamRepo;
 // ---------------------------------------------------------------------------
 
 struct MockConversationRepo {
+    host_questions: Mutex<HashMap<(String, String), usize>>,
     conversations: std::sync::Mutex<Vec<ConversationRow>>,
     messages: std::sync::Mutex<Vec<MessageRow>>,
 }
@@ -53,6 +54,7 @@ struct MockConversationRepo {
 impl MockConversationRepo {
     fn new() -> Self {
         Self {
+            host_questions: Mutex::new(HashMap::new()),
             conversations: std::sync::Mutex::new(Vec::new()),
             messages: std::sync::Mutex::new(Vec::new()),
         }
@@ -372,6 +374,16 @@ impl FakeConversationPorts {
 
 #[async_trait::async_trait]
 impl TeamConversationProvisioningPort for FakeConversationPorts {
+    fn pending_host_question_count(&self, user_id: &str, conversation_id: &str) -> usize {
+        self.repo
+            .host_questions
+            .lock()
+            .unwrap()
+            .get(&(user_id.into(), conversation_id.into()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
@@ -1333,6 +1345,7 @@ fn confirmations_factory(count: usize) -> AgentFactory {
     Arc::new(move |opts: BuildTaskOptions| {
         let confirmations = (0..count)
             .map(|idx| Confirmation {
+                questions: Vec::new(),
                 id: format!("tool-{idx}"),
                 call_id: format!("tool-{idx}"),
                 title: None,
@@ -3662,7 +3675,10 @@ async fn tl3_list_teams_filters_by_owner() {
 
 #[tokio::test]
 async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_tasks() {
-    let (svc, task_manager) = setup_with_factory(confirmations_factory(2));
+    let (svc, task_manager, conversations) = setup_with_factory_and_metadata_and_conversation_repo(
+        confirmations_factory(2),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
     let created = svc
         .create_team(
             "user1",
@@ -3690,6 +3706,11 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
         )
         .await
         .unwrap();
+    conversations
+        .host_questions
+        .lock()
+        .unwrap()
+        .insert(("user1".into(), conversation_id.clone()), 1);
     let before = task_manager.snapshot();
 
     let list = svc.list_teams("user1").await.unwrap();
@@ -3697,7 +3718,7 @@ async fn tl_list_teams_includes_pending_confirmation_counts_without_rebuilding_t
 
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, created.id);
-    assert_eq!(list[0].assistants[0].pending_confirmations, 2);
+    assert_eq!(list[0].assistants[0].pending_confirmations, 3);
     assert_eq!(after.build, before.build);
 }
 
@@ -5911,6 +5932,61 @@ async fn sa_send_message_to_agent_with_active_session() {
     svc.send_message_to_agent("user1", &created.id, &worker_slot, "Do this", None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn completed_question_replies_wake_only_the_owned_team_conversation() {
+    use aionui_common::TeamQuestionReplies;
+
+    let (svc, _, turns, _) = setup_with_recording_turn_port();
+    let team = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Question".into(),
+                agents: aionrs_two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let worker = &team.assistants[1];
+    let reply = "<send_user_message_question_reply>choose option B</send_user_message_question_reply>";
+    assert!(
+        svc.enqueue_question_reply("someone-else", &team.id, &worker.conversation_id, reply)
+            .await
+            .is_err()
+    );
+    assert!(
+        svc.enqueue_question_reply("user1", &team.id, "removed-member", reply)
+            .await
+            .is_err()
+    );
+    svc.enqueue_question_reply("user1", &team.id, &worker.conversation_id, reply)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let replies = turns
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.content.contains(reply))
+                .map(|r| (r.slot_id.clone(), r.conversation_id.clone(), r.team_run_id.is_some()))
+                .collect::<Vec<_>>();
+            if !replies.is_empty() {
+                assert_eq!(
+                    replies,
+                    vec![(worker.slot_id.clone(), worker.conversation_id.clone(), true)]
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("user answer should start a Team run for the asking worker");
 }
 
 #[tokio::test]

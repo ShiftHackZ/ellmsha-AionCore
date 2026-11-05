@@ -346,6 +346,12 @@ impl ConversationTurnOrchestrator {
                 .with_task_context(&input.user_id, &input.conv_id, current_send.content)
                 .await;
             let prepared_send = agent.prepare_message(current_send).await;
+            if !runtime_state.is_cancelling(&input.conv_id)
+                && let Ok(prepared) = &prepared_send
+                && let Some(receipt) = prepared.rules_read_receipt()
+            {
+                relay.record_rules_read(receipt).await;
+            }
             if runtime_state.is_cancelling(&input.conv_id)
                 || runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id)
             {

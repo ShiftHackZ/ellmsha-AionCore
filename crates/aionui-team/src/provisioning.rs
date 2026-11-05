@@ -88,6 +88,10 @@ pub struct TeamConversationCreateResult {
 
 #[async_trait]
 pub trait TeamConversationProvisioningPort: Send + Sync {
+    fn pending_host_question_count(&self, _user_id: &str, _conversation_id: &str) -> usize {
+        0
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,

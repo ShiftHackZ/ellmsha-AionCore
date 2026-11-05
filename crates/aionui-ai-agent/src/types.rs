@@ -32,6 +32,7 @@ pub struct BuildTaskOptions {
     pub context: AgentSessionContext,
     pub runtime_capabilities: RuntimeCapabilities,
     pub memory_recall: MemoryRecallScope,
+    pub(crate) memory_capability: std::sync::Arc<std::sync::OnceLock<crate::generation::MemoryCapability>>,
 }
 
 impl BuildTaskOptions {
@@ -41,6 +42,7 @@ impl BuildTaskOptions {
             context,
             runtime_capabilities: RuntimeCapabilities::default(),
             memory_recall: MemoryRecallScope::default(),
+            memory_capability: Default::default(),
         }
     }
 
@@ -97,6 +99,8 @@ impl BuildTaskOptions {
 /// provider adapters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryRecallScope {
+    /// Actual host-resolved session directory, which may be a module below the project workspace.
+    pub rule_workspace: String,
     /// Host-owned conversation identity for attributing auxiliary model usage.
     pub conversation_id: Option<String>,
     /// Explicit synthetic integration-test scope; no real durable knowledge is read or written.
@@ -104,6 +108,8 @@ pub struct MemoryRecallScope {
     /// An explicitly isolated project chat still receives mandatory rules, but no optional recall.
     pub guidance_only: bool,
     pub project_id: Option<String>,
+    /// Ordinary chats may have internal temporary project rows for workspace ownership.
+    pub temporary_project: bool,
     pub project_name: Option<String>,
     pub workspace: String,
     pub roots: Vec<String>,

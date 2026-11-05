@@ -271,6 +271,7 @@ impl AionrsAgentManager {
             config.tools.auto_approve = false;
         }
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink)
+            .project_instructions_from_host()
             .child_preflight(Arc::new(crate::capability::tencent_memory::NativeChildRules {
                 conversation_id: conversation_id.clone(),
                 workspace: workspace.clone(),

@@ -127,6 +127,31 @@ pub struct TeamSessionService {
     self_ref: Weak<TeamSessionService>,
 }
 
+#[async_trait::async_trait]
+impl aionui_common::TeamQuestionReplies for TeamSessionService {
+    async fn enqueue_question_reply(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let team = self
+            .load_owned_team(user_id, team_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let member = team
+            .agents
+            .iter()
+            .find(|agent| agent.conversation_id == conversation_id)
+            .ok_or_else(|| TeamError::AgentNotFound(conversation_id.to_owned()).to_string())?;
+        self.send_message_to_agent(user_id, team_id, &member.slot_id, content, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl TeamSessionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(

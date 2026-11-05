@@ -120,7 +120,11 @@ impl CodexMcpApprovals {
         if method != "mcpServer/elicitation/request" {
             return false;
         }
-        if let Some(meta) = frame["params"]["_meta"].as_object_mut() {
+        if let Some(meta) = frame
+            .get_mut("params")
+            .and_then(|p| p.get_mut("_meta"))
+            .and_then(Value::as_object_mut)
+        {
             meta.remove("ellmsha_exact_tool");
         }
         let Some(id) = frame.get("id").filter(|id| !id.is_null()).map(Value::to_string) else {
@@ -128,7 +132,11 @@ impl CodexMcpApprovals {
         };
         self.answered(&id);
         let params = &frame["params"];
-        if params["_meta"]["codex_approval_kind"] != "mcp_tool_call" || self.store.is_none() {
+        if params["_meta"]["codex_approval_kind"] != "mcp_tool_call"
+            || self.store.is_none()
+            || params["mode"] == "url"
+            || !matches!(super::codex_elicitation::questions(params), Ok(None))
+        {
             return false;
         }
         let Some(server) = params["serverName"].as_str() else {

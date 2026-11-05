@@ -1174,6 +1174,10 @@ impl AcpAgentManager {
         self.params.metadata.backend.as_deref()
     }
 
+    pub(crate) fn native_skill_dirs(&self) -> &[String] {
+        self.params.metadata.native_skills_dirs.as_deref().unwrap_or(&[])
+    }
+
     /// Agent metadata id this session was spawned from.
     pub fn agent_id(&self) -> &str {
         &self.params.metadata.id

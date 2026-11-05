@@ -148,6 +148,11 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// serializer. stdio → `{command,args,env:{k:v}}`; http/sse → `{type,url,headers:{…}}`.
 pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     let mut args = Vec::new();
+    if config.host_manages_project_instructions {
+        // Claude still loads managed policy, skills and permission settings. The host supplies
+        // workspace guidance; the wildcard also covers symlink targets with unrelated names.
+        args.extend(["--settings", r#"{"claudeMdExcludes":["**"],"autoMemoryEnabled":false}"#].map(str::to_owned));
+    }
     if config.generation_only {
         args.extend(
             [
@@ -255,19 +260,6 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig) -> Vec<String> {
     // rejection (the dispatch reconciles on the reply), keeping this builder a pure,
     // syscall-free fn.
     args.push("--allow-dangerously-skip-permissions".to_string());
-
-    // TEMPORARY: disable AskUserQuestion until the multi-question interactive card is
-    // ported to the current frontend. claude's AskUserQuestion can ask several
-    // questions at once (`{questions:[…]}`), but the active frontend only renders a
-    // single-question permission card, so a multi-question ask would silently drop all
-    // but the first. Rather than ship that half-answer behaviour, deny the tool at
-    // spawn time — claude then falls back to plain-text questions, which render fully.
-    // Mirrors the official @agentclientprotocol/claude-agent-acp adapter, which
-    // likewise lists `AskUserQuestion` in `disallowedTools` for the same reason
-    // ("not a great way to expose this over ACP at the moment"). Remove once the
-    // frontend gains a multi-question renderer.
-    args.push("--disallowed-tools".to_string());
-    args.push("AskUserQuestion".to_string());
 
     if let Some(model) = config.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--model".to_string());
@@ -3134,6 +3126,23 @@ mod tests {
     /// bypass; it does NOT change the initial mode (default still enforces — LIVE-PROBED
     /// 2.1.185), so the fail-closed default is preserved while runtime bypass is reachable.
     #[test]
+    fn host_managed_claude_excludes_native_rules_without_disabling_skills_or_permissions() {
+        let original = build_claude_init_args(&SessionConfig::default());
+        assert!(!original.iter().any(|arg| arg == "--settings"));
+        let args = build_claude_init_args(&SessionConfig {
+            host_manages_project_instructions: true,
+            ..Default::default()
+        });
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({"claudeMdExcludes":["**"],"autoMemoryEnabled":false})
+        );
+        assert_eq!(args[2..], original);
+    }
+
+    #[test]
     fn build_claude_init_args_empty_config_defaults_permission_mode() {
         let config = SessionConfig::default();
         assert_eq!(
@@ -3142,12 +3151,9 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "an unconfigured claude session is gated as `default` (never silently bypassed), \
-             with runtime-bypass UNLOCKED but not activated, and AskUserQuestion denied \
-             (temporary — no multi-question frontend renderer yet)"
+             with runtime-bypass unlocked but not activated"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
     }
@@ -3258,12 +3264,9 @@ mod tests {
                 "--permission-mode".to_string(),
                 "default".to_string(),
                 "--allow-dangerously-skip-permissions".to_string(),
-                "--disallowed-tools".to_string(),
-                "AskUserQuestion".to_string(),
             ],
             "a blank mode is gated as `default` (never silently bypassed); the unlock flag \
-             is always present so a later in-band switch to bypass is accepted; \
-             AskUserQuestion is denied (temporary)"
+             is always present so a later in-band switch to bypass is accepted"
         );
     }
 

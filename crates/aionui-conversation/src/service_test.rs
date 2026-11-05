@@ -4304,6 +4304,107 @@ async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
 }
 
 #[tokio::test]
+async fn confirm_completed_codex_question_routes_via_owned_team_instead_of_standalone_send() {
+    use aionui_ai_agent::session_agent::SessionAgentTask;
+    use aionui_api_types::ConfirmRequest;
+    use aionui_session::{CodexSessionBackend, SessionBackend, SessionEvent, testing::FakeAgentIo};
+    use futures_util::StreamExt;
+
+    #[derive(Default)]
+    struct TeamReplies(Mutex<Vec<(String, String, String, String)>>);
+    #[async_trait::async_trait]
+    impl aionui_common::TeamQuestionReplies for TeamReplies {
+        async fn enqueue_question_reply(
+            &self,
+            user: &str,
+            team: &str,
+            chat: &str,
+            content: &str,
+        ) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((user.into(), team.into(), chat.into(), content.into()));
+            Ok(())
+        }
+    }
+
+    let manager = Arc::new(MockTaskManager::new());
+    let (svc, _, _) = make_service_with_mock_task_manager(manager.clone());
+    let mut create = make_create_req();
+    create.extra = json!({"teamId":"team-1","slot_id":"worker"});
+    let row = svc.create("user_1", create).await.unwrap();
+    let replies = Arc::new(TeamReplies::default());
+    svc.with_team_question_replies(replies.clone());
+    let item = json!({"type":"agentMessage","id":"ask","text":"Choose?","phase":"final_answer","delivery":"async",
+        "questions":[{"title":"Choose?","options":["A","B"]}]});
+    let frames = [
+        json!({"method":"thread/started","params":{"thread":{"id":"root"}}}),
+        json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"turn"}}}),
+        json!({"method":"item/completed","params":{"threadId":"root","turnId":"turn","item":item}}),
+        json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"turn","status":"completed"}}}),
+    ]
+    .map(|v| v.to_string() + "\n")
+    .concat();
+    let fake = FakeAgentIo::never_exits(vec![]).with_gated_tail(frames.into_bytes());
+    let release = fake.stdout_releaser();
+    let backend = Arc::new(CodexSessionBackend::build_with_io("team-question", Box::new(fake)).await);
+    let mut events = backend.events();
+    let session = SessionAgentTask::new(
+        AgentType::Acp,
+        row.id.clone(),
+        "user_1".into(),
+        "/tmp".into(),
+        backend,
+        None,
+    );
+    manager.insert_agent(&row.id, AgentInstance::Session(session));
+    release();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = events.next().await {
+            if matches!(event.event, SessionEvent::TurnResult { .. }) {
+                return;
+            }
+        }
+        panic!("missing completed turn");
+    })
+    .await
+    .unwrap();
+    let workers: Arc<dyn IWorkerTaskManager> = manager;
+    let form = svc
+        .list_confirmations("user_1", &row.id, &workers)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let answer = || ConfirmRequest {
+        msg_id: form.id.clone(),
+        data: json!({"answers":[{"question":form.questions[0].id,"labels":["B"]}]}),
+        always_allow: false,
+    };
+    assert!(
+        svc.confirm("another-user", &row.id, &form.call_id, answer(), &workers)
+            .await
+            .is_err()
+    );
+    svc.confirm("user_1", &row.id, &form.call_id, answer(), &workers)
+        .await
+        .unwrap();
+    assert!(
+        svc.confirm("user_1", &row.id, &form.call_id, answer(), &workers)
+            .await
+            .is_err()
+    );
+    let sent = replies.0.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (&sent[0].0[..], &sent[0].1[..], &sent[0].2[..]),
+        ("user_1", "team-1", row.id.as_str())
+    );
+    assert!(sent[0].3.contains(r#""answer":"B""#) && sent[0].3.contains("<send_user_message_question_reply>"));
+}
+
+#[tokio::test]
 async fn ensure_runtime_rejects_team_owned_conversation() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
@@ -6881,6 +6982,7 @@ async fn warmup_keeps_generic_error_for_non_openclaw_gateway_signature() {
 fn make_test_confirmations() -> Vec<Confirmation> {
     vec![
         Confirmation {
+            questions: Vec::new(),
             id: "c1".into(),
             call_id: "call-1".into(),
             title: Some("Allow file edit".into()),
@@ -6890,6 +6992,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             options: vec![],
         },
         Confirmation {
+            questions: Vec::new(),
             id: "c2".into(),
             call_id: "call-2".into(),
             title: Some("Read file".into()),

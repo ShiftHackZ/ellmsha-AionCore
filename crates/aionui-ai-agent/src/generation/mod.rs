@@ -5,8 +5,8 @@ mod service;
 mod stateless;
 mod types;
 
-pub use service::GenerationService;
 pub(crate) use service::GenerationTarget;
+pub use service::{GenerationService, MemoryCapability};
 pub(crate) use stateless::complete_stateless;
 pub use types::*;
 

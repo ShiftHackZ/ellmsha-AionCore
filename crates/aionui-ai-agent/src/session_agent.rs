@@ -334,6 +334,7 @@ fn session_content_blocks_to_json(content: &[ContentBlock]) -> Vec<serde_json::V
 pub struct SessionAgentTask {
     /// Frozen V2 route. Unlike picker state, this never consults a prior catalog preload.
     routed_model: std::sync::OnceLock<String>,
+    async_question_reply: tokio::sync::Mutex<()>,
     generation: std::sync::Mutex<Option<crate::generation::GenerationTarget>>,
     agent_type: AgentType,
     conversation_id: String,
@@ -395,6 +396,21 @@ impl SessionAgentTask {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn native_skill_dirs(&self) -> Vec<String> {
+        if self.agent_type == AgentType::Antigravity {
+            return vec![".agents/skills".to_owned()];
+        }
+        match self.generation.lock().ok().as_deref().and_then(|g| g.as_ref()) {
+            Some(crate::generation::GenerationTarget::Cli { backend, .. }) if backend == "claude" => {
+                vec![".claude/skills".to_owned()]
+            }
+            Some(crate::generation::GenerationTarget::Cli { backend, .. }) if backend == "codex" => {
+                vec![".agents/skills".to_owned()]
+            }
+            _ => Vec::new(),
+        }
     }
 
     pub(crate) fn generation_target(&self) -> Result<crate::generation::GenerationTarget, AgentError> {
@@ -516,6 +532,7 @@ impl SessionAgentTask {
         );
         Arc::new(Self {
             routed_model: std::sync::OnceLock::new(),
+            async_question_reply: tokio::sync::Mutex::new(()),
             generation: std::sync::Mutex::new(None),
             agent_type,
             conversation_id,
@@ -574,16 +591,6 @@ impl SessionAgentTask {
     // Backed by the backend's cheap sync `capabilities()` snapshot (reflects
     // late model/mode/config discovery) and `dispatch` for mutations.
 
-    /// Pending confirmations, projected from the backend's live
-    /// `pending_permission_requests()`. The REST `/confirmations` recovery path
-    /// (frontend `usePendingConfirmationsRecovery`) calls this on mount/reconnect to
-    /// rebuild permission cards that were raised while the page was away — WITHOUT
-    /// this returning them, a mid-turn permission (or AskUserQuestion) raised before
-    /// the client subscribed is lost and the turn hangs forever waiting for an answer
-    /// that can never be given. The card id == call_id == request_id, matching the
-    /// live `AcpPermission` frame so a duplicate live+recovered pair de-dups. Options
-    /// mirror the live translation: AskUserQuestion → its question options, else the
-    /// generic allow/deny.
     /// Raise a tool approval that came from OUTSIDE the backend's stream and
     /// block until the user answers.
     ///
@@ -599,6 +606,7 @@ impl SessionAgentTask {
         self.backend.request_external_permission(tool_name, input).await
     }
 
+    /// Recover approvals and structured questions by the same request IDs used in live events.
     pub fn get_confirmations(&self) -> Vec<aionui_common::Confirmation> {
         self.backend
             .pending_permission_requests()
@@ -616,6 +624,8 @@ impl SessionAgentTask {
                     options
                 };
                 aionui_common::Confirmation {
+                    questions: projected_questions(&p.tool_name, &p.request_id, p.questions.as_ref())
+                        .unwrap_or_default(),
                     id: p.request_id.clone(),
                     call_id: p.request_id,
                     title: (!p.tool_name.is_empty()).then(|| p.tool_name.clone()),
@@ -635,19 +645,62 @@ impl SessionAgentTask {
             .collect()
     }
 
-    /// Answer a pending permission. `data` is the option the user picked (the card
-    /// echoes the option's `option_id` — a string, or `{option_id|value}` object).
-    /// The picked id maps to the answer:
-    ///   - `reject`        → Denied
-    ///   - `allow_always`  → AllowAlways
-    ///   - `allow_mcp_*`   → AllowAlways + the Codex persistence scope
-    ///   - `allow`         → Approved
-    ///   - anything else   → an AskUserQuestion answer LABEL → Approved + `selected`
-    ///     (claude keys the AskUserQuestion answer by the chosen label — see
-    ///     claude_conn `build_control_response`; single-select single-question path).
-    ///
-    /// `always_allow` (legacy flag) forces AllowAlways regardless.
-    pub fn confirm(
+    /// A Codex async question can outlive the turn that asked it. Steer a running
+    /// turn, or use the normal chat submission path once that turn has finished.
+    pub async fn answer_async_question<E, F, Fut>(
+        &self,
+        call_id: &str,
+        data: &serde_json::Value,
+        new_turn: F,
+    ) -> Result<(), E>
+    where
+        E: From<AgentError>,
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        let _guard = self.async_question_reply.lock().await;
+        let request = self
+            .get_confirmations()
+            .into_iter()
+            .find(|q| q.call_id == call_id && !q.questions.is_empty())
+            .ok_or_else(|| AgentError::conflict("Question is no longer pending"))?;
+        if confirm_option_id(data).as_deref() != Some("reject") {
+            let answers: Vec<aionui_session::QuestionAnswer> = serde_json::from_value(data["answers"].clone())
+                .map_err(|_| AgentError::bad_request("Invalid question answers"))?;
+            aionui_session::QuestionAnswer::validate(&request.questions, &answers).map_err(AgentError::bad_request)?;
+            let replies = answers
+                .into_iter()
+                .map(|answer| {
+                    let question = request
+                        .questions
+                        .iter()
+                        .find(|q| q.id == answer.question)
+                        .expect("validated question id");
+                    serde_json::json!({
+                        "questionItemId": answer.question,
+                        "question": question.question,
+                        "answer": answer.labels.join(", ")
+                    })
+                })
+                .collect::<Vec<_>>();
+            let text = format!(
+                "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+                serde_json::json!(replies)
+            );
+            if !self
+                .backend
+                .steer_async_question_reply(call_id, &text)
+                .await
+                .map_err(|e| AgentError::internal(e.to_string()))?
+            {
+                new_turn(text).await?;
+            }
+        }
+        self.backend.finish_async_question(call_id);
+        Ok(())
+    }
+
+    pub async fn confirm(
         &self,
         _msg_id: &str,
         call_id: &str,
@@ -655,42 +708,69 @@ impl SessionAgentTask {
         always_allow: bool,
     ) -> Result<(), AgentError> {
         let picked = confirm_option_id(&data);
-        let (decision, selected) = permission_decision_from_choice(picked.as_deref(), always_allow);
+        let pending = self
+            .backend
+            .pending_permission_requests()
+            .into_iter()
+            .find(|request| request.request_id == call_id);
+        let questions = pending
+            .as_ref()
+            .and_then(|p| projected_questions(&p.tool_name, call_id, p.questions.as_ref()));
+        if pending.is_some_and(|p| {
+            p.questions.is_some() || p.tool_name == "AskUserQuestion" && !p.request_id.starts_with("elicit:")
+        }) && questions.is_none()
+            && picked.as_deref() != Some("reject")
+        {
+            return Err(AgentError::bad_request("Invalid question form; dismiss this request"));
+        }
+        let mut answers = Vec::<aionui_session::QuestionAnswer>::new();
+        let (decision, selected) = if let Some(questions) = questions {
+            if always_allow {
+                return Err(AgentError::bad_request("A question cannot be permanently approved"));
+            }
+            if (picked.as_deref() == Some("reject")
+                || (picked.as_deref() == Some("cancel") && call_id.starts_with("elicit:")))
+                && data.get("answers").is_none()
+            {
+                (
+                    aionui_session::PermissionDecision::Denied,
+                    picked.filter(|v| v == "cancel"),
+                )
+            } else {
+                answers = if let Some(value) = data.get("answers") {
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| AgentError::bad_request("Invalid question answers"))?
+                } else if let Some(label) = picked
+                    .filter(|label| questions.len() == 1 && questions[0].options.iter().any(|o| o.label == *label))
+                {
+                    vec![aionui_session::QuestionAnswer {
+                        question: questions[0].id.clone(),
+                        labels: vec![label],
+                    }]
+                } else {
+                    return Err(AgentError::bad_request("Answer every pending question"));
+                };
+                aionui_session::QuestionAnswer::validate(&questions, &answers).map_err(AgentError::bad_request)?;
+                (aionui_session::PermissionDecision::Approved, None)
+            }
+        } else {
+            if data.get("answers").is_some() {
+                return Err(AgentError::bad_request("These questions are no longer pending"));
+            }
+            permission_decision_from_choice(picked.as_deref(), always_allow)
+        };
         self.backend
             .prepare_permission(call_id, selected.as_deref())
             .map_err(|error| AgentError::internal(error.to_string()))?;
-        let backend = self.backend.clone();
-        let request_id = call_id.to_string();
-        let conv_id = self.conversation_id.clone();
-        // dispatch is async; confirm() is sync in IAgentTask's sibling API, so
-        // fire-and-forget on the runtime (the answer rides the stdin FIFO). The
-        // REST confirm has already returned success by the time this runs, so a
-        // dispatch failure here is INVISIBLE to the caller — it MUST be surfaced
-        // in the log or a wedged permission (claude blocked forever on
-        // can_use_tool) is undiagnosable in production.
-        tokio::spawn(async move {
-            match backend
-                .dispatch(Command::AnswerPermission {
-                    request_id: request_id.clone(),
-                    decision,
-                    selected,
-                    answers: Vec::new(),
-                })
-                .await
-            {
-                Ok(_) => tracing::info!(
-                    conv_id = %conv_id,
-                    request_id = %request_id,
-                    "permission answer delivered to backend"
-                ),
-                Err(e) => tracing::error!(
-                    conv_id = %conv_id,
-                    request_id = %request_id,
-                    error = %e,
-                    "permission answer FAILED after REST confirm already returned success — claude stays blocked on can_use_tool"
-                ),
-            }
-        });
+        self.backend
+            .dispatch(Command::AnswerPermission {
+                request_id: call_id.to_owned(),
+                decision,
+                selected,
+                answers,
+            })
+            .await
+            .map_err(|error| AgentError::internal(error.to_string()))?;
         Ok(())
     }
 
@@ -1662,6 +1742,7 @@ pub async fn build_session_instance(
     let cli_program = resolve_session_cli_program(backend_label, metadata)
         .map_err(|error| AgentError::bad_gateway(format!("{backend_label} runtime unavailable: {error}")))?;
     let mut session_config = SessionConfig {
+        host_manages_project_instructions: true,
         mcp_approval_store,
         mcp_approval_bindings: crate::mcp_approval::trusted_bindings(&neutral),
         prefer_managed_linear: !config.allow_provider_linear
@@ -2975,6 +3056,9 @@ fn spawn_event_pump(
 
             // Drive the coarse status off the turn-boundary events so `status()`
             // reflects running/finished (the app gates the sidebar spinner on it).
+            if matches!(&env.event, SessionEvent::AdapterSpecific { tag, .. } if tag=="context_compacted") {
+                crate::capability::tencent_memory::forget_delivered_rules(&conversation_id);
+            }
             match &env.event {
                 SessionEvent::TurnStarted { .. } => {
                     runtime.set_status(ConversationStatus::Running);
@@ -3147,6 +3231,19 @@ fn spawn_event_pump(
             // Finish, so the translated frame below would be shouted into an empty
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
+            let removed = match &env.event {
+                SessionEvent::PermissionResolved { request_id, .. } => Some(request_id.as_str()),
+                SessionEvent::AdapterSpecific { tag, payload } if tag == "codex_async_question_resolved" => {
+                    payload["id"].as_str()
+                }
+                _ => None,
+            };
+            if let (Some(bus), Some(id)) = (broadcaster.as_ref(), removed) {
+                bus.broadcast(aionui_api_types::WebSocketMessage::new(
+                    "confirmation.remove",
+                    serde_json::json!({"user_id":user_id,"conversation_id":conversation_id,"id":id}),
+                ));
+            }
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
@@ -3650,16 +3747,28 @@ fn default_permission_options(
     options
 }
 
-/// Project an AskUserQuestion tool `input` into permission-card options the user can
-/// pick. `input` shape (claude, live-captured): `{questions:[{question, header,
-/// options:[{label, description}], multiSelect}]}`. The frontend card is single-select
-/// (one radio group, one confirm), so we surface the FIRST question's option labels as
-/// the choices — `option_id == label` so `confirm()` can pass the picked label straight
-/// into `AnswerPermission.selected` (claude keys the answer by label). A multi-question
-/// AskUserQuestion degrades to answering the first question (a known single-select
-/// frontend limitation — the remaining questions claude silently drops, same as the
-/// legacy single-question path). Returns empty when the shape is absent/unparseable, so
-/// the caller falls back to allow/deny.
+/// Only confirmed native question protocols may project a structured form.
+fn projected_questions(
+    name: &str,
+    id: &str,
+    raw: Option<&serde_json::Value>,
+) -> Option<Vec<aionui_common::UserQuestion>> {
+    let raw = raw?;
+    match name {
+        "McpElicitationForm" if id.starts_with("elicit:") => {
+            let form = serde_json::from_value::<Vec<aionui_common::UserQuestion>>(raw.clone()).ok()?;
+            aionui_common::UserQuestion::valid_form(&form).then_some(form)
+        }
+        "AskUserQuestion" if !id.starts_with("elicit:") => aionui_common::UserQuestion::from_native(raw, true),
+        "request_user_input" if id.starts_with("question:") => aionui_common::UserQuestion::from_native(raw, false),
+        "request_user_input_async" if id.starts_with("async-question:") => {
+            aionui_common::UserQuestion::from_native(raw, false)
+        }
+        _ => None,
+    }
+}
+
+/// Retain Claude’s legacy first-question choices for clients using the old permission card.
 fn ask_user_question_options(
     input: Option<&serde_json::Value>,
 ) -> Vec<crate::protocol::events::AcpPermissionOptionData> {
@@ -4144,6 +4253,23 @@ fn child_stream_status(event: &SessionEvent) -> Option<&'static str> {
 /// result is an absorbed teardown, not a crash). Immaterial for every other arm.
 fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_seen: bool) -> Vec<AgentStreamEvent> {
     match event {
+        SessionEvent::AdapterSpecific { tag, payload } if tag == "codex_async_question" => {
+            // The provider did not block the turn; use its typed message to draw a
+            // card without going through the permission FSM or auto-approval path.
+            let id = payload["id"].as_str().unwrap_or_default().to_owned();
+            translate_event(
+                SessionEvent::Permission {
+                    request_id: id,
+                    kind: aionui_session::PermissionKind::Tool,
+                    metadata: None,
+                    tool_name: Some("request_user_input_async".into()),
+                    input: Some(payload["input"].clone()),
+                },
+                conversation_id,
+                terminal_result_seen,
+            )
+        }
+
         // NOTE: the Start lifecycle frame is emitted by `send_message` (before
         // dispatch), mirroring the ACP path which emits Start right before prompt().
         // The backend's own turn-start signals — claude/codex `PromptAccepted`
@@ -4288,16 +4414,8 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             input,
             ..
         } => {
-            // The frontend permission card renders whatever `options[]` we send as the
-            // selectable choices (MessageAcpPermission maps each to a radio). So the
-            // options MUST reflect what the user is actually choosing between:
-            //   - AskUserQuestion → the question's own options (labels), so the user
-            //     answers the question. `confirm()` maps the picked label to the
-            //     AnswerPermission `selected` (claude keys the answer by it).
-            //   - any other tool approval → generic Allow / Allow Always / Reject.
-            // (Before, EVERY permission — including AskUserQuestion — was hard-coded to
-            // allow/deny, so a question rendered as an allow/deny card. TIO: the question
-            // content in `input` is user-facing, not a sensitive tool body.)
+            // Older clients render the first Claude choice using permission options;
+            // current clients recover every question from the structured payload.
             let is_ask = tool_name.as_deref() == Some("AskUserQuestion");
             let options = if is_ask {
                 ask_user_question_options(input.as_ref())
@@ -4314,6 +4432,12 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                     crate::protocol::events::AcpPermissionRequestData {
                         session_id: conversation_id.to_owned(),
                         tool_call: crate::protocol::events::AcpPermissionToolCall {
+                            questions: projected_questions(
+                                tool_name.as_deref().unwrap_or_default(),
+                                &request_id,
+                                input.as_ref().and_then(|v| v.get("questions")),
+                            )
+                            .unwrap_or_default(),
                             tool_call_id: request_id,
                             status: None,
                             title: tool_name,
@@ -8403,6 +8527,8 @@ mod pump_tests {
             None,
         );
         let confs = task.get_confirmations();
+        assert_eq!(confs[0].questions.len(), 1);
+        assert_eq!(confs[0].questions[0].id, "Which?");
         assert_eq!(confs.len(), 1, "the pending permission must be recovered");
         assert_eq!(
             confs[0].call_id, "req-recover",

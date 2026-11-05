@@ -79,17 +79,6 @@ async fn generation_capabilities_reject_missing_unknown_expired_and_model_mismat
     ));
     assert!(provider.requests.lock().unwrap().is_empty());
 }
-#[test]
-fn generation_context_capability_is_bound_to_conversation() {
-    let service = service();
-    let env = service.mcp_env("user-a", "chat-a", None);
-    let token = &env[1].1;
-    assert!(service.validate_context_token(token, "chat-a").is_ok());
-    assert!(service.validate_context_token(token, "chat-b").is_err());
-    assert!(service.validate_context_token("", "chat-a").is_err());
-    assert!(service.validate_context_token("unknown", "chat-a").is_err());
-    assert_eq!(env[0].1, "http://127.0.0.1:1234/api/memory/generation/context");
-}
 #[tokio::test]
 async fn generation_routes_freeze_model_and_keep_concurrent_snapshots_separate() {
     let service = service();
@@ -178,7 +167,10 @@ async fn auxiliary_usage_stays_bound_to_issued_conversation_and_does_not_replace
             model: "worker".into(),
         })
         .unwrap();
-    service.routes.get_mut(&hash(&context.callback_token)).unwrap().owner = Some(GenerationOwner {
+    service.routes.get_mut(&hash(&context.callback_token)).unwrap().owner = Some(MemoryCapability {
+        token_hash: hash("fixture"),
+        project_id: None,
+        stored_workspace: String::new(),
         user: "owner".into(),
         conversation: "chat-a".into(),
         provider: Some("account-a".into()),

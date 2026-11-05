@@ -3,7 +3,7 @@ mod router_children;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::{BuildTaskOptions, MemoryRecallScope};
@@ -30,7 +30,8 @@ use aionui_api_types::{
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
+    PaginatedResult, TeamQuestionReplies, WorkspacePathValidationError, generate_short_id, now_ms,
+    validate_workspace_path_availability,
 };
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
@@ -308,8 +309,9 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
 
 #[derive(Clone)]
 pub struct ConversationService {
+    pub(crate) host_questions: crate::host_questions::Registry,
     workspace_root: PathBuf,
-    broadcaster: Arc<dyn EventBroadcaster>,
+    pub(crate) broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     /// Hooks invoked during `delete()` before the DB row is removed so other services
@@ -317,6 +319,7 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    team_question_replies: Arc<RwLock<Option<Weak<dyn TeamQuestionReplies>>>>,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -331,6 +334,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    user_repo: Option<Arc<dyn aionui_db::IUserRepository>>,
     router: Option<Arc<aionui_ai_agent::routing::RouterService>>,
     router_children: Arc<router_children::RouterChildren>,
 
@@ -343,7 +347,7 @@ pub struct ConversationService {
         Arc<std::sync::Mutex<std::collections::HashMap<String, crate::background_stream::BackgroundWatcherHandle>>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
-    conversation_repo: Arc<dyn IConversationRepository>,
+    pub(crate) conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
 }
@@ -399,11 +403,13 @@ impl ConversationService {
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
     ) -> Self {
         Self {
+            host_questions: Default::default(),
             workspace_root,
             broadcaster,
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            team_question_replies: Default::default(),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -416,6 +422,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            user_repo: None,
             router: None,
             router_children: Arc::default(),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -424,6 +431,11 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    pub fn with_user_repo(mut self, users: Arc<dyn aionui_db::IUserRepository>) -> Self {
+        self.user_repo = Some(users);
+        self
     }
 
     pub fn with_router_service(mut self, router: Arc<aionui_ai_agent::routing::RouterService>) -> Self {
@@ -736,6 +748,13 @@ impl ConversationService {
     pub fn with_agent_availability_feedback(&self, feedback: Arc<dyn AgentAvailabilityFeedbackPort>) {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
+        }
+    }
+
+    pub fn with_team_question_replies(&self, sender: Arc<dyn TeamQuestionReplies>) {
+        // The Team service already owns a clone of this conversation service.
+        if let Ok(mut slot) = self.team_question_replies.write() {
+            *slot = Some(Arc::downgrade(&sender));
         }
     }
 
@@ -1285,17 +1304,17 @@ impl ConversationService {
                 }
             };
             extra["workspace"] = serde_json::Value::String(workspace.clone());
-            let scope = MemoryRecallScope {
-                conversation_id: extra
-                    .pointer("/router_child/parent_conversation_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                workspace: workspace.clone(),
-                roots: vec![workspace],
-                isolated_test: tool_scope.is_session_only(),
-                guidance_only: tool_scope.is_session_only(),
-                ..Default::default()
-            };
+            let scope = self
+                .classifier_rules_scope(
+                    user_id,
+                    &workspace,
+                    extra
+                        .pointer("/router_child/parent_conversation_id")
+                        .and_then(serde_json::Value::as_str),
+                    auto_provisioned_workspace.is_some(),
+                    tool_scope.is_session_only(),
+                )
+                .await?;
             let facts = aionui_api_types::RouterRequirements {
                 vision: routing.has_images,
                 ..Default::default()
@@ -3781,7 +3800,9 @@ impl ConversationService {
             None => return Ok(Vec::new()),
         };
 
-        Ok(agent.get_confirmations())
+        let mut confirmations = agent.get_confirmations();
+        confirmations.extend(self.host_forms(user_id, conversation_id));
+        Ok(confirmations)
     }
 
     /// Confirm a pending tool call.
@@ -3796,12 +3817,19 @@ impl ConversationService {
         req: ConfirmRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
-        self.conversation_repo
+        let conversation = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        if call_id.starts_with("host-question:") {
+            return self
+                .answer_host_question(user_id, conversation_id, call_id, &req.data)
+                .await;
+        }
 
         let agent = task_manager
             .get_task(conversation_id)
@@ -3815,7 +3843,44 @@ impl ConversationService {
             .find(|c| c.call_id == call_id)
             .map(|c| c.id.clone());
 
-        agent.confirm(&req.msg_id, call_id, req.data, req.always_allow)?;
+        if call_id.starts_with("async-question:")
+            && let AgentInstance::Session(session) = &agent
+        {
+            session
+                .answer_async_question(call_id, &req.data, |content| async move {
+                    if let Some(team_id) = team_id_from_extra(&conversation.extra) {
+                        let sender = self
+                            .team_question_replies
+                            .read()
+                            .ok()
+                            .and_then(|entry| entry.as_ref()?.upgrade())
+                            .ok_or_else(|| ConversationError::TeamRuntimeRequired {
+                                conversation_id: conversation_id.to_owned(),
+                                team_id: team_id.clone(),
+                            })?;
+                        return sender
+                            .enqueue_question_reply(user_id, &team_id, conversation_id, &content)
+                            .await
+                            .map_err(ConversationError::internal);
+                    }
+                    self.send_message(
+                        user_id,
+                        conversation_id,
+                        SendMessageRequest {
+                            content,
+                            files: vec![],
+                            inject_skills: vec![],
+                            hidden: false,
+                        },
+                        task_manager,
+                    )
+                    .await
+                    .map(|_| ())
+                })
+                .await?;
+        } else {
+            agent.confirm(&req.msg_id, call_id, req.data, req.always_allow).await?;
+        }
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({
@@ -4597,9 +4662,9 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options(row, seed)
                 .await?;
-        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await?;
-        options.memory_recall.guidance_only = options.context.is_session_only();
-        options.memory_recall.isolated_test = options.context.is_session_only() && row.project_id.is_none();
+        options.memory_recall = self
+            .memory_recall_scope(row, &options.context.workspace.path, options.context.is_session_only())
+            .await?;
         if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
             .ok()
             .and_then(|v| v.get("routing").cloned())
@@ -4641,9 +4706,9 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options_with_workspace_override(row, workspace_override, seed)
                 .await?;
-        options.memory_recall = self.memory_recall_scope(row, &options.context.workspace.path).await?;
-        options.memory_recall.guidance_only = options.context.is_session_only();
-        options.memory_recall.isolated_test = options.context.is_session_only() && row.project_id.is_none();
+        options.memory_recall = self
+            .memory_recall_scope(row, &options.context.workspace.path, options.context.is_session_only())
+            .await?;
         if let Some(value) = serde_json::from_str::<serde_json::Value>(&row.extra)
             .ok()
             .and_then(|v| v.get("routing").cloned())
@@ -4797,31 +4862,212 @@ impl ConversationService {
         &self,
         row: &ConversationRow,
         runtime_workspace: &str,
+        session_only: bool,
+    ) -> Result<MemoryRecallScope, ConversationError> {
+        let mut scope = self.bound_rule_scope(row, runtime_workspace, session_only).await?;
+        scope.recent_user_goals = self
+            .conversation_repo
+            .recent_user_messages(&row.user_id, &row.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .filter_map(|message| {
+                let body: serde_json::Value = serde_json::from_str(&message.content).ok()?;
+                body.get("content")?
+                    .as_str()
+                    .map(|text| text.chars().take(8192).collect())
+            })
+            .collect();
+        Ok(scope)
+    }
+
+    /// The Rules tab resolves the same workspace, project and isolation as the provider's preflight,
+    /// without provisioning a session, creating folders or loading conversation history.
+    pub(crate) async fn chat_rules_scope(
+        &self,
+        user: &str,
+        id: &str,
+        runtime: Option<&aionui_ai_agent::generation::MemoryCapability>,
+    ) -> Result<(MemoryRecallScope, bool), ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.into() })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)
+            .map_err(|_| ConversationError::bad_request("Invalid conversation configuration"))?;
+        if runtime.is_some_and(|cap| {
+            !cap.matches_binding(
+                user,
+                row.project_id.as_deref(),
+                extra["workspace"].as_str().unwrap_or_default(),
+            )
+        }) {
+            return Err(ConversationError::Unauthorized {
+                reason: "The memory runtime binding has changed".into(),
+            });
+        }
+        let tool_scope = aionui_api_types::ConversationToolScope::from_extra(&extra)
+            .map_err(|_| ConversationError::bad_request("Invalid conversation tool scope"))?;
+        let agent_type = string_to_enum(&row.r#type)?;
+        let workspace =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+                .resolve_workspace(&row, &agent_type, &extra, None, false)?;
+        let local_only = extra
+            .get("routing")
+            .map(|value| serde_json::from_value::<aionui_api_types::RouterSnapshot>(value.clone()))
+            .transpose()
+            .map_err(|_| ConversationError::bad_request("Invalid conversation routing snapshot"))?
+            .is_some_and(|routing| routing.config.local_only);
+        Ok((
+            self.bound_rule_scope(&row, &workspace.path, tool_scope.is_session_only())
+                .await?,
+            local_only,
+        ))
+    }
+
+    async fn authorized_rules_scope(
+        &self,
+        user: &str,
+        id: &str,
+        runtime: Option<&aionui_ai_agent::generation::MemoryCapability>,
+    ) -> Result<(MemoryRecallScope, bool), ConversationError> {
+        let users = self
+            .user_repo
+            .as_ref()
+            .ok_or_else(|| ConversationError::internal("Memory owner unavailable"))?;
+        if !users.owns_machine_memory(user).await? {
+            return Err(ConversationError::Forbidden {
+                reason: "Rules are restricted to the machine's memory owner".into(),
+            });
+        }
+        self.chat_rules_scope(user, id, runtime).await
+    }
+
+    /// List the full current rule sources for the authenticated conversation owner.
+    pub async fn read_chat_rules(
+        &self,
+        user: &str,
+        id: &str,
+        runtime: Option<&aionui_ai_agent::generation::MemoryCapability>,
+    ) -> Result<aionui_api_types::ChatRulesResponse, ConversationError> {
+        let (scope, local_only) = self.authorized_rules_scope(user, id, runtime).await?;
+        Ok(aionui_ai_agent::read_chat_rules(&scope, local_only).await?)
+    }
+
+    /// An agent reads its actual bound guidance, including applicable repository instructions.
+    /// The caller cannot supply a scope, cwd, project ID, file path, or mutation.
+    pub async fn read_worker_rules(
+        &self,
+        id: &str,
+        capability: &aionui_ai_agent::generation::MemoryCapability,
+    ) -> Result<serde_json::Value, ConversationError> {
+        let (scope, local_only) = self
+            .authorized_rules_scope(&capability.user, id, Some(capability))
+            .await?;
+        Ok(aionui_ai_agent::invoke_rules_tool(
+            "tdai_rules_read",
+            &serde_json::json!({}),
+            &scope,
+            &scope.rule_workspace,
+            local_only,
+        )
+        .await?)
+    }
+
+    /// Apply one revision-checked mutation within the authenticated conversation's scope.
+    pub async fn mutate_chat_rule(
+        &self,
+        user: &str,
+        id: &str,
+        runtime: Option<&aionui_ai_agent::generation::MemoryCapability>,
+        mutation: &aionui_api_types::ChatRuleMutation,
+    ) -> Result<(), ConversationError> {
+        let (scope, local_only) = self.authorized_rules_scope(user, id, runtime).await?;
+        Ok(aionui_ai_agent::mutate_chat_rule(&scope, mutation, local_only).await?)
+    }
+
+    pub async fn project_rule_files(
+        &self,
+        user: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::ProjectRuleFiles, ConversationError> {
+        let (scope, _) = self.authorized_rules_scope(user, id, None).await?;
+        Ok(aionui_ai_agent::project_rules::list(&scope).await?)
+    }
+
+    pub async fn mutate_project_file_rule(
+        &self,
+        user: &str,
+        id: &str,
+        change: aionui_api_types::ProjectFileRuleMutation,
+    ) -> Result<(), ConversationError> {
+        let (scope, _) = self.authorized_rules_scope(user, id, None).await?;
+        Ok(aionui_ai_agent::project_rules::mutate(&scope, change).await?)
+    }
+
+    async fn bound_rule_scope(
+        &self,
+        row: &ConversationRow,
+        runtime_workspace: &str,
+        session_only: bool,
     ) -> Result<MemoryRecallScope, ConversationError> {
         let mut scope = MemoryRecallScope {
             conversation_id: Some(row.id.clone()),
-            isolated_test: false,
-            guidance_only: false,
+            isolated_test: session_only && row.project_id.is_none(),
+            guidance_only: session_only,
             project_id: row.project_id.clone(),
+            temporary_project: row.project_id.is_none(),
             project_name: None,
             workspace: runtime_workspace.to_owned(),
             roots: vec![runtime_workspace.to_owned()],
-            recent_user_goals: self
-                .conversation_repo
-                .recent_user_messages(&row.user_id, &row.id)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .rev()
-                .filter_map(|message| {
-                    let body: serde_json::Value = serde_json::from_str(&message.content).ok()?;
-                    body.get("content")?
-                        .as_str()
-                        .map(|text| text.chars().take(8192).collect())
-                })
-                .collect(),
+            rule_workspace: runtime_workspace.to_owned(),
+
+            recent_user_goals: Vec::new(),
         };
         self.bind_project_memory_scope(&row.user_id, &mut scope).await?;
+        Ok(scope)
+    }
+
+    /// Before the chat exists, a supplied cwd alone cannot grant project guidance.
+    /// Resolve only an existing, owned workspace entry, or the exact server-minted parent.
+    pub(crate) async fn classifier_rules_scope(
+        &self,
+        user_id: &str,
+        workspace: &str,
+        parent_id: Option<&str>,
+        auto_workspace: bool,
+        session_only: bool,
+    ) -> Result<MemoryRecallScope, ConversationError> {
+        let project_id = if let Some(id) = parent_id {
+            self.conversation_repo
+                .get(user_id, id)
+                .await?
+                .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?
+                .project_id
+        } else if auto_workspace {
+            None
+        } else {
+            let service = self.project_service.read().ok().and_then(|guard| guard.clone());
+            match service {
+                Some(service) => service
+                    .standard_project_at(user_id, Path::new(workspace))
+                    .await
+                    .map_err(|_| ConversationError::internal("Could not verify the classifier project binding"))?,
+                None => None,
+            }
+        };
+        let mut scope = MemoryRecallScope {
+            project_id,
+            temporary_project: true,
+            workspace: workspace.into(),
+            rule_workspace: workspace.into(),
+            isolated_test: session_only,
+            guidance_only: session_only,
+            ..Default::default()
+        };
+        self.bind_project_memory_scope(user_id, &mut scope).await?;
         Ok(scope)
     }
 
@@ -4866,10 +5112,10 @@ impl ConversationService {
                 Ok(path)
             })
             .collect::<Result<Vec<_>, ConversationError>>()?;
+        scope.temporary_project = project.kind == "temp";
         scope.project_name = Some(project.name);
-        if !roots.is_empty() {
-            scope.roots = roots;
-        }
+        // For repository file access, an empty set of registered folders grants no filesystem authority.
+        scope.roots = roots;
         if let Some(project_workspace) = project_workspace {
             scope.workspace = project_workspace;
         }

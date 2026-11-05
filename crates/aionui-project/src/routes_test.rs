@@ -260,3 +260,52 @@ async fn remove_attached_then_workspace_immutable() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["code"], "workspace_entry_immutable");
 }
+
+#[tokio::test]
+async fn skills_follow_registered_project_and_nested_repositories_only() {
+    let (router, project, _, root, _) = setup().await;
+    let dir = root.path().join("subrepo/.claude/skills/lint");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(root.path().join("subrepo/.git")).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: lint\ndescription: Check the repository.\n---\nPRIVATE BODY",
+    )
+    .unwrap();
+    let (status, data) = send(&router, "GET", &format!("/api/projects/{project}/skills"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        data["data"],
+        json!([{"name":"lint","description":"Check the repository.","source":"./subrepo/.claude/skills/lint/SKILL.md"}])
+    );
+    let (status, _) = send(&router, "GET", "/api/projects/foreign-missing/skills", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let uri = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("workspace", &root.path().to_string_lossy())
+        .finish();
+    assert_eq!(
+        send(&router, "GET", &format!("/api/projects/selected-workspace?{uri}"), None)
+            .await
+            .1["data"],
+        project
+    );
+    let other = tempfile::tempdir().unwrap();
+    let uri = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("workspace", &other.path().to_string_lossy())
+        .finish();
+    assert!(
+        send(&router, "GET", &format!("/api/projects/selected-workspace?{uri}"), None)
+            .await
+            .1["data"]
+            .is_null()
+    );
+    let (status, created) = send(
+        &router,
+        "POST",
+        "/api/projects/selected-workspace",
+        Some(json!({"workspace":other.path()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(created["data"].as_str().is_some());
+}

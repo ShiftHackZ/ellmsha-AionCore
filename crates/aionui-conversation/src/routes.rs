@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
@@ -418,8 +418,10 @@ async fn search_messages(
 async fn list_confirmations(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<ConfirmationListResponse>>, ApiError> {
+    crate::routes_aux::require_user_session(&headers)?;
     let items = state
         .service
         .list_confirmations(&user.id, &id, &state.task_manager)
@@ -438,9 +440,11 @@ struct ConfirmPathParams {
 async fn confirm(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
     Path(params): Path<ConfirmPathParams>,
     body: Result<Json<ConfirmRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    crate::routes_aux::require_user_session(&headers)?;
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .service

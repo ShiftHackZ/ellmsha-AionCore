@@ -72,6 +72,9 @@ pub trait IUserRepository: Send + Sync {
     /// to any other account — including after more accounts are provisioned.
     async fn is_default_data_adopter(&self, owner_id: &str) -> Result<bool, DbError>;
 
+    /// The process-wide memory belongs to the active machine owner, or its recorded one-shot adopter.
+    async fn owns_machine_memory(&self, user_id: &str) -> Result<bool, DbError>;
+
     /// Finds a user by ID.
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError>;
 

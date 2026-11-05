@@ -45,6 +45,22 @@ impl ProjectService {
 
     // ── creation / backfill ────────────────────────────────────────────
 
+    /// Lookup only already registered workspace roots of the authenticated account.
+    /// Never traverse the arbitrary path supplied by a caller on this read path.
+    pub async fn standard_project_at(&self, user: &str, workspace: &Path) -> Result<Option<String>, ProjectError> {
+        let uri = canonical::canonicalize(&canonical::to_file_uri(workspace)?)?;
+        for project in self.store.list_standard_projects(user).await? {
+            let entries = self.store.list_entries(user, &project.project_id).await?;
+            if entries
+                .iter()
+                .any(|(entry, folder)| entry.role == "workspace" && folder.resource_canonical == uri.as_str())
+            {
+                return Ok(Some(project.project_id));
+            }
+        }
+        Ok(None)
+    }
+
     /// User-selected existing directory → `kind = standard`.
     pub async fn create_standard(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
         let canonical = canonical::canonicalize(&uri)?;

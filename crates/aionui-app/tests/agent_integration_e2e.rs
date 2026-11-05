@@ -531,6 +531,7 @@ async fn confirm_and_check_approval() {
 
     // Pre-populate a pending confirmation so the confirm endpoint can find it
     agent.confirmations.lock().unwrap().push(Confirmation {
+        questions: Vec::new(),
         id: "conf-1".into(),
         call_id: "call-42".into(),
         title: Some("Allow file edit".into()),

@@ -84,3 +84,16 @@ pub struct MemoryProjectContext {
     /// Canonical local paths of the current workspace and attached folders.
     pub roots: Vec<String>,
 }
+
+/// A user-invocable project skill. The source is relative to its registered root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSkillSummary {
+    pub name: String,
+    pub description: String,
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectWorkspaceSelection {
+    pub workspace: String,
+}

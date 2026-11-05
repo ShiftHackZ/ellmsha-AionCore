@@ -77,18 +77,18 @@ pub fn build_agent_factory(deps: AgentFactoryDeps) -> AgentFactory {
     })
 }
 
-async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
+async fn build_agent(deps: Arc<AgentFactoryDeps>, mut options: BuildTaskOptions) -> Result<AgentInstance, AgentError> {
     let frozen_target = crate::routing::guard::frozen_target(&options)?.cloned();
-    let routing = options.routing;
     let routing_scope = options.memory_recall.clone();
-    let mut context = options.context;
     if !routing_scope.isolated_test {
-        tencent_memory::attach_required_guidance(&mut context).await?;
-        tencent_memory::attach_background_processes(&mut context).await?;
+        tencent_memory::attach_required_guidance(&mut options.context).await?;
+        tencent_memory::attach_background_processes(&mut options.context).await?;
     }
-    if !context.is_session_only() {
-        tencent_memory::attach_runtime_memory(&mut context, deps.generation_service.as_deref()).await?;
+    if !options.context.is_session_only() {
+        tencent_memory::attach_runtime_memory(&mut options, deps.generation_service.as_deref()).await?;
     }
+    let routing = options.routing;
+    let mut context = options.context;
     codex_home::isolate_legacy_memory(&mut context, &deps.data_dir).await?;
     let ctx = FactoryContext::resolve(&context).await?;
     let model = context.model.clone();

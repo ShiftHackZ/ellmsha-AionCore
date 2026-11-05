@@ -20,6 +20,11 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
+        .route("/api/conversations/{id}/rules", get(get_rules).post(mutate_rule))
+        .route(
+            "/api/conversations/{id}/project-rule-files",
+            get(get_project_rule_files).post(mutate_project_file_rule),
+        )
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
@@ -33,6 +38,72 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Route handlers ─────────────────────────────────────────────────
+
+// The manual editor requires the user's session. The built-in memory MCP has its own
+// conversation-bound capability endpoint. Rejecting helper headers also closes the CSRF exemption.
+pub(crate) fn require_user_session(headers: &HeaderMap) -> Result<(), ApiError> {
+    if [
+        aionui_auth::RUNTIME_TOKEN_HEADER,
+        aionui_auth::RUNTIME_USER_ID_HEADER,
+        aionui_auth::RUNTIME_CONVERSATION_ID_HEADER,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+    {
+        return Err(ApiError::Forbidden("This action requires a user session".into()));
+    }
+    Ok(())
+}
+
+async fn get_rules(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<aionui_api_types::ChatRulesResponse>>, ApiError> {
+    require_user_session(&headers)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.read_chat_rules(&user.id, &id, None).await?,
+    )))
+}
+
+async fn mutate_rule(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<aionui_api_types::ChatRuleMutation>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_user_session(&headers)?;
+    let Json(mutation) = body.map_err(ApiError::from)?;
+    state.service.mutate_chat_rule(&user.id, &id, None, &mutation).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn get_project_rule_files(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse<aionui_api_types::ProjectRuleFiles>>, ApiError> {
+    require_user_session(&headers)?;
+    Ok(Json(ApiResponse::ok(
+        state.service.project_rule_files(&user.id, &id).await?,
+    )))
+}
+
+async fn mutate_project_file_rule(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<aionui_api_types::ProjectFileRuleMutation>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_user_session(&headers)?;
+    let Json(change) = body.map_err(ApiError::from)?;
+    state.service.mutate_project_file_rule(&user.id, &id, change).await?;
+    Ok(Json(ApiResponse::success()))
+}
 
 /// Runtime callers may manipulate only their own brief. Ordinary authenticated
 /// UI clients remain owner-scoped by the service repository lookup.

@@ -315,6 +315,7 @@ fn map_sdk_permission_option_kind(kind: SdkPermissionOptionKind) -> AcpPermissio
 
 fn map_permission_tool_call(tool_call: &SdkToolCallUpdate) -> AcpPermissionToolCall {
     AcpPermissionToolCall {
+        questions: vec![],
         tool_call_id: tool_call.tool_call_id.to_string(),
         status: tool_call.fields.status.as_ref().map(map_sdk_tool_status),
         title: tool_call.fields.title.clone(),

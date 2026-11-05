@@ -40,6 +40,7 @@ impl BackendProtocolSink {
         let command_type = Some(category.to_string());
 
         Confirmation {
+            questions: Vec::new(),
             id: generate_id(),
             call_id: call_id.to_string(),
             title: Some(title),

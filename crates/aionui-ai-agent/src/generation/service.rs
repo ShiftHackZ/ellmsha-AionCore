@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::{GenerationContext, GenerationRequest, GenerationResponse, cli, native};
+use crate::session_context::AgentSessionKind;
+use crate::types::BuildTaskOptions;
 use crate::{AgentError, AgentInstance, IWorkerTaskManager};
 
 #[derive(Clone)]
@@ -36,15 +38,32 @@ impl GenerationTarget {
     }
 }
 
-#[derive(Clone)]
-struct GenerationOwner {
-    user: String,
+/// A private MCP capability belongs to a single worker slot. Only its digest is retained.
+#[derive(Debug, Clone)]
+pub struct MemoryCapability {
+    token_hash: String,
+    pub user: String,
+    project_id: Option<String>,
+    stored_workspace: String,
     conversation: String,
     provider: Option<String>,
 }
 
+impl MemoryCapability {
+    /// Unregistered chats can derive project aliases from their persisted workspace.
+    pub fn matches_binding(&self, user: &str, project_id: Option<&str>, stored_workspace: &str) -> bool {
+        self.user == user
+            && self.project_id.as_deref() == project_id
+            && (project_id.is_some() || self.stored_workspace == stored_workspace)
+    }
+
+    pub(crate) fn matches(&self, token: &str, conversation_id: &str) -> bool {
+        self.conversation == conversation_id && self.token_hash == hash(token)
+    }
+}
+
 struct Route {
-    owner: Option<GenerationOwner>,
+    owner: Option<MemoryCapability>,
     target: GenerationTarget,
     expires: Instant,
 }
@@ -52,7 +71,6 @@ struct Route {
 /// Private capabilities are never included in tool arguments or model prompts.
 /// A callback route remains frozen for 24 hours, including queued extraction jobs.
 pub struct GenerationService {
-    context_tokens: DashMap<String, GenerationOwner>,
     usage_bus: Option<Arc<dyn aionui_realtime::EventBroadcaster>>,
     routes: DashMap<String, Route>,
     slots: Semaphore,
@@ -62,7 +80,6 @@ pub struct GenerationService {
 impl GenerationService {
     pub fn new(base_url: String) -> Self {
         Self {
-            context_tokens: DashMap::new(),
             usage_bus: None,
             routes: DashMap::new(),
             slots: Semaphore::new(4),
@@ -77,24 +94,34 @@ impl GenerationService {
     }
 
     /// Mint a conversation-bound capability for the private memory MCP.
-    pub fn mcp_env(&self, user: &str, conversation_id: &str, provider: Option<String>) -> [(String, String); 3] {
+    pub fn mcp_env(&self, options: &BuildTaskOptions) -> Result<[(String, String); 3], AgentError> {
+        let context = &options.context;
+        let conversation_id = context.conversation_id();
         let token = uuid::Uuid::new_v4().to_string();
-        self.context_tokens.insert(
-            hash(&token),
-            GenerationOwner {
-                user: user.into(),
+        let provider = match &context.kind {
+            AgentSessionKind::Aionrs(_) => Some(context.model.provider_id.clone()),
+            AgentSessionKind::Acp(c) => c.config.agent_id.clone(),
+            AgentSessionKind::Antigravity(c) => c.config.agent_id.clone(),
+        };
+        options
+            .memory_capability
+            .set(MemoryCapability {
+                token_hash: hash(&token),
+                user: context.conversation.user_id.clone(),
                 conversation: conversation_id.into(),
+                project_id: options.memory_recall.project_id.clone(),
+                stored_workspace: context.workspace.stored_path.clone(),
                 provider,
-            },
-        );
-        [
+            })
+            .map_err(|_| AgentError::internal("Memory capability already issued for this runtime"))?;
+        Ok([
             (
                 "AIONUI_GENERATION_CONTEXT_URL".into(),
                 format!("{}/api/memory/generation/context", self.base_url),
             ),
             ("AIONUI_GENERATION_TOKEN".into(), token),
             ("AIONUI_CONVERSATION_ID".into(), conversation_id.to_owned()),
-        ]
+        ])
     }
 
     pub async fn issue_context(
@@ -103,10 +130,9 @@ impl GenerationService {
         conversation_id: &str,
         tasks: &dyn IWorkerTaskManager,
     ) -> Result<GenerationContext, AgentError> {
-        self.validate_context_token(token, conversation_id)?;
-        let task = tasks.get_task(conversation_id).ok_or_else(|| {
-            AgentError::conflict("Primary agent is not running; start its conversation before memory generation")
-        })?;
+        let (owner, task) = tasks
+            .memory_runtime(conversation_id, token)
+            .ok_or_else(|| AgentError::unauthorized("Invalid memory generation context capability"))?;
         let target = match task {
             AgentInstance::Aionrs(manager) => manager.generation_target(),
             AgentInstance::Session(manager) => manager.generation_target()?,
@@ -117,24 +143,10 @@ impl GenerationService {
             }
         };
         let context = self.issue_target(target)?;
-        if let (Some(owner), Some(mut route)) = (
-            self.context_tokens.get(&hash(token)),
-            self.routes.get_mut(&hash(&context.callback_token)),
-        ) {
-            route.owner = Some(owner.clone());
+        if let Some(mut route) = self.routes.get_mut(&hash(&context.callback_token)) {
+            route.owner = Some(owner);
         }
         Ok(context)
-    }
-
-    pub fn validate_context_token(&self, token: &str, conversation_id: &str) -> Result<(), AgentError> {
-        if self
-            .context_tokens
-            .get(&hash(token))
-            .is_none_or(|entry| entry.conversation != conversation_id)
-        {
-            return Err(AgentError::unauthorized("Invalid memory generation context capability"));
-        }
-        Ok(())
     }
 
     fn issue_target(&self, target: GenerationTarget) -> Result<GenerationContext, AgentError> {

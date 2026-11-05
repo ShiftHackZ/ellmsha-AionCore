@@ -90,7 +90,7 @@ impl<'a> SessionContextBuilder<'a> {
                 reason: "session_only tool scope requires a native aionrs conversation".into(),
             });
         }
-        let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override)?;
+        let workspace = self.resolve_workspace(row, &agent_type, &extra, workspace_override, true)?;
         let model = provider_model_from_conversation_row(row);
         let skills = parse_string_array(extra.get("skills").cloned()).unwrap_or_default();
         let team = TeamSessionBinding::from_extra_value(&extra).map_err(|e| ConversationError::BadRequest {
@@ -129,12 +129,13 @@ impl<'a> SessionContextBuilder<'a> {
         })
     }
 
-    fn resolve_workspace(
+    pub(crate) fn resolve_workspace(
         &self,
         row: &ConversationRow,
         agent_type: &AgentType,
         extra: &serde_json::Value,
         workspace_override: Option<&str>,
+        provision: bool,
     ) -> Result<WorkspaceContext, ConversationError> {
         // Router workspaces are allocated before the concrete runtime is
         // selected. Their stable label must survive native/CLI selection.
@@ -179,8 +180,10 @@ impl<'a> SessionContextBuilder<'a> {
             .filter(|value| !value.is_empty());
 
         let Some(stored_path) = stored else {
-            std::fs::create_dir_all(&expected_auto_workspace)
-                .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+            if provision {
+                std::fs::create_dir_all(&expected_auto_workspace)
+                    .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+            }
             return Ok(WorkspaceContext {
                 path: expected_auto_workspace.to_string_lossy().into_owned(),
                 stored_path: String::new(),

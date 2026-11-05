@@ -360,6 +360,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
@@ -557,14 +558,17 @@ dependencies = [
  "base64",
  "getrandom 0.2.17",
  "hmac 0.12.1",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -863,14 +867,17 @@ dependencies = [
  "aionui-session",
  "async-trait",
  "base64",
+ "chrono",
  "futures-util",
  "proptest",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

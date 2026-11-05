@@ -25,7 +25,10 @@ impl TeamSessionService {
     ) -> Result<aionui_api_types::TeamAgentResponse, TeamError> {
         let icon = self.resolve_agent_icon(user_id, agent).await?;
         let mut response = agent.to_response_with_icon(icon);
-        response.pending_confirmations = self.pending_confirmation_count(&agent.conversation_id);
+        response.pending_confirmations = self.pending_confirmation_count(&agent.conversation_id)
+            + self
+                .conversation_port
+                .pending_host_question_count(user_id, &agent.conversation_id);
         Ok(response)
     }
 

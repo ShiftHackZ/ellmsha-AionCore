@@ -17,3 +17,16 @@ use async_trait::async_trait;
 pub trait OnConversationDelete: Send + Sync {
     async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str);
 }
+
+/// Schedules the next turn for the Team member whose Codex question was answered
+/// after its original turn finished.
+#[async_trait]
+pub trait TeamQuestionReplies: Send + Sync {
+    async fn enqueue_question_reply(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<(), String>;
+}

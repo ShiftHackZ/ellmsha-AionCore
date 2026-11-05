@@ -114,6 +114,29 @@ pub struct StreamRelay {
     defer_clean_terminal_errors: bool,
 }
 
+fn wire_stream_event(event: &AgentStreamEvent) -> Result<serde_json::Value, serde_json::Error> {
+    let mut value = serde_json::to_value(event)?;
+    // External ACP fields retain the existing snake_case wire contract. The new
+    // typed question DTO, including secret masking, is identical on REST and WS.
+    let questions = if matches!(
+        event,
+        AgentStreamEvent::AcpPermission(_) | AgentStreamEvent::Permission(_)
+    ) {
+        ["/data/tool_call/questions", "/data/questions"]
+            .into_iter()
+            .find_map(|path| value.pointer(path).cloned().map(|q| (path, q)))
+    } else {
+        None
+    };
+    normalize_keys_to_snake_case(&mut value);
+    if let Some((path, questions)) = questions
+        && let Some(v) = value.pointer_mut(path)
+    {
+        *v = questions;
+    }
+    Ok(value)
+}
+
 impl StreamRelay {
     pub fn new(
         conversation_id: String,
@@ -175,6 +198,27 @@ impl StreamRelay {
     pub fn with_defer_clean_terminal_errors(mut self, enabled: bool) -> Self {
         self.defer_clean_terminal_errors = enabled;
         self
+    }
+
+    /// A host read happens before provider dispatch. Its receipt belongs in the
+    /// chat, but is not a provider side effect that would prevent safe retries.
+    pub(crate) async fn record_rules_read(&self, receipt: serde_json::Value) {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+        if receipt["mode"] == "unchanged" {
+            return;
+        }
+        let call_id = format!("host-rules-{}", ConversationService::mint_msg_id());
+        let tool = ToolCallEventData {
+            call_id: call_id.clone(),
+            name: "tdai_rules_read".into(),
+            args: json!({}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some(receipt.to_string()),
+            description: None,
+        };
+        self.adapter.persist_tool_call(&tool).await;
+        self.forward_to_websocket_with_msg_id(&call_id, &AgentStreamEvent::ToolCall(tool));
     }
 
     /// Run the relay loop. Consumes `self` and runs until the agent stream ends.
@@ -739,17 +783,13 @@ impl StreamRelay {
 
     #[tracing::instrument(skip_all)]
     fn forward_to_websocket_with_msg_id(&self, msg_id: &str, event: &AgentStreamEvent) {
-        let mut event_data = match serde_json::to_value(event) {
+        let event_data = match wire_stream_event(event) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %ErrorChain(&e), "Failed to serialize agent event for WebSocket");
                 return;
             }
         };
-        // Nested ACP SDK payloads serialise as camelCase on their own;
-        // force every object key down the tree to snake_case so the
-        // wire contract stays uniform.
-        normalize_keys_to_snake_case(&mut event_data);
 
         let payload = json!({
             "conversation_id": self.conversation_id,
@@ -960,6 +1000,18 @@ impl ISkillLoadService for SharedSkillResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_question_wire_preserves_mask_and_selection_flags() {
+        let evt = AgentStreamEvent::Permission(
+            json!({"call_id":"fixture","questions":[{"id":"id","multiSelect":true,"isSecret":true,"isOther":true}]}),
+        );
+        let wire = wire_stream_event(&evt).unwrap();
+        let q = &wire["data"]["questions"][0];
+        assert!(q["multiSelect"] == true && q["isSecret"] == true && q["isOther"] == true);
+        assert!(q.get("is_secret").is_none());
+    }
+
     use crate::stream_persistence::StreamPersistenceAdapter;
     use aionui_ai_agent::AgentError;
     use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData, ThinkingEventData};
@@ -2381,6 +2433,42 @@ mod tests {
     }
 
     // ── Tool persistence tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_rules_read_appears_before_provider_output_and_survives_reload() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let relay = StreamRelay::new(
+            "chat".into(),
+            "reply".into(),
+            "turn".into(),
+            "owner".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let mut ws = bus.subscribe();
+        let receipt = json!({"mode":"full","revision":"source-hash","complete":true});
+        relay.record_rules_read(receipt.clone()).await;
+        relay
+            .record_rules_read(json!({"mode":"unchanged","revision":"source-hash"}))
+            .await;
+        let (tx, rx) = broadcast::channel(8);
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        assert!(relay.consume(rx).await.attempt.safe_to_auto_replay());
+        let event = ws.try_recv().unwrap();
+        assert_eq!(event.name, "message.stream");
+        assert_eq!(event.data["data"]["name"], "tdai_rules_read");
+        assert_eq!(event.data["data"]["args"], json!({}));
+        assert_eq!(event.data["data"]["status"], "completed");
+        let rows = repo.take_inserts();
+        assert_eq!(rows.iter().filter(|row| row.r#type == "tool_call").count(), 1);
+        let tool = rows.iter().find(|row| row.r#type == "tool_call").unwrap();
+        assert_eq!(event.data["msg_id"], tool.id);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool.content).unwrap()["output"],
+            receipt.to_string()
+        );
+    }
 
     #[tokio::test]
     async fn run_tool_call_persists_message() {

@@ -182,18 +182,33 @@ pub struct PreparedAgentMessage {
     /// Native requests can project current guidance without saving another copy
     /// in conversation history. This never comes from the client message DTO.
     native_guidance: Option<String>,
+    rules_delivery: Option<crate::capability::tencent_memory::RulesDelivery>,
 }
 
 impl PreparedAgentMessage {
+    /// Auditable host operation. Does not contain rule bodies or the user task.
+    pub fn rules_read_receipt(&self) -> Option<serde_json::Value> {
+        self.rules_delivery.as_ref().map(|d| d.receipt.clone())
+    }
+
     pub async fn send(self) -> Result<(), AgentSendError> {
-        match &self.agent {
+        if let Some(delivery) = &self.rules_delivery {
+            delivery.check_binding().map_err(AgentSendError::from_agent_error)?;
+        }
+        let result = match &self.agent {
             AgentInstance::Aionrs(manager) => {
                 manager
                     .send_message_with_guidance(self.data, self.native_guidance)
                     .await
             }
             _ => self.agent.as_task().send_message(self.data).await,
+        };
+        if result.is_ok()
+            && let Some(delivery) = self.rules_delivery
+        {
+            delivery.acknowledge();
         }
+        result
     }
 }
 
@@ -259,19 +274,46 @@ impl AgentInstance {
             Self::Mock(mock) => mock.enforce_memory_preflight(),
             _ => true,
         };
-        let rules = if enforce_rules {
-            crate::capability::tencent_memory::required_rules_from_env(self.conversation_id(), self.workspace())
-                .await
-                .map_err(AgentSendError::from_agent_error)?
+        let rules_delivery = if enforce_rules {
+            crate::capability::tencent_memory::prepare_rules_delivery(
+                self.conversation_id(),
+                self.workspace(),
+                matches!(self, Self::Aionrs(_)),
+            )
+            .await
+            .map_err(AgentSendError::from_agent_error)?
         } else {
             None
         };
+        let mut rules = rules_delivery.as_ref().map(|d| d.text.clone());
+        let native_skill_dirs = match self {
+            Self::Acp(agent) => agent.native_skill_dirs().to_vec(),
+            Self::Session(agent) => agent.native_skill_dirs(),
+            _ => vec![],
+        };
+        if let Some(skills) = crate::capability::tencent_memory::project_skills_for_turn(
+            self.conversation_id(),
+            &data.content,
+            self.workspace(),
+            native_skill_dirs,
+        )
+        .await
+        .map_err(AgentSendError::from_agent_error)?
+        {
+            let context = rules.get_or_insert_with(String::new);
+            context.push_str("\n\n");
+            context.push_str(&skills);
+        }
         // The conversation has already persisted the user's original message.
         // Only the transient provider input receives retrieved memory, covering
         // ordinary, scheduled and conversation-backed delegated turns alike.
-        if let Some(memory) =
-            crate::capability::tencent_memory::recall_from_env(self.conversation_id(), self.workspace(), &data.content)
-                .await
+        if let Some(memory) = crate::capability::tencent_memory::recall_from_env(
+            self.conversation_id(),
+            self.workspace(),
+            &data.content,
+            rules_delivery.as_ref().and_then(|d| d.receipt["sources"].as_object()),
+        )
+        .await
         {
             if memory.status == "ready" {
                 tracing::info!(
@@ -302,8 +344,7 @@ impl AgentInstance {
         let native_guidance = if matches!(self, Self::Aionrs(_)) {
             rules
         } else {
-            // External agents own their history. Keep their full fresh guidance
-            // in the turn payload; do not guess whether compaction retained it.
+            // External sessions retain acknowledged tool results in their transcript.
             if let Some(rules) = rules {
                 data.content = format!("{rules}\n\n{}", data.content);
             }
@@ -313,6 +354,7 @@ impl AgentInstance {
             agent: self.clone(),
             data,
             native_guidance,
+            rules_delivery,
         })
     }
 
@@ -373,17 +415,22 @@ impl AgentInstance {
     }
 
     /// Submit a confirmation response for a pending tool call.
-    pub fn confirm(
+    pub async fn confirm(
         &self,
         msg_id: &str,
         call_id: &str,
         data: serde_json::Value,
         always_allow: bool,
     ) -> Result<(), AgentError> {
+        if data.get("answers").is_some() && !matches!(self, Self::Session(_)) {
+            return Err(AgentError::bad_request(
+                "This provider cannot accept structured answers for this request",
+            ));
+        }
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
-            Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow).await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -643,7 +690,7 @@ mod cc_switch_model_merge_tests {
 }
 
 #[cfg(test)]
-mod aionrs_config_option_tests {
+pub(crate) mod aionrs_config_option_tests {
     use std::sync::Arc;
 
     use aionui_api_types::ConfigOptionConfirmation;
@@ -651,7 +698,7 @@ mod aionrs_config_option_tests {
     use super::*;
     use crate::types::AionrsResolvedConfig;
 
-    pub(super) fn make_test_config() -> AionrsResolvedConfig {
+    pub(crate) fn make_test_config() -> AionrsResolvedConfig {
         AionrsResolvedConfig {
             host_delegation: false,
             mcp_approval_bindings: Default::default(),

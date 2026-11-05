@@ -406,6 +406,11 @@ impl TeamProjectionMessageStore for TeamConversationAdapters {
 
 #[async_trait]
 impl TeamConversationProvisioningPort for TeamConversationAdapters {
+    fn pending_host_question_count(&self, user_id: &str, conversation_id: &str) -> usize {
+        self.conversation_service
+            .pending_host_question_count(user_id, conversation_id)
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,

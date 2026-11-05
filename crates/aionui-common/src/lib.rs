@@ -3,6 +3,8 @@
 //! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
 pub mod constants;
 pub mod mcp_approvals;
+pub mod project_skills;
+pub mod project_sources;
 pub mod user_paths;
 
 mod case_convert;
@@ -30,9 +32,12 @@ pub use enums::{
 pub use error::{
     ApiError, ApiErrorLogContext, ErrorChain, WorkspacePathValidationError, validate_workspace_path_availability,
 };
-pub use hooks::OnConversationDelete;
+pub use hooks::{OnConversationDelete, TeamQuestionReplies};
 pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed_id, generate_short_id};
 pub use pagination::PaginatedResult;
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType, VersionInfo};
 pub use user_paths::{UserDirNameError, user_dir_name};
+
+mod user_question;
+pub use user_question::{QuestionAnswer, QuestionOption, UserQuestion};

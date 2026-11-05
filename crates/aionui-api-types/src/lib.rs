@@ -25,6 +25,7 @@ mod extension;
 mod figma;
 mod file;
 pub use figma::*;
+mod chat_rules;
 mod lifecycle;
 mod mcp;
 mod memory_artifact;
@@ -45,6 +46,10 @@ mod team_mcp;
 mod team_tools;
 mod websocket;
 
+pub use chat_rules::{
+    ChatRule, ChatRuleMutation, ChatRuleScope, ChatRulesResponse, ProjectFileRule, ProjectFileRuleMutation,
+    ProjectRuleFile, ProjectRuleFiles,
+};
 pub use memory_artifact::{MemoryArtifactQuery, MemoryArtifactResponse};
 
 pub use acp::{
@@ -152,7 +157,7 @@ pub use office::{
 };
 pub use project::{
     AttachFolderRequest, MemoryProjectContext, MemoryProjectRequest, ProjectDetailResponse, ProjectEntry,
-    ProjectExplorer,
+    ProjectExplorer, ProjectSkillSummary, ProjectWorkspaceSelection,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,

@@ -3,6 +3,13 @@ use std::collections::BTreeMap;
 
 use super::*;
 
+mod editor;
+mod tool;
+pub use editor::{mutate_chat_rule, read_chat_rules};
+pub use tool::invoke_rules_tool;
+pub(crate) use tool::{RulesDelivery, prepare_rules_delivery};
+pub(super) use tool::{render_delivery, revisions};
+
 const PAGE: usize = super::RULE_PAGE_SIZE;
 const MAX_RULES: usize = 512;
 const MAX_BYTES: usize = 256 * 1024;
@@ -20,10 +27,12 @@ async fn inventory(
     scopes: &[String],
     aliases: &[String],
     local_only: bool,
-) -> Result<BTreeMap<String, Value>, crate::AgentError> {
+    max_rules: usize,
+) -> Result<(BTreeMap<String, Value>, Option<(String, bool)>), crate::AgentError> {
     let mut records = BTreeMap::new();
     let mut offset = 0;
     let mut expected_total = None;
+    let mut revision = None;
     loop {
         let mut body = rule_body(&plan("project guidance", None), scopes, aliases);
         body["guidance_inventory"] = json!(true);
@@ -41,12 +50,26 @@ async fn inventory(
         if local_only && page.get("guidance_locality").and_then(Value::as_str) != Some("local") {
             return Err(blocked("memory locality is unverified for local-only routing"));
         }
+        let page_revision = page
+            .get("guidance_revision")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|revision| {
+                (
+                    revision.to_owned(),
+                    page.get("guidance_write_version").and_then(Value::as_u64) == Some(1),
+                )
+            });
+        if offset != 0 && revision != page_revision {
+            return Err(blocked("guidance changed while reading pages"));
+        }
+        revision = page_revision;
         let total = page
             .get("total_candidates")
             .and_then(Value::as_u64)
             .ok_or_else(|| blocked("missing guidance count"))?;
-        if total > MAX_RULES as u64 || expected_total.is_some_and(|previous| previous != total) {
-            return Err(blocked("guidance inventory changed or exceeds 512 records"));
+        if total > max_rules as u64 || expected_total.is_some_and(|previous| previous != total) {
+            return Err(blocked("guidance inventory changed or exceeds the record limit"));
         }
         expected_total = Some(total);
         let items = page
@@ -70,7 +93,7 @@ async fn inventory(
             if records.len() as u64 != total || !page.get("next_offset").is_none_or(Value::is_null) {
                 return Err(blocked("guidance count mismatch"));
             }
-            return Ok(records);
+            return Ok((records, revision));
         }
         let next = page
             .get("next_offset")
@@ -83,12 +106,65 @@ async fn inventory(
     }
 }
 
-pub(super) async fn load(
+fn applicable_source(path: &str, scope: &str, scopes: &[String], aliases: &[String]) -> bool {
+    if path.contains(['\0', '\\'])
+        || !path.ends_with(".md")
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        return false;
+    }
+    let path = path.to_ascii_lowercase();
+    let global = ["knowledge/global/", "global/", "v2/wiki/", "wiki/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        || path.contains("/global-rules/");
+    if global || scope == "global" {
+        return global && scope == "global";
+    }
+    if scopes.iter().any(|id| path.contains(&format!("/{id}/"))) {
+        return true;
+    }
+    let Some(id) = path
+        .strip_prefix("v2/projects/")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(id, _)| id)
+    else {
+        return false;
+    };
+    static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-v?\d+(?:-\d+)*$").expect("static alias regex"));
+    aliases.iter().any(|alias| {
+        let normalized = slug(alias);
+        [normalized.as_str(), VERSION.replace(&normalized, "").as_ref()]
+            .into_iter()
+            .any(|name| {
+                name.len() >= 4
+                    && (id == name
+                        || id
+                            .strip_prefix(name)
+                            .and_then(|rest| rest.strip_prefix(['-', '_']))
+                            .is_some_and(|tail| {
+                                tail.split(['-', '_'])
+                                    .all(|part| part.len() >= 2 && part.bytes().all(|c| c.is_ascii_hexdigit()))
+                            }))
+            })
+    })
+}
+
+#[derive(Clone)]
+pub(super) struct VerifiedSource {
+    rule: Value,
+    record: Value,
+}
+
+pub(super) type SourceCache = Arc<Mutex<Option<(String, Vec<VerifiedSource>)>>>;
+
+async fn read_sources(
     config: &MemoryConfig,
     scope: &MemoryRecallScope,
     workspace: &str,
     local_only: bool,
-) -> Result<String, crate::AgentError> {
+    editing: bool,
+) -> Result<(String, Vec<VerifiedSource>, Option<String>), crate::AgentError> {
     if local_only
         && !reqwest::Url::parse(&config.gateway_url)
             .ok()
@@ -102,11 +178,63 @@ pub(super) async fn load(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| blocked("client unavailable"))?;
-    let (project, scopes, aliases) = derive_aliases(scope, workspace);
-    let before = inventory(&client, config, &scopes, &aliases, local_only).await?;
+    let (project, scopes, aliases) = if scope.project_id.is_some() && !scope.temporary_project {
+        derive_aliases(scope, workspace)
+    } else {
+        // A temporary working folder can itself be nested in another project's Git tree.
+        (project_scope(workspace), vec![], vec![])
+    };
+    // The panel can repair an oversized set. Provider dispatch retains its original hard limits.
+    let max_rules = if editing { MAX_RULES * 2 } else { MAX_RULES };
+    let max_bytes = if editing { MAX_BYTES * 2 } else { MAX_BYTES };
+    let before = inventory(&client, config, &scopes, &aliases, local_only, max_rules).await?;
+    let session_cache = scope.conversation_id.as_ref().and_then(|id| {
+        SESSION_RECALL
+            .get(id)
+            .filter(|entry| entry.scope == *scope)
+            .map(|s| s.rule_sources.clone())
+    });
+    let mut paths = std::collections::BTreeSet::new();
+    if before
+        .0
+        .values()
+        .filter_map(|record| record["source_path"].as_str())
+        .any(|path| !paths.insert(path))
+    {
+        return Err(blocked("multiple active records refer to the same guidance source"));
+    }
+    // A revision is the gateway's scenario epoch. Never trust an old snapshot
+    // without a fresh authenticated inventory and exactly the same indexed rows.
+    let cache_key = if !editing && before.1.is_some() {
+        let identity = serde_json::to_vec(&(
+            &config.gateway_url,
+            &config.service_id,
+            &config.team_id,
+            &config.user_id,
+            &config.agent_id,
+            &config.gateway_api_key,
+            local_only,
+            &project,
+            &before,
+        ))
+        .map_err(|_| blocked("invalid guidance inventory"))?;
+        Some(format!("{:x}", Sha256::digest(identity)))
+    } else {
+        None
+    };
+    if let (Some(cache), Some(key)) = (&session_cache, &cache_key) {
+        let cache = cache.lock().map_err(|_| blocked("guidance cache unavailable"))?;
+        if let Some((_, sources)) = cache.as_ref().filter(|(old, _)| old == key) {
+            return Ok((
+                project,
+                sources.clone(),
+                before.1.and_then(|(rev, writable)| writable.then_some(rev)),
+            ));
+        }
+    }
     let mut rules = Vec::new();
     let mut bytes = 0;
-    for item in before.values() {
+    for item in before.0.values() {
         if item.get("guidance_status").and_then(Value::as_str) != Some("active")
             || item.get("source_status").and_then(Value::as_str) != Some("active")
             || !matches!(
@@ -126,6 +254,9 @@ pub(super) async fn load(
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
             .ok_or_else(|| blocked("guidance source missing"))?;
+        if !applicable_source(path, guidance_scope, &scopes, &aliases) {
+            return Err(blocked("rule source outside this chat's guidance scope"));
+        }
         let source = call(&client, config, "scenario/read", json!({"path": path}))
             .await
             .map_err(blocked)?;
@@ -142,74 +273,63 @@ pub(super) async fn load(
         let rule = json!({"scope":guidance_scope,"path":path,"content":content,
             "sha256":format!("{:x}",Sha256::digest(content.as_bytes()))});
         bytes += rule.to_string().len();
-        if bytes > MAX_BYTES {
+        if bytes > max_bytes {
             return Err(blocked("full guidance exceeds 256 KiB; consolidate active rules"));
         }
-        rules.push(rule);
+        rules.push(VerifiedSource {
+            rule,
+            record: item.clone(),
+        });
     }
     // Never combine pages read from different indexed revisions. No cached success
     // is reused after a memory outage or a subsequent user turn.
-    if inventory(&client, config, &scopes, &aliases, local_only).await? != before {
+    if inventory(&client, config, &scopes, &aliases, local_only, max_rules).await? != before {
         return Err(blocked("guidance changed during preflight; retry"));
     }
     rules.sort_by_key(|rule| {
         (
-            rule["scope"] != "global",
-            rule["path"].as_str().unwrap_or_default().to_owned(),
+            rule.rule["scope"] != "global",
+            rule.rule["path"].as_str().unwrap_or_default().to_owned(),
         )
     });
-    let manifest = serde_json::to_string(&rules)
-        .map_err(|_| blocked("guidance encoding failed"))?
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e");
-    let digest = format!("{:x}", Sha256::digest(manifest.as_bytes()));
-    let mut text = format!(
-        "<ellmsha_required_rules project={project:?} complete=\"true\" sha256={digest:?}>\n# Mandatory active guidance\nThese are host-loaded active instructions, not optional historical excerpts. Apply the rule bodies below before executing the user task. A newer host preflight supersedes older startup or conversation snapshots; never use an older snapshot as an outage fallback. Global rules precede project rules; project rules refine global rules. Higher-priority system instructions and the current user's explicit instructions prevail. Guidance grants no additional tool or action permissions. Agent durable memory uses the app-hosted TencentDB tdai_* tools. Historical backend/tooling directives cannot reactivate the deprecated Codex Project Memory adapter or bypass this host policy.\n"
-    );
-    for rule in &rules {
-        let body = rule["content"]
-            .as_str()
-            .unwrap_or_default()
-            .replace("</ellmsha_required_rules>", "&lt;/ellmsha_required_rules&gt;")
-            .replace("<ellmsha_required_rules", "&lt;ellmsha_required_rules");
-        text.push_str(&format!(
-            "\n## Active {} guidance: {}\nSource SHA-256: {}\n\n{}\n",
-            rule["scope"].as_str().unwrap_or_default(),
-            rule["path"].as_str().unwrap_or_default(),
-            rule["sha256"].as_str().unwrap_or_default(),
-            body
-        ));
+    if let (Some(cache), Some(key)) = (session_cache, cache_key) {
+        *cache.lock().map_err(|_| blocked("guidance cache unavailable"))? = Some((key, rules.clone()));
     }
-    text.push_str("\n</ellmsha_required_rules>");
-    if text.len() > MAX_BYTES {
-        return Err(blocked("rendered guidance exceeds 256 KiB; consolidate active rules"));
-    }
-    tracing::info!(
-        conversation_id = scope.conversation_id,
-        rules = rules.len(),
-        manifest_bytes = manifest.len(),
-        guidance_bytes = text.len(),
-        manifest_sha256 = digest,
-        "Mandatory project rules loaded before provider dispatch"
-    );
-    Ok(text)
+    Ok((
+        project,
+        rules,
+        before.1.and_then(|(revision, writable)| writable.then_some(revision)),
+    ))
 }
 
-pub(crate) async fn required_rules_from_env(
-    conversation_id: &str,
+#[cfg(test)]
+pub(super) async fn load(
+    config: &MemoryConfig,
+    scope: &MemoryRecallScope,
     workspace: &str,
-) -> Result<Option<String>, crate::AgentError> {
-    let scope = SESSION_RECALL
-        .get(conversation_id)
-        .map(|entry| entry.scope.clone())
-        .ok_or_else(|| blocked("host project binding unavailable"))?;
-    if scope.isolated_test {
-        return Ok(None);
-    }
-    let config = load_config().ok_or_else(|| blocked("memory configuration unavailable"))?;
-    required_rules_for_scope(&config, &scope, workspace).await.map(Some)
+    local_only: bool,
+) -> Result<String, crate::AgentError> {
+    let snapshot = tool::read_snapshot(config, scope, workspace, local_only).await?;
+    render_delivery(&snapshot, "full", snapshot["rules"].as_array().unwrap(), &[], true)
 }
 
+pub(crate) fn startup_rules_from_env(conversation_id: &str) -> Result<(), crate::AgentError> {
+    let mut entry = SESSION_RECALL
+        .get_mut(conversation_id)
+        .ok_or_else(|| blocked("host project binding unavailable"))?;
+    if entry.scope.isolated_test {
+        return Ok(());
+    }
+    if load_config().is_none() {
+        return Err(blocked("memory configuration unavailable"));
+    }
+    // A fresh or resumed worker has a different transcript. Defer all rule reads
+    // to the actual tool invocation, and rehydrate on its first real task.
+    entry.delivered_rules = Arc::default();
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) async fn required_rules_for_scope(
     config: &MemoryConfig,
     scope: &MemoryRecallScope,
@@ -229,10 +349,23 @@ pub(crate) struct NativeChildRules {
 #[async_trait::async_trait]
 impl aion_agent::spawner::ChildPromptPreflight for NativeChildRules {
     async fn instructions(&self) -> Result<String, String> {
-        required_rules_from_env(&self.conversation_id, &self.workspace)
+        let session = SESSION_RECALL
+            .get(&self.conversation_id)
+            .map(|s| s.clone())
+            .ok_or_else(|| blocked("host project binding unavailable").to_string())?;
+        let snapshot = invoke_rules_tool("tdai_rules_read", &json!({}), &session.scope, &self.workspace, false)
             .await
-            .map(|rules| rules.unwrap_or_default())
-            .map_err(|error| error.to_string())
+            .map_err(|e| e.to_string())?;
+        let mut text = tool::render_delivery(&snapshot, "full", snapshot["rules"].as_array().unwrap(), &[], true)
+            .map_err(|e| e.to_string())?;
+        if let Some(skills) = super::project_skills_for_turn(&self.conversation_id, "", &self.workspace, vec![])
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            text.push_str("\n\n");
+            text.push_str(&skills);
+        }
+        Ok(text)
     }
 }
 
@@ -244,7 +377,7 @@ mod tests {
         matchers::{body_partial_json, method, path},
     };
 
-    fn config(server: &MockServer) -> MemoryConfig {
+    pub(super) fn config(server: &MockServer) -> MemoryConfig {
         MemoryConfig {
             gateway_url: server.uri(),
             service_id: "fixture".into(),
@@ -254,11 +387,11 @@ mod tests {
             gateway_api_key: String::new(),
         }
     }
-    fn record(id: usize) -> Value {
-        json!({"id":id.to_string(),"guidance_status":"active","source_status":"active","type":"instruction","guidance_scope":if id == 0 {"global"} else {"project"},"source_path":format!("knowledge/fixture/rule-{id}.md")})
+    pub(super) fn record(id: usize) -> Value {
+        json!({"id":id.to_string(),"guidance_status":"active","source_status":"active","type":"instruction","guidance_scope":if id == 0 {"global"} else {"project"},"source_path":format!("knowledge/{}/rule-{id}.md", if id==0 {"global".to_owned()} else {project_scope("/tmp/fixture")})})
     }
-    fn page(items: Vec<Value>, total: usize, next: Option<usize>) -> Value {
-        json!({"code":0,"data":{"guidance_inventory":true,"degraded":false,"returned":items.len(),"items":items,"total_candidates":total,"complete":next.is_none(),"next_offset":next}})
+    pub(super) fn page(items: Vec<Value>, total: usize, next: Option<usize>) -> Value {
+        json!({"code":0,"data":{"guidance_inventory":true,"guidance_revision":"fixture-rev","guidance_write_version":1,"degraded":false,"returned":items.len(),"items":items,"total_candidates":total,"complete":next.is_none(),"next_offset":next}})
     }
     #[tokio::test]
     async fn loads_every_page_and_full_source_with_global_rules_first() {
@@ -279,14 +412,22 @@ mod tests {
                 .await;
         }
         for id in 0..19 {
-            let path = format!("knowledge/fixture/rule-{id}.md");
+            let path = record(id)["source_path"].as_str().unwrap().to_owned();
             Mock::given(method("POST")).and(path_match()).and(body_partial_json(json!({"path":path})))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code":0,"data":{"path":path,"content":format!("{}FULL_END_{id}", "rule body ".repeat(200))}})))
                 .expect(1).mount(&server).await;
         }
-        let text = load(&config(&server), &MemoryRecallScope::default(), "/tmp/fixture", false)
-            .await
-            .unwrap();
+        let text = load(
+            &config(&server),
+            &MemoryRecallScope {
+                project_id: Some("fixture".into()),
+                ..Default::default()
+            },
+            "/tmp/fixture",
+            false,
+        )
+        .await
+        .unwrap();
         assert!(text.starts_with("<ellmsha_required_rules"));
         for id in 0..19 {
             assert!(text.contains(&format!("FULL_END_{id}")));
@@ -298,6 +439,23 @@ mod tests {
         path("/v3/scenario/read")
     }
 
+    #[tokio::test]
+    async fn distinct_records_for_the_same_active_source_fail_before_body_reads() {
+        let server = MockServer::start().await;
+        let first = record(0);
+        let mut duplicate = first.clone();
+        duplicate["id"] = json!("other-record");
+        Mock::given(path("/v3/atomic/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![first, duplicate], 2, None)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = load(&config(&server), &MemoryRecallScope::default(), "/tmp/fixture", false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("same guidance source"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
     #[tokio::test]
     async fn rejects_incomplete_degraded_duplicate_unacknowledged_or_changed_pages() {
         for kind in ["degraded", "cursor", "duplicate", "count", "old-server", "changed"] {
@@ -403,10 +561,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_host_binding_never_silently_skips_rules() {
-        let error = required_rules_from_env("not-a-registered-chat", "/tmp/fixture")
+    async fn required_provider_preflight_refreshes_only_applicable_unmanaged_repository_rules() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/atomic/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(vec![], 0, None)))
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().canonicalize().unwrap();
+        let file = cwd.join("AGENTS.md");
+        let text = |rule: &str| {
+            format!(
+                "<!-- BEGIN PROJECT-MEMORY MANAGED BLOCK -->\nHistorical BMAD specification\n<!-- END PROJECT-MEMORY MANAGED BLOCK -->\n# Local instructions\n\n{rule}\n"
+            )
+        };
+        std::fs::write(&file, text("First instruction")).unwrap();
+        let scope = MemoryRecallScope {
+            project_id: Some("fixture-project".into()),
+            roots: vec![cwd.display().to_string()],
+            ..Default::default()
+        };
+        let first = required_rules_for_scope(&config(&server), &scope, cwd.to_str().unwrap())
             .await
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(first.matches("First instruction").count(), 1);
+        assert!(!first.contains("Historical BMAD specification"));
+        std::fs::write(&file, text("Second instruction")).unwrap();
+        let fresh = required_rules_for_scope(&config(&server), &scope, cwd.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(fresh.contains("Second instruction") && !fresh.contains("First instruction"));
+    }
+
+    #[tokio::test]
+    async fn missing_host_binding_never_silently_skips_rules() {
+        let error = startup_rules_from_env("not-a-registered-chat").unwrap_err();
         assert!(error.to_string().contains("host project binding unavailable"));
     }
 }

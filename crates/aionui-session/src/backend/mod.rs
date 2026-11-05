@@ -12,6 +12,7 @@ mod acp_conn;
 mod antigravity;
 mod claude_conn;
 mod codex_conn;
+mod codex_elicitation;
 mod codex_mcp_approval;
 mod conversation_session;
 mod orchestrator;
@@ -105,6 +106,14 @@ pub trait SessionBackend: Send + Sync {
     /// SessionBackend is routed into `AgentInstance::Session` (today only claude/codex
     /// are; opencode/gemini/hermes still use the legacy `AgentInstance::Acp` path,
     /// which recovers via its own `permission_router`).
+    /// An async Codex question is an assistant message, not a reverse RPC.
+    /// Steer an active turn (wait for provider acknowledgement), or let the
+    /// conversation service submit the answer as an ordinary new user turn.
+    async fn steer_async_question_reply(&self, _id: &str, _text: &str) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+    fn finish_async_question(&self, _call_id: &str) {}
+
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         Vec::new()
     }
@@ -247,6 +256,9 @@ pub struct SessionConfig {
     pub mcp_approval_store: Option<aionui_common::mcp_approvals::McpApprovalStore>,
     /// Isolated stateless generation: no application MCP, skills, or tool workflow.
     pub generation_only: bool,
+    /// The eLLMsha chat host supplies repository instructions through its scoped rules tool.
+    /// Standalone adapter consumers retain the CLI's own discovery defaults.
+    pub host_manages_project_instructions: bool,
     /// Structured output for the generation-only Codex turn.
     pub generation_response_schema: Option<serde_json::Value>,
     pub cwd: Option<String>,
