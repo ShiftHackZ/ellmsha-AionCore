@@ -157,8 +157,8 @@ impl WorkerTaskManagerImpl {
             scopes.push(RuntimeTokenScope::RouterCall);
         }
         let issue = service.issue(
-            options.context.conversation.user_id.clone(),
-            options.context.conversation.conversation_id.clone(),
+            &options.context.conversation.user_id,
+            &options.context.conversation.conversation_id,
             TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             scopes,
         );
@@ -170,18 +170,38 @@ impl WorkerTaskManagerImpl {
             .context
             .runtime_env
             .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), issue.token.clone()));
-        if host_router {
+        {
             let servers = match &mut options.context.kind {
                 crate::session_context::AgentSessionKind::Aionrs(ctx) => &mut ctx.config.session_mcp_servers,
                 crate::session_context::AgentSessionKind::Acp(ctx) => &mut ctx.config.session_mcp_servers,
                 crate::session_context::AgentSessionKind::Antigravity(ctx) => &mut ctx.config.session_mcp_servers,
             };
-            for server in servers
-                .iter_mut()
-                .filter(|s| s.id == "ellmsha-router" && s.name == "ellmsha-router")
-            {
+            for server in servers.iter_mut().filter(|s| {
+                (s.id == "ellmsha-router" && s.name == "ellmsha-router")
+                    || (s.id == "ellmsha-secrets" && s.name == "ellmsha-secrets")
+            }) {
                 if let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &mut server.transport {
-                    env.insert(AIONUI_RUNTIME_TOKEN_ENV.into(), issue.token.clone());
+                    let token = if server.id == "ellmsha-secrets" {
+                        let Some(binding) = env.get("AIONUI_SECRETS_BINDING") else {
+                            env.remove(AIONUI_RUNTIME_TOKEN_ENV);
+                            service.invalidate_secrets(
+                                &options.context.conversation.user_id,
+                                &options.context.conversation.conversation_id,
+                            );
+                            continue;
+                        };
+                        service
+                            .issue_secrets(
+                                &options.context.conversation.user_id,
+                                &options.context.conversation.conversation_id,
+                                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+                                binding.clone(),
+                            )
+                            .token
+                    } else {
+                        issue.token.clone()
+                    };
+                    env.insert(AIONUI_RUNTIME_TOKEN_ENV.into(), token);
                 }
             }
         }
@@ -938,6 +958,88 @@ mod tests {
                 "user-1",
                 "conv-1",
                 RuntimeTokenScope::TeamCall,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn refreshing_managed_secrets_never_inherits_the_general_helper_capability() {
+        let tokens = Arc::new(RuntimeTokenService::new());
+        let manager = make_manager().with_runtime_token_service(tokens.clone());
+        let mut options = make_options("secret-chat");
+        options.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+        if let AgentSessionKind::Acp(ctx) = &mut options.context.kind {
+            ctx.config.session_mcp_servers.push(aionui_api_types::SessionMcpServer {
+                id: "ellmsha-secrets".into(),
+                name: "ellmsha-secrets".into(),
+                transport: aionui_api_types::SessionMcpTransport::Stdio {
+                    command: "synthetic".into(),
+                    args: vec!["mcp-secrets-stdio".into()],
+                    env: std::collections::HashMap::from([("AIONUI_SECRETS_BINDING".into(), "vault-binding".into())]),
+                },
+                auto_approve_in_unattended: false,
+                approval_identity: Some("secrets:vault-binding".into()),
+            });
+        }
+        manager.refresh_runtime_token_for_new_task(&mut options);
+        let helper = options
+            .context
+            .runtime_env
+            .iter()
+            .find(|(key, _)| key == AIONUI_RUNTIME_TOKEN_ENV)
+            .unwrap()
+            .1
+            .clone();
+        let AgentSessionKind::Acp(ctx) = &options.context.kind else {
+            panic!("ACP fixture")
+        };
+        let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &ctx.config.session_mcp_servers[0].transport
+        else {
+            panic!("stdio fixture")
+        };
+        let secret = env[AIONUI_RUNTIME_TOKEN_ENV].clone();
+        assert_ne!(helper, secret);
+        assert_eq!(
+            tokens
+                .validate(
+                    Some(&helper),
+                    "user-1",
+                    "secret-chat",
+                    RuntimeTokenScope::SecretsCall,
+                    TEAM_RUNTIME_TOKEN_SESSION_GENERATION
+                )
+                .unwrap_err(),
+            RuntimeTokenError::ScopeMissing
+        );
+        assert_eq!(
+            tokens
+                .validate(
+                    Some(&secret),
+                    "user-1",
+                    "secret-chat",
+                    RuntimeTokenScope::ConversationHelper,
+                    TEAM_RUNTIME_TOKEN_SESSION_GENERATION
+                )
+                .unwrap_err(),
+            RuntimeTokenError::ScopeMissing
+        );
+        manager.refresh_runtime_token_for_new_task(&mut options);
+        tokens
+            .validate(
+                Some(&helper),
+                "user-1",
+                "secret-chat",
+                RuntimeTokenScope::ConversationHelper,
+                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            )
+            .unwrap();
+        tokens
+            .validate(
+                Some(&secret),
+                "user-1",
+                "secret-chat",
+                RuntimeTokenScope::SecretsCall,
                 TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
             )
             .unwrap();

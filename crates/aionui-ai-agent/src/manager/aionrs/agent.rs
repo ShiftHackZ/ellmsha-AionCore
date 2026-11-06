@@ -160,7 +160,8 @@ impl AionrsAgentManager {
         resume_session: Option<Session>,
         child_router: Option<Arc<dyn aion_agent::spawner::ChildRouter>>,
     ) -> Result<Self, AgentError> {
-        let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
+        let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128)
+            .with_sensitive_tools(config_extra.extra_mcp_servers.values().any(|server| server.sensitive));
         let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;

@@ -322,6 +322,12 @@ pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
 /// Single message object returned in API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageResponse {
+    /// Monotonic canonical content version; authoritative edits may shorten content.
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub redacted: bool,
+
     pub id: String,
     pub conversation_id: String,
     pub msg_id: Option<String>,
@@ -826,6 +832,9 @@ mod tests {
     #[test]
     fn serialize_message_response_snake_case() {
         let resp = MessageResponse {
+            revision: 0,
+            redacted: false,
+
             id: "msg_1".into(),
             conversation_id: "conv_1".into(),
             msg_id: Some("client_1".into()),
@@ -855,6 +864,9 @@ mod tests {
     #[test]
     fn message_response_roundtrip() {
         let resp = MessageResponse {
+            revision: 0,
+            redacted: false,
+
             id: "msg_2".into(),
             conversation_id: "conv_2".into(),
             msg_id: None,

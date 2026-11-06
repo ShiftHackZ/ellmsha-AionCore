@@ -47,6 +47,9 @@ fn make_conversation(suffix: &str) -> ConversationRow {
 fn make_message(conv_id: &str, content: &str) -> MessageRow {
     let now = aionui_common::now_ms();
     MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: aionui_common::generate_prefixed_id("msg"),
         conversation_id: conv_id.to_string(),
         msg_id: Some(aionui_common::generate_prefixed_id("cmsg")),
@@ -765,6 +768,9 @@ async fn anchor_rejects_legacy_artifact_rows() {
     repo.insert_message(
         &conv.user_id,
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "legacy-cron".into(),
             conversation_id: conv.id.clone(),
             msg_id: None,
@@ -1150,6 +1156,9 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
         repo.insert_message(
             &conv.user_id,
             &MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: id.into(),
                 conversation_id: conv.id.clone(),
                 msg_id: None,
@@ -1190,6 +1199,9 @@ async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
     repo.insert_message(
         &conv.user_id,
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: aionui_common::generate_prefixed_id("msg"),
             conversation_id: conv.id.clone(),
             msg_id: Some("legacy-trigger".into()),
@@ -1380,6 +1392,9 @@ async fn upsert_artifact_rejects_cross_user_id_takeover() {
 
 fn make_message_at(conv_id: &str, content: &str, created_at: i64, backend_turn_id: Option<&str>) -> MessageRow {
     MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: aionui_common::generate_prefixed_id("msg"),
         conversation_id: conv_id.to_string(),
         msg_id: Some(aionui_common::generate_prefixed_id("cmsg")),

@@ -323,6 +323,25 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let file_authenticated =
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let secrets_runtime = crate::secrets::SecretsRuntimeState {
+        question_cancellations: Default::default(),
+        secrets: states.secrets.clone(),
+        tokens: services.runtime_token_service.clone(),
+        conversations: services.conversation_repo.clone(),
+        projects: Arc::new(aionui_db::SqliteProjectStore::new(services.database.pool().clone())),
+        events: services.ws_manager.clone(),
+        conversation_service: services.conversation_service.clone(),
+    };
+    let secrets_authenticated = aionui_secrets::routes::domain_routes(states.secrets)
+        .route_layer(from_fn_with_state(
+            crate::secrets::HumanGuardState {
+                local: services.identity_mode.is_local(),
+            },
+            crate::secrets::human_guard,
+        ))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(aionui_secrets::routes::no_store));
+
     // Project control-plane routes protected by auth middleware
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -418,7 +437,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(cron_authenticated)
         .merge(office_authenticated)
         .merge(shell_authenticated)
-        .merge(assistant_authenticated);
+        .merge(assistant_authenticated)
+        .merge(secrets_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -434,6 +454,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(runtime_team_tools)
+    .merge(crate::secrets::runtime_routes(secrets_runtime))
     .merge(super::runtime_router_tools::runtime_router_tools_routes(
         super::runtime_router_tools::RuntimeRouterToolsState {
             conversation: services.conversation_service.clone(),

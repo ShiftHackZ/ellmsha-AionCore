@@ -36,6 +36,9 @@ impl ConversationService {
             None => serde_json::to_value(&stream_error.detail).unwrap_or(serde_json::Value::Null),
         };
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: Self::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
             msg_id: None,

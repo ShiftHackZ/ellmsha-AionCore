@@ -305,6 +305,9 @@ where
         };
 
         Ok(MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: msg_id.to_owned(),
             conversation_id: request.conversation_id.clone(),
             msg_id: Some(msg_id.to_owned()),

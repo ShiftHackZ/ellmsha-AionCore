@@ -517,6 +517,9 @@ impl StreamPersistenceAdapter {
             }
         } else {
             let row = MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(segment.id.clone()),
@@ -561,6 +564,9 @@ impl StreamPersistenceAdapter {
             }
         } else {
             let row = MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(segment.id.clone()),
@@ -653,6 +659,9 @@ impl StreamPersistenceAdapter {
             }
         } else if !hidden {
             let row = MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: self.msg_id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(self.msg_id.clone()),
@@ -680,6 +689,9 @@ impl StreamPersistenceAdapter {
 
         let content = json!({ "content": &data.message, "type": "error", "error": &data }).to_string();
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: ConversationService::mint_msg_id(),
             conversation_id: self.conversation_id.clone(),
             msg_id: None,
@@ -714,6 +726,9 @@ impl StreamPersistenceAdapter {
         })
         .to_string();
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: ConversationService::mint_msg_id(),
             conversation_id: self.conversation_id.clone(),
             msg_id: None,
@@ -751,6 +766,9 @@ impl StreamPersistenceAdapter {
         })
         .to_string();
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: segment.id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(segment.id),
@@ -793,6 +811,9 @@ impl StreamPersistenceAdapter {
         let content = serde_json::to_string(data).unwrap_or_default();
 
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: data.call_id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(data.call_id.clone()),
@@ -844,6 +865,9 @@ impl StreamPersistenceAdapter {
         let content = value.to_string();
 
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: tool_call_id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(tool_call_id.clone()),
@@ -920,6 +944,9 @@ impl StreamPersistenceAdapter {
             }
         } else {
             let row = MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: group_id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(group_id),

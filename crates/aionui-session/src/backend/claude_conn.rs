@@ -286,7 +286,7 @@ fn build_claude_mcp_config(servers: &[super::McpServerSpec]) -> Option<String> {
     };
     let mut map = Map::new();
     for s in servers {
-        let entry = match &s.transport {
+        let mut entry = match &s.transport {
             McpTransport::Stdio { command, args, env } => json!({
                 "command": command,
                 "args": args,
@@ -303,6 +303,12 @@ fn build_claude_mcp_config(servers: &[super::McpServerSpec]) -> Option<String> {
                 "headers": Value::Object(kv(headers)),
             }),
         };
+        // The managed Secrets question rendezvous allows ten minutes of human input.
+        if s.name == "ellmsha-secrets"
+            && matches!(&s.transport, McpTransport::Stdio { args, .. } if args.as_slice() == ["mcp-secrets-stdio"])
+        {
+            entry["timeout"] = json!(620000);
+        }
         map.insert(s.name.clone(), entry);
     }
     Some(json!({ "mcpServers": Value::Object(map) }).to_string())
@@ -6511,5 +6517,26 @@ mod memory_generation_tests {
         ] {
             assert!(args.iter().any(|v| v == flag));
         }
+    }
+}
+
+#[cfg(test)]
+mod secrets_deadline_tests {
+    use super::*;
+    #[test]
+    fn managed_secrets_deadline_preserves_other_mcp_servers() {
+        let server = |name: &str| crate::backend::McpServerSpec {
+            name: name.into(),
+            auto_approve_in_unattended: false,
+            transport: crate::backend::McpTransport::Stdio {
+                command: "synthetic-core".into(),
+                args: vec!["mcp-secrets-stdio".into()],
+                env: vec![],
+            },
+        };
+        let servers = vec![server("ellmsha-secrets"), server("ordinary")];
+        let config = serde_json::from_str::<serde_json::Value>(&build_claude_mcp_config(&servers).unwrap()).unwrap()["mcpServers"].clone();
+        assert_eq!(config["ellmsha-secrets"]["timeout"], 620000);
+        assert!(config["ordinary"].get("timeout").is_none());
     }
 }

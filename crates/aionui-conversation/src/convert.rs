@@ -156,6 +156,9 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, Conve
         .map_err(|e| ConversationError::internal(format!("Invalid message content JSON: {e}")))?;
 
     Ok(MessageResponse {
+        revision: row.revision,
+        redacted: row.redacted,
+
         id: row.id,
         conversation_id: row.conversation_id,
         msg_id: row.msg_id,

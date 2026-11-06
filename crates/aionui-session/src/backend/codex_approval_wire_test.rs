@@ -338,3 +338,80 @@ fn externally_resolved_user_input_uses_the_original_public_card_id() {
     assert_eq!(remove_pending_tool_approval(&registry, "7"), "question:7");
     assert!(!has_pending_tool_approval(&registry, "7"));
 }
+
+#[tokio::test]
+async fn secrets_wire_uses_exact_host_grant_and_preserves_raw_private_transport() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = McpApprovalStore::new(dir.path(), "user");
+    let wire = concat!(
+        "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"root\"}}}\n",
+        "{\"method\":\"item/started\",\"params\":{\"threadId\":\"root\",\"turnId\":\"turn\",\"item\":{\"type\":\"mcpToolCall\",\"id\":\"call\",\"server\":\"ellmsha-secrets\",\"tool\":\"ellmsha_global_secret_read\",\"arguments\":{\"id\":\"019a0000-0000-7000-8000-000000000001\"}}}}\n",
+        "{\"id\":7,\"method\":\"mcpServer/elicitation/request\",\"params\":{\"threadId\":\"root\",\"turnId\":\"turn\",\"serverName\":\"ellmsha-secrets\",\"mode\":\"form\",\"_meta\":{\"codex_approval_kind\":\"mcp_tool_call\",\"tool_params\":{\"id\":\"019a0000-0000-7000-8000-000000000001\"}},\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\n"
+    );
+    for fresh in [false, true] {
+        let fake =
+            FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![wire.as_bytes().to_vec(), b"{}\n".to_vec()]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::spawn_with_wake(
+            "fixture-chat".into(),
+            Box::new(fake),
+            CodexWakeRecipe {
+                spawner: None,
+                config: std::sync::RwLock::new({
+                    let mut cfg = config(Some(store.clone()));
+                    cfg.init.mcp_servers[0].name = "ellmsha-secrets".into();
+                    cfg
+                }),
+            },
+            None,
+        )
+        .await;
+        let mut events = backend.events();
+        release();
+        if !fresh {
+            let request_id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(event) = events.next().await {
+                    if let SessionEvent::Permission { request_id, input, .. } = event.event {
+                        assert_eq!(
+                            input.unwrap()["_meta"]["ellmsha_exact_tool"]["tool"],
+                            "ellmsha_global_secret_read"
+                        );
+                        return request_id;
+                    }
+                }
+                panic!("permission not emitted")
+            })
+            .await
+            .unwrap();
+            backend.prepare_permission(&request_id, Some("ellmsha_always")).unwrap();
+            backend
+                .dispatch(Command::AnswerPermission {
+                    request_id,
+                    decision: super::super::types::PermissionDecision::AllowAlways,
+                    selected: Some("ellmsha_always".into()),
+                    answers: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let bytes = captured.lock().await.clone();
+                let text = String::from_utf8(bytes).unwrap();
+                if text.contains("\"action\":\"accept\"") {
+                    assert!(
+                        !text.contains("persist"),
+                        "host scope must not masquerade as provider persistence"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(backend.pending_permission_requests().is_empty());
+    }
+    assert_eq!(store.list().unwrap().len(), 1);
+}

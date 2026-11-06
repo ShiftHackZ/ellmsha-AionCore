@@ -25,7 +25,7 @@ pub struct AgentRuntime {
     workspace: Arc<str>,
     status: Arc<RwLock<Option<ConversationStatus>>>,
     last_activity: Arc<AtomicI64>,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    event_tx: crate::capability::sensitive::EventSender,
 }
 
 impl AgentRuntime {
@@ -41,8 +41,18 @@ impl AgentRuntime {
             workspace: Arc::from(workspace.into()),
             status: Arc::new(RwLock::new(None)),
             last_activity: Arc::new(AtomicI64::new(now_ms())),
-            event_tx,
+            event_tx: event_tx.into(),
         }
+    }
+
+    pub(crate) fn with_sensitive_tools(self, enabled: bool) -> Self {
+        if enabled {
+            self.event_tx.enable_secrets();
+        }
+        self
+    }
+    pub(crate) fn secrets_registered(&self) -> bool {
+        self.event_tx.secrets_registered()
     }
 
     // ── Read ────────────────────────────────────────────────────────────
@@ -72,7 +82,7 @@ impl AgentRuntime {
     /// needed directly (e.g. passing into an SDK builder). Prefer
     /// `emit` / `emit_finish` / `emit_error` for event emission.
     #[allow(dead_code)]
-    pub(crate) fn event_sender(&self) -> broadcast::Sender<AgentStreamEvent> {
+    pub(crate) fn event_sender(&self) -> crate::capability::sensitive::EventSender {
         self.event_tx.clone()
     }
 

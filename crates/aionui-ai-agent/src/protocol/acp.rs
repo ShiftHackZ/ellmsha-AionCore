@@ -38,7 +38,7 @@ use agent_client_protocol::{
 use aionui_common::ErrorChain;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
@@ -148,10 +148,10 @@ impl AcpProtocol {
     /// Takes ownership of the child's stdin/stdout (from [`CliAgentProcess::take_stdio`]).
     /// Spawns the SDK background task for JSON-RPC message routing.
     /// Returns after the initialize handshake completes successfully.
-    pub async fn connect(
+    pub(crate) async fn connect(
         stdin: ChildStdin,
         stdout: ChildStdout,
-        event_tx: broadcast::Sender<AgentStreamEvent>,
+        event_tx: crate::capability::sensitive::EventSender,
         permission_tx: mpsc::Sender<PermissionRequest>,
         notification_tx: mpsc::Sender<SessionNotification>,
     ) -> Result<Self, AcpError> {
@@ -569,7 +569,7 @@ impl Drop for ReplaySuppressionGuard<'_> {
 async fn run_sdk_background(
     stdin: ChildStdin,
     stdout: ChildStdout,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    event_tx: crate::capability::sensitive::EventSender,
     permission_tx: mpsc::Sender<PermissionRequest>,
     notification_tx: mpsc::Sender<SessionNotification>,
     init_tx: oneshot::Sender<Result<InitializeResponse, AcpError>>,
@@ -721,7 +721,7 @@ async fn run_sdk_background(
 /// Fan out a CLI session notification to the event broadcast channel.
 async fn handle_session_notification(
     notification: SessionNotification,
-    event_tx: &broadcast::Sender<AgentStreamEvent>,
+    event_tx: &crate::capability::sensitive::EventSender,
 ) {
     log_agent_notify("session/update", &json_str(&notification));
 

@@ -129,6 +129,7 @@ impl SqliteConversationRepository {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 content = CASE \
+                    WHEN messages.redacted = 1 THEN messages.content \
                     WHEN messages.status IN ('finish', 'error') AND excluded.status = 'work' THEN \
                         CASE messages.type \
                             WHEN 'acp_tool_call' THEN json_set( \
@@ -977,7 +978,7 @@ impl IConversationRepository for SqliteConversationRepository {
         let mut binds: Vec<BindValue> = Vec::new();
 
         if let Some(ref content) = updates.content {
-            set_parts.push("content = ?".to_string());
+            set_parts.push("content = CASE WHEN redacted = 1 THEN content ELSE ? END".to_string());
             binds.push(BindValue::Str(content.clone()));
         }
         if let Some(ref status) = updates.status {
@@ -1097,8 +1098,8 @@ impl IConversationRepository for SqliteConversationRepository {
                 sqlx::query(
                     "INSERT INTO messages \
                         (id, conversation_id, msg_id, type, content, position, \
-                         status, hidden, created_at, backend_turn_id) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                         status, hidden, created_at, backend_turn_id, revision, redacted) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
                 )
                 .bind(aionui_common::generate_id())
                 .bind(target_conversation_id)
@@ -1109,6 +1110,8 @@ impl IConversationRepository for SqliteConversationRepository {
                 .bind(&row.status)
                 .bind(row.hidden)
                 .bind(row.created_at)
+                .bind(row.revision)
+                .bind(row.redacted)
                 .execute(&mut *connection)
                 .await?;
                 copied += 1;
@@ -1229,6 +1232,9 @@ impl IConversationRepository for SqliteConversationRepository {
                 Ok(StaleRuntimeMessageRow {
                     user_id: row.try_get("user_id")?,
                     message: MessageRow {
+                        revision: row.try_get("revision")?,
+                        redacted: row.try_get("redacted")?,
+
                         id: row.try_get("id")?,
                         conversation_id: row.try_get("conversation_id")?,
                         msg_id: row.try_get("msg_id")?,
@@ -1262,6 +1268,9 @@ impl IConversationRepository for SqliteConversationRepository {
                 Ok(LegacyUploadMessageRow {
                     user_id: row.try_get("user_id")?,
                     message: MessageRow {
+                        revision: row.try_get("revision")?,
+                        redacted: row.try_get("redacted")?,
+
                         id: row.try_get("id")?,
                         conversation_id: row.try_get("conversation_id")?,
                         msg_id: row.try_get("msg_id")?,
@@ -1670,6 +1679,9 @@ mod tests {
     fn sample_message(conv_id: &str) -> MessageRow {
         let now = aionui_common::now_ms();
         MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: aionui_common::generate_prefixed_id("msg"),
             conversation_id: conv_id.to_string(),
             msg_id: Some("client_msg_1".to_string()),

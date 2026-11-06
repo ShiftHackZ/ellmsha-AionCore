@@ -53,6 +53,11 @@ type MaterializedRevisions = (
 /// Central registry orchestrating extension loading, activation, contribution
 /// resolution, and event broadcasting.
 ///
+#[async_trait::async_trait]
+pub trait ExtensionDisableObserver: Send + Sync {
+    async fn disabled(&self, user_id: &str, name: &str);
+}
+
 /// Thread-safe: can be shared across HTTP handlers, the file watcher, and
 /// other async tasks via `Arc`.
 #[derive(Clone)]
@@ -62,6 +67,7 @@ pub struct ExtensionRegistry {
     broadcaster: Arc<dyn EventBroadcaster>,
     app_version: String,
     reload_lock: Arc<Mutex<()>>,
+    disable_observer: Arc<std::sync::RwLock<Option<Arc<dyn ExtensionDisableObserver>>>>,
     revision_root: Arc<PathBuf>,
     revision_counter: Arc<AtomicU64>,
     linear_connections: Option<LinearConnectionManager>,
@@ -176,6 +182,7 @@ impl ExtensionRegistry {
             broadcaster,
             app_version,
             reload_lock: Arc::new(Mutex::new(())),
+            disable_observer: Arc::new(std::sync::RwLock::new(None)),
             revision_root: Arc::new(revision_root),
             revision_counter: Arc::new(AtomicU64::new(0)),
             linear_connections,
@@ -495,6 +502,7 @@ impl ExtensionRegistry {
 
         self.state_store.set_user_enabled(user_id, name, false).await?;
         self.bump_generation().await;
+        self.notify_disabled(user_id, name).await;
         self.broadcast_state_changed(user_id, name, false);
 
         info!(
@@ -550,10 +558,22 @@ impl ExtensionRegistry {
             .set_project_enabled(user_id, project_id, name, enabled)
             .await?;
         self.bump_generation().await;
+        if !enabled {
+            self.notify_disabled(user_id, name).await;
+        }
         self.broadcast_state_changed(user_id, name, enabled);
         Ok(())
     }
 
+    pub fn set_disable_observer(&self, observer: Arc<dyn ExtensionDisableObserver>) {
+        *self.disable_observer.write().unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+    async fn notify_disabled(&self, user_id: &str, name: &str) {
+        let observer = self.disable_observer.read().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(observer) = observer {
+            observer.disabled(user_id, name).await;
+        }
+    }
     async fn bump_generation(&self) {
         let mut guard = self.inner.write().await;
         guard.generation = guard.generation.saturating_add(1);
@@ -630,6 +650,14 @@ impl ExtensionRegistry {
         };
         retain_contributions(&mut contributions, &enabled);
         contributions
+    }
+
+    /// Effective project-aware authorization, including actual plugin installation.
+    pub async fn secrets_enabled_for_binding(&self, user_id: &str, project_id: Option<&str>) -> bool {
+        self.extensions_for_binding(user_id, project_id)
+            .await
+            .into_iter()
+            .any(|e| e.manifest.name == "secrets" && e.state.enabled)
     }
 
     pub async fn get_contributions_for_binding(

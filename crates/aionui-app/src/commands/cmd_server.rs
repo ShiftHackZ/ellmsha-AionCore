@@ -54,6 +54,18 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
         .with_field("port", config.port.to_string()));
     }
 
+    if aionui_app::tls_proxy_configured()
+        && !config
+            .socket_addr()
+            .parse::<SocketAddr>()
+            .is_ok_and(|addr| addr.ip().is_loopback())
+    {
+        return Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.host",
+            "Secrets TLS proxy requires a loopback-only origin",
+        ));
+    }
     let dynamic_port = config.port == 0;
     let max_attempts = if dynamic_port {
         DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS
@@ -311,7 +323,7 @@ pub(crate) async fn run_server(
     emit_ready_event();
     info!("startup: server ready, emitted AIONCORE_READY");
 
-    axum::serve(listener, router)
+    axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             match shutdown_signal(parent_exit).await {
                 Err(error) => {

@@ -1079,6 +1079,9 @@ mod tests {
     #[test]
     fn router_child_final_result_uses_latest_visible_finish_and_utf8_byte_limit() {
         let row = |content: &str, status: &str, hidden| MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "msg".into(),
             conversation_id: "child".into(),
             msg_id: None,

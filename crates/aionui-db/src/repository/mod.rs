@@ -85,3 +85,7 @@ pub mod usage;
 
 mod usage_types;
 pub use usage_types::{UsageContext, UsageResponse, UsageSeries, UsageTotals};
+
+pub mod secrets;
+
+pub mod secret_history;

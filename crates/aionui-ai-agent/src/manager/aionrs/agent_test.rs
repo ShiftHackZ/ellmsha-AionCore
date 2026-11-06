@@ -138,6 +138,7 @@ fn aionrs_final_input_dump_value_contains_raw_split_input_and_context() {
             headers: None,
             deferred: Some(false),
             startup_timeout_ms: None,
+            sensitive: false,
         },
     );
 

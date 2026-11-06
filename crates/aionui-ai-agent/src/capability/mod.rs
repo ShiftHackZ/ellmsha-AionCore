@@ -14,3 +14,5 @@ pub(crate) mod skill_manager;
 
 pub use prompt_pipeline::{PostRecvHook, PreSendHook, PromptCtx, PromptPipeline};
 pub(crate) mod tencent_memory;
+
+pub(crate) mod sensitive;

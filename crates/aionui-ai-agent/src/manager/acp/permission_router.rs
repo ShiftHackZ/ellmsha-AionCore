@@ -77,7 +77,16 @@ impl PermissionRouter {
                 }
 
                 let permission_event = permission_request_to_event_data(&perm_req.request);
-                let confirmation = permission_event
+                let mut recovered_event = permission_event.clone();
+                if runtime.secrets_registered() {
+                    let mut projected = AgentStreamEvent::AcpPermission(recovered_event);
+                    crate::capability::sensitive::SensitiveProjection::default().project(&mut projected);
+                    let AgentStreamEvent::AcpPermission(value) = projected else {
+                        unreachable!()
+                    };
+                    recovered_event = value;
+                }
+                let confirmation = recovered_event
                     .as_confirmation()
                     .expect("ACP permission events must be recoverable as confirmations");
 
@@ -294,6 +303,81 @@ mod tests {
                 value: json!("allow_once"),
                 params: None,
             }],
+        }
+    }
+
+    #[tokio::test]
+    async fn secrets_sdk_permission_roundtrip_keeps_recovered_confirmation_safe_and_honors_reject() {
+        for option in ["allow_once", "allow_session", "reject"] {
+            let (tx, rx) = mpsc::channel(1);
+            let router = Arc::new(PermissionRouter::new(rx));
+            let runtime = AgentRuntime::new("synthetic-chat", "/synthetic", 32).with_sensitive_tools(true);
+            let mut events = runtime.subscribe();
+            router.start(runtime.clone());
+            let request = permission_request_with_title_and_raw_input(
+                "mcp__ellmsha-secrets__ellmsha_project_secret_delete",
+                Some(
+                    json!({"id":"019a0000-0000-7000-8000-000000000001","expected_revision":2,"fields":{"password":"SYNTHETIC_ACP_SECRET"}}),
+                ),
+                vec![
+                    allow_once_option("allow_once"),
+                    allow_always_option("allow_session"),
+                    reject_option("reject"),
+                ],
+            );
+            let original_request = request.clone();
+            let (response_tx, response_rx) = oneshot::channel();
+            tx.send(PermissionRequest { request, response_tx }).await.unwrap();
+            let emitted = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(emitted, AgentStreamEvent::AcpPermission(_)));
+            let display = serde_json::to_string(&emitted).unwrap();
+            assert!(!display.contains("SYNTHETIC_ACP_SECRET"));
+            assert!(display.contains("019a0000-0000-7000-8000-000000000001"));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let recovered = router.get_confirmations();
+                    if !recovered.is_empty() {
+                        let display = serde_json::to_string(&recovered).unwrap();
+                        assert!(!display.contains("SYNTHETIC_ACP_SECRET"));
+                        assert!(display.contains("019a0000-0000-7000-8000-000000000001"));
+                        assert_eq!(recovered[0].options.len(), 3);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            router.confirm("tool-1", option.into(), "synthetic-chat").unwrap();
+            assert!(
+                matches!(response_rx.await.unwrap(), PermissionDecision::Selected { option_id } if option_id == option)
+            );
+            assert!(router.get_confirmations().is_empty());
+            // The permission is the first identity-bearing frame: no tool start
+            // precedes it. Anonymous completion must retain shared attribution.
+            let completion: AgentStreamEvent = serde_json::from_value(json!({"type":"acp_tool_call","data":{"session_id":"session-1","update":{"sessionUpdate":"tool_call_update","tool_call_id":"tool-1","status":"completed","rawOutput":{"password":"SYNTHETIC_COMPLETION"}}}})).unwrap();
+            runtime.event_sender().send(completion).unwrap();
+            let emitted = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut persisted = serde_json::to_value(&emitted).unwrap();
+            aionui_common::normalize_keys_to_snake_case(&mut persisted);
+            assert!(!persisted.to_string().contains("SYNTHETIC_COMPLETION"));
+            assert_eq!(persisted["data"]["update"]["tool_call_id"], "tool-1");
+            // Projection affects only display/persistence copies, not SDK request data.
+            assert!(
+                serde_json::to_string(&original_request)
+                    .unwrap()
+                    .contains("SYNTHETIC_ACP_SECRET")
+            );
+            assert_eq!(
+                original_request.tool_call.fields.title.as_deref(),
+                Some("mcp__ellmsha-secrets__ellmsha_project_secret_delete")
+            );
         }
     }
 

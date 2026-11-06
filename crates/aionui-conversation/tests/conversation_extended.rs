@@ -136,6 +136,9 @@ fn make_create_req() -> CreateConversationRequest {
 
 fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: generate_prefixed_id("msg"),
         conversation_id: conv_id.to_string(),
         msg_id: Some(generate_prefixed_id("client")),
@@ -151,6 +154,9 @@ fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {
 
 fn make_acp_tool_message(conv_id: &str, id: &str, output: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: id.to_string(),
         conversation_id: conv_id.to_string(),
         msg_id: Some(id.to_string()),
@@ -638,6 +644,9 @@ async fn t9_5_preview_text_extracts_from_json_content() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
     let complex_msg = MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: generate_prefixed_id("msg"),
         conversation_id: conv.id.clone(),
         msg_id: None,

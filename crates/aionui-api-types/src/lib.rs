@@ -237,3 +237,5 @@ mod public_contract_tests {
 
 pub mod mcp_approval;
 pub use mcp_approval::{McpApprovalResponse, RevokeMcpApprovalResponse};
+
+pub mod secrets;

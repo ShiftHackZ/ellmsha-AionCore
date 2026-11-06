@@ -37,6 +37,9 @@ async fn insert_message(
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     let msg = aionui_db::models::MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: msg_id.into(),
         conversation_id: conv_id.into(),
         msg_id: None,
@@ -79,6 +82,9 @@ async fn insert_acp_tool_message(
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     let msg = aionui_db::models::MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: msg_id.into(),
         conversation_id: conv_id.into(),
         msg_id: Some(msg_id.into()),
@@ -421,6 +427,9 @@ async fn t8_7_messages_exclude_legacy_cron_rows() {
         ),
     ] {
         let msg = aionui_db::models::MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: id.into(),
             conversation_id: conv_id.clone(),
             msg_id: None,

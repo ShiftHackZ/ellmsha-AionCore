@@ -17,6 +17,20 @@ use crate::error::MainError;
 // MainError has been moved to src/error.rs
 
 fn main() -> ExitCode {
+    if let Ok(capability) = std::env::var("AIONUI_SECRETS_TLS_PROXY_CAPABILITY") {
+        // SAFETY: process entry, before workers; never inherited by agent subprocesses.
+        unsafe {
+            std::env::remove_var("AIONUI_SECRETS_TLS_PROXY_CAPABILITY");
+        }
+        aionui_app::initialize_tls_proxy_capability(capability);
+    }
+    if let Ok(capability) = std::env::var("AIONUI_SECRETS_HUMAN_CAPABILITY") {
+        // SAFETY: no threads or Tokio exist yet; child agents must never inherit this credential.
+        unsafe {
+            std::env::remove_var("AIONUI_SECRETS_HUMAN_CAPABILITY");
+        }
+        aionui_app::initialize_human_capability(capability);
+    }
     if let Ok(key) = std::env::var("AIONUI_BROWSER_SCOPE_KEY") {
         // SAFETY: this is the first action in main, before worker threads and
         // Tokio exist. Remove the issuer secret before any native tool, CLI,
@@ -96,6 +110,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::McpBridge) => Ok(commands::run_mcp_bridge().await),
         Some(Command::McpTeamStdio) => Ok(commands::run_team_stdio().await),
         Some(Command::McpRouterStdio) => Ok(commands::run_router_stdio().await),
+        Some(Command::McpSecretsStdio) => Ok(commands::cmd_secrets_stdio::run().await),
         Some(Command::McpFigmaStdio) => Ok(commands::run_figma_stdio().await),
         Some(Command::McpClockifyStdio) => Ok(commands::run_clockify_stdio().await),
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),

@@ -13,6 +13,7 @@ pub enum RuntimeTokenScope {
     TeamCall,
     /// Ordinary V2 router host delegation only.
     RouterCall,
+    SecretsCall,
     /// Conversation-scoped helper CLI access (`aioncore config` / `diagnose`
     /// invoked from inside an agent conversation). Grants the token holder the
     /// bound user's identity on ordinary API routes via the auth middleware's
@@ -26,6 +27,7 @@ impl RuntimeTokenScope {
             Self::TeamContext => "team:context",
             Self::TeamCall => "team:call",
             Self::RouterCall => "router:call",
+            Self::SecretsCall => "secrets:call",
             Self::ConversationHelper => "conversation:helper",
         }
     }
@@ -48,6 +50,7 @@ impl std::fmt::Debug for RuntimeTokenIssue {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeTokenClaims {
+    pub secrets_binding: Option<String>,
     pub user_id: String,
     pub conversation_id: String,
     pub scopes: HashSet<RuntimeTokenScope>,
@@ -92,18 +95,27 @@ impl RuntimeTokenService {
         let conversation_id = conversation_id.into();
         let session_generation = session_generation.into();
         let scopes = scopes.into_iter().collect::<HashSet<_>>();
+        assert!(
+            !scopes.contains(&RuntimeTokenScope::SecretsCall),
+            "Secrets require a dedicated capability"
+        );
         if let Some(existing) = self.existing_token(&user_id, &conversation_id, &session_generation, &scopes) {
             return existing;
         }
         let token = generate_token();
         let claims = RuntimeTokenClaims {
+            secrets_binding: None,
             user_id,
             conversation_id,
             scopes,
             issued_at: SystemTime::now(),
             session_generation,
         };
-        self.invalidate_conversation(&claims.user_id, &claims.conversation_id);
+        self.tokens.retain(|_, entry| {
+            !(entry.claims.user_id == claims.user_id
+                && entry.claims.conversation_id == claims.conversation_id
+                && !entry.claims.scopes.contains(&RuntimeTokenScope::SecretsCall))
+        });
         self.tokens.insert(
             token_hash(&token),
             RuntimeTokenEntry {
@@ -112,6 +124,58 @@ impl RuntimeTokenService {
             },
         );
         RuntimeTokenIssue { token, claims }
+    }
+
+    /// Independent capability, passed only to the managed Secrets MCP host.
+    pub fn issue_secrets(&self, user: &str, chat: &str, generation: &str, binding: String) -> RuntimeTokenIssue {
+        if let Some(existing) = self.tokens.iter().find_map(|entry| {
+            let c = &entry.claims;
+            (c.user_id == user
+                && c.conversation_id == chat
+                && c.session_generation == generation
+                && c.secrets_binding.as_ref() == Some(&binding)
+                && c.scopes == HashSet::from([RuntimeTokenScope::SecretsCall]))
+            .then(|| RuntimeTokenIssue {
+                token: entry.token.clone(),
+                claims: c.clone(),
+            })
+        }) {
+            return existing;
+        }
+        self.invalidate_secrets(user, chat);
+        let issue = RuntimeTokenIssue {
+            token: generate_token(),
+            claims: RuntimeTokenClaims {
+                user_id: user.into(),
+                conversation_id: chat.into(),
+                session_generation: generation.into(),
+                scopes: HashSet::from([RuntimeTokenScope::SecretsCall]),
+                secrets_binding: Some(binding),
+                issued_at: SystemTime::now(),
+            },
+        };
+        self.tokens.insert(
+            token_hash(&issue.token),
+            RuntimeTokenEntry {
+                token: issue.token.clone(),
+                claims: issue.claims.clone(),
+            },
+        );
+        issue
+    }
+    pub fn invalidate_secrets(&self, user: &str, chat: &str) {
+        self.tokens.retain(|_, entry| {
+            !(entry.claims.user_id == user
+                && entry.claims.conversation_id == chat
+                && entry.claims.scopes.contains(&RuntimeTokenScope::SecretsCall))
+        });
+    }
+
+    /// Revoke only this owner's Secrets hosts when the plugin is disabled.
+    pub fn invalidate_user_secrets(&self, user: &str) {
+        self.tokens.retain(|_, entry| {
+            !(entry.claims.user_id == user && entry.claims.scopes.contains(&RuntimeTokenScope::SecretsCall))
+        });
     }
 
     fn existing_token(
@@ -127,6 +191,7 @@ impl RuntimeTokenService {
             if claims.user_id == user_id
                 && claims.conversation_id == conversation_id
                 && claims.session_generation == session_generation
+                && !claims.scopes.contains(&RuntimeTokenScope::SecretsCall)
                 && scopes.is_subset(&claims.scopes)
             {
                 Some(RuntimeTokenIssue {

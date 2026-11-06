@@ -22,3 +22,6 @@ mod usage;
 pub(crate) mod figma;
 
 pub use figma::mcp::run_figma_stdio;
+
+pub(crate) mod secrets;
+pub use secrets::{initialize_human_capability, initialize_tls_proxy_capability, tls_proxy_configured};

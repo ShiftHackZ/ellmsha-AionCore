@@ -125,6 +125,8 @@ pub(crate) enum Command {
     McpTeamStdio,
     /// MCP stdio server for ordinary host-managed router delegation.
     McpRouterStdio,
+    /// Chat-scoped automation Secrets MCP server.
+    McpSecretsStdio,
     /// MCP stdio server for one verified Clockify account.
     McpClockifyStdio,
     /// MCP stdio server for one verified Figma account.
@@ -150,6 +152,7 @@ impl Command {
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::McpRouterStdio => "mcp-router-stdio",
+            Self::McpSecretsStdio => "mcp-secrets-stdio",
             Self::McpClockifyStdio => "mcp-clockify-stdio",
             Self::McpFigmaStdio => "mcp-figma-stdio",
             Self::Doctor => "doctor",

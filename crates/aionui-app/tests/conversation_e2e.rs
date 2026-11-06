@@ -879,6 +879,9 @@ async fn t7_1_reset_conversation() {
     // Insert a message directly via repo
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let msg = aionui_db::models::MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: "msg-1".into(),
         conversation_id: id.clone(),
         msg_id: None,
@@ -972,6 +975,9 @@ async fn team_owned_conversation_rejects_ordinary_send_but_allows_history_reads(
 
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let msg = aionui_db::models::MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: "team-history-msg-1".into(),
         conversation_id: id.clone(),
         msg_id: Some("team-history-msg-1".into()),

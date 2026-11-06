@@ -330,6 +330,7 @@ pub struct ConversationService {
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     plugin_registry: Arc<RwLock<Option<ExtensionRegistry>>>,
+    secrets_repository: Option<Arc<dyn aionui_db::ISecretsRepository>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -418,6 +419,7 @@ impl ConversationService {
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             plugin_registry: Arc::new(RwLock::new(None)),
+            secrets_repository: None,
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -555,6 +557,11 @@ impl ConversationService {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
         }
+    }
+
+    pub fn with_secrets_repository(mut self, repository: Arc<dyn aionui_db::ISecretsRepository>) -> Self {
+        self.secrets_repository = Some(repository);
+        self
     }
 
     pub fn with_plugin_registry(&self, registry: ExtensionRegistry) {
@@ -3797,7 +3804,7 @@ impl ConversationService {
 
         let agent = match task_manager.get_task(conversation_id) {
             Some(a) => a,
-            None => return Ok(Vec::new()),
+            None => return Ok(self.host_forms(user_id, conversation_id)),
         };
 
         let mut confirmations = agent.get_confirmations();
@@ -3997,6 +4004,9 @@ impl ConversationService {
         // to preserve legacy callers that still rely on `id == msg_id`.
         let user_msg_id = Self::mint_msg_id();
         let user_msg = aionui_db::models::MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
@@ -4065,8 +4075,8 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
-        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
@@ -4127,6 +4137,9 @@ impl ConversationService {
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: user_msg_id.clone(),
                 conversation_id: request.conversation_id.clone(),
                 msg_id: Some(user_msg_id),
@@ -4190,8 +4203,8 @@ impl ConversationService {
             }
         };
 
-        self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
         self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
@@ -4526,8 +4539,8 @@ impl ConversationService {
         }
 
         let mut build_opts = self.build_task_options(&row).await?;
-        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         let plugin_snapshot = self.apply_plugin_runtime(&row, &mut build_opts).await;
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
         self.apply_router_child_tools(&mut build_opts)?;
         self.ensure_workspace_skill_links(&row, &mut build_opts, plugin_snapshot.as_ref())
             .await;
@@ -5356,6 +5369,86 @@ impl ConversationService {
             AgentSessionKind::Aionrs(context) => {
                 append(&mut context.config.skills, &mut context.config.session_mcp_servers)
             }
+        }
+        if registry
+            .secrets_enabled_for_binding(&row.user_id, row.project_id.as_deref())
+            .await
+            && let (Some(command), Some(base)) = (&self.runtime_helper_bin, &self.runtime_base_url)
+        {
+            let prepared = async {
+                let snapshot = self.secrets_repository.as_ref()?.load(&row.user_id).await.ok()??;
+                let vault: serde_json::Value = serde_json::from_slice(&snapshot.ciphertext).ok()?;
+                let vault_id = vault.get("id")?.as_str()?;
+                let incarnation = vault.get("incarnation")?.as_str()?;
+                let binding = serde_json::to_string(
+                    &serde_json::json!({"project":row.project_id,"vault":vault_id,"incarnation":incarnation}),
+                )
+                .ok()?;
+                let token = self
+                    .runtime_token_service
+                    .as_ref()?
+                    .issue_secrets(
+                        &row.user_id,
+                        &row.id,
+                        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+                        binding.clone(),
+                    )
+                    .token;
+                let project_scope = self
+                    .browser_project_id(&row.user_id, row.project_id.as_deref())
+                    .await
+                    .ok()?
+                    .is_some();
+                let env = std::collections::HashMap::from([
+                    (
+                        "AIONUI_SECRETS_PROJECT_ENABLED".into(),
+                        if project_scope { "1" } else { "0" }.into(),
+                    ),
+                    ("AIONUI_SECRETS_BINDING".into(), binding),
+                    ("AIONUI_BASE_URL".into(), base.clone()),
+                    ("AIONUI_USER_ID".into(), row.user_id.clone()),
+                    ("AIONUI_CONVERSATION_ID".into(), row.id.clone()),
+                    ("AIONUI_RUNTIME_TOKEN".into(), token),
+                ]);
+                let identity = aionui_common::mcp_approvals::mcp_binding(&serde_json::json!([
+                    "secrets-vault-v1",
+                    vault_id,
+                    &row.user_id,
+                    &row.project_id
+                ]));
+                let server = SessionMcpServer {
+                    id: "ellmsha-secrets".into(),
+                    name: "ellmsha-secrets".into(),
+                    transport: aionui_api_types::SessionMcpTransport::Stdio {
+                        command: command.clone(),
+                        args: vec!["mcp-secrets-stdio".into()],
+                        env,
+                    },
+                    approval_identity: Some(format!("secrets:{identity}")),
+                    auto_approve_in_unattended: false,
+                };
+                Some(server)
+            }
+            .await;
+            if let Some(server) = prepared {
+                let servers = match &mut build_opts.context.kind {
+                    AgentSessionKind::Acp(c) => &mut c.config.session_mcp_servers,
+                    AgentSessionKind::Antigravity(c) => &mut c.config.session_mcp_servers,
+                    AgentSessionKind::Aionrs(c) => &mut c.config.session_mcp_servers,
+                };
+                servers.retain(|s| s.id != "ellmsha-secrets");
+                servers.push(server);
+            }
+        }
+        let has_secrets = match &build_opts.context.kind {
+            AgentSessionKind::Acp(c) => &c.config.session_mcp_servers,
+            AgentSessionKind::Antigravity(c) => &c.config.session_mcp_servers,
+            AgentSessionKind::Aionrs(c) => &c.config.session_mcp_servers,
+        }
+        .iter()
+        .any(|s| s.id == "ellmsha-secrets");
+        if !has_secrets && let Some(tokens) = &self.runtime_token_service {
+            tokens.invalidate_secrets(&row.user_id, &row.id);
         }
         build_opts.runtime_capabilities.plugin_generation = Some(snapshot.generation);
         build_opts.runtime_capabilities.linear_connection_revision = Some(snapshot.linear_revision);

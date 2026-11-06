@@ -941,6 +941,12 @@ fn build_codex_mcp_servers_with_env_and_approval(
                     .collect(),
             );
         }
+        // The managed Secrets question rendezvous allows ten minutes of human input.
+        if s.name == "ellmsha-secrets"
+            && matches!(&s.transport, McpTransport::Stdio { args, .. } if args.as_slice() == ["mcp-secrets-stdio"])
+        {
+            entry["tool_timeout_sec"] = json!(620);
+        }
         map.insert(s.name.clone(), entry);
     }
     Value::Object(map)
@@ -12311,5 +12317,26 @@ mod native_instruction_recovery_tests {
             ..config
         };
         assert!(restored_codex_agent_instructions(&generation).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod secrets_deadline_tests {
+    use super::*;
+    #[test]
+    fn managed_secrets_deadline_preserves_other_mcp_servers() {
+        let server = |name: &str| crate::backend::McpServerSpec {
+            name: name.into(),
+            auto_approve_in_unattended: false,
+            transport: crate::backend::McpTransport::Stdio {
+                command: "synthetic-core".into(),
+                args: vec!["mcp-secrets-stdio".into()],
+                env: vec![],
+            },
+        };
+        let servers = vec![server("ellmsha-secrets"), server("ordinary")];
+        let config = build_codex_mcp_servers_with_approval(&servers, false);
+        assert_eq!(config["ellmsha-secrets"]["tool_timeout_sec"], 620);
+        assert!(config["ordinary"].get("tool_timeout_sec").is_none());
     }
 }

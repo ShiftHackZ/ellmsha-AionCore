@@ -156,6 +156,9 @@ mod tests {
     #[test]
     fn visible_text_finishes_as_visible_output() {
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "msg-1".into(),
             conversation_id: "conv-1".into(),
             msg_id: Some("msg-1".into()),
@@ -178,6 +181,9 @@ mod tests {
     fn stale_tool_rows_classify_as_settle() {
         for ty in ["tool_call", "tool_group"] {
             let row = MessageRow {
+                revision: 0,
+                redacted: false,
+
                 id: "m".into(),
                 conversation_id: "c".into(),
                 msg_id: Some("m".into()),
@@ -229,6 +235,9 @@ mod tests {
     #[test]
     fn empty_text_finishes_as_hidden_placeholder() {
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "msg-1".into(),
             conversation_id: "conv-1".into(),
             msg_id: Some("msg-1".into()),

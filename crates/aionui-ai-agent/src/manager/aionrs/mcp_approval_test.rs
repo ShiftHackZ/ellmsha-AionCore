@@ -16,6 +16,7 @@ fn config(token: &str) -> HashMap<String, McpServerConfig> {
             headers: None,
             deferred: Some(true),
             startup_timeout_ms: None,
+            sensitive: false,
         },
     )])
 }

@@ -87,7 +87,7 @@ struct UsageTarget {
 
 /// Shared session events and liveness bookkeeping.
 struct SessionRuntime {
-    tx: broadcast::Sender<AgentStreamEvent>,
+    tx: crate::capability::sensitive::EventSender,
     usage_target: std::sync::Mutex<Option<UsageTarget>>,
     last_activity_ms: AtomicI64,
     /// Coarse status derived from the FSM edge the translator observes.
@@ -509,7 +509,7 @@ impl SessionAgentTask {
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
-            tx,
+            tx: tx.into(),
             usage_target: std::sync::Mutex::new(None),
             last_activity_ms: AtomicI64::new(now_ms()),
             status: std::sync::Mutex::new(None),
@@ -630,7 +630,13 @@ impl SessionAgentTask {
                     call_id: p.request_id,
                     title: (!p.tool_name.is_empty()).then(|| p.tool_name.clone()),
                     action: None,
-                    description: permission_input_description(p.input.as_ref()),
+                    description: if self.runtime.tx.secrets_registered()
+                        && crate::capability::sensitive::registered(&p.tool_name, p.input.as_ref())
+                    {
+                        "Sensitive Secrets operation; arguments hidden".into()
+                    } else {
+                        permission_input_description(p.input.as_ref())
+                    },
                     command_type: None,
                     options: options
                         .into_iter()
@@ -1644,6 +1650,12 @@ pub async fn build_antigravity_instance(
         spawn_catalog_writeback(agent_id, user_id.clone(), backend.clone(), catalog_tx);
     }
 
+    let sensitive_tools = config.session_mcp_servers.iter().any(|server| {
+        server
+            .approval_identity
+            .as_deref()
+            .is_some_and(|id| id.starts_with("secrets:"))
+    });
     let task = SessionAgentTask::new_with_preload(
         AgentType::Antigravity,
         conversation_id,
@@ -1655,6 +1667,9 @@ pub async fn build_antigravity_instance(
         None,
         Some(broadcaster),
     );
+    if sensitive_tools {
+        task.runtime.tx.enable_secrets();
+    }
     *task.runtime.usage_target.lock().expect("usage target mutex") = Some(usage_target);
     Ok(crate::agent_task::AgentInstance::Session(task))
 }
@@ -1945,6 +1960,12 @@ pub async fn build_session_instance(
         backend: if backend_label == "claude" { "claude" } else { "codex" },
     });
 
+    let sensitive_tools = config.session_mcp_servers.iter().any(|server| {
+        server
+            .approval_identity
+            .as_deref()
+            .is_some_and(|id| id.starts_with("secrets:"))
+    });
     let task = SessionAgentTask::new_with_preload(
         AgentType::Acp,
         conversation_id,
@@ -1958,6 +1979,9 @@ pub async fn build_session_instance(
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
     );
+    if sensitive_tools {
+        task.runtime.tx.enable_secrets();
+    }
     *task.runtime.usage_target.lock().expect("usage target mutex") = Some(usage_target);
     *task.generation.lock().expect("generation mutex") = Some(crate::generation::GenerationTarget::Cli {
         backend: backend_label.to_owned(),

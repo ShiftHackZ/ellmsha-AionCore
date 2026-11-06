@@ -4,6 +4,7 @@ use aion_protocol::events::{ProtocolEvent, ToolCategory};
 use aion_protocol::writer::ProtocolEmitter;
 use aionui_common::{Confirmation, ConfirmationOption, generate_id};
 use serde_json::json;
+#[cfg(test)]
 use tokio::sync::broadcast;
 use tracing::debug;
 
@@ -16,15 +17,18 @@ use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCall
 /// other events (text, thinking, tool results) are already handled by
 /// `BackendOutputSink` via the `OutputSink` trait.
 pub struct BackendProtocolSink {
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    event_tx: crate::capability::sensitive::EventSender,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     approval_manager: Option<Arc<aion_protocol::ToolApprovalManager>>,
 }
 
 impl BackendProtocolSink {
-    pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>, confirmations: Arc<RwLock<Vec<Confirmation>>>) -> Self {
+    pub(crate) fn new(
+        event_tx: impl Into<crate::capability::sensitive::EventSender>,
+        confirmations: Arc<RwLock<Vec<Confirmation>>>,
+    ) -> Self {
         Self {
-            event_tx,
+            event_tx: event_tx.into(),
             confirmations,
             approval_manager: None,
         }

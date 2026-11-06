@@ -70,3 +70,10 @@ pub use repository::{IRouterOutcomeRepository, RouterOutcome, SqliteRouterOutcom
 pub use repository::usage::{SqliteUsageRepository, UsageCounter, UsageQuery, UsageReport};
 
 pub use repository::{UsageContext, UsageResponse, UsageSeries, UsageTotals};
+
+pub use repository::secrets::{ISecretsRepository, SqliteSecretsRepository, VaultSnapshot};
+
+pub use repository::secret_history::{
+    HistoryCommitContext, HistoryCommitGuard, HistoryEdit, HistoryScope, ISecretHistoryRepository, SecretHistoryRow,
+    SqliteSecretHistoryRepository, UncheckedHistoryCommit,
+};

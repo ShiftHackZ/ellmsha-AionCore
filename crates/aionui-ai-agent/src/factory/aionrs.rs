@@ -594,6 +594,7 @@ async fn row_to_mcp_server_config(
                 headers: None,
                 deferred: Some(true),
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         "http" | "streamable_http" => {
@@ -620,6 +621,7 @@ async fn row_to_mcp_server_config(
                 headers: Some(headers),
                 deferred: Some(true),
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         "sse" => {
@@ -646,6 +648,7 @@ async fn row_to_mcp_server_config(
                 headers: Some(headers),
                 deferred: Some(true),
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         other => Err(format!("unsupported transport_type: {other}")),
@@ -680,6 +683,7 @@ async fn session_server_to_mcp_server_config(
                 headers: None,
                 deferred,
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         SessionMcpTransport::Http { url, headers } => {
@@ -695,6 +699,7 @@ async fn session_server_to_mcp_server_config(
                 headers: Some(headers.clone()),
                 deferred,
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         SessionMcpTransport::Sse { url, headers } => {
@@ -710,6 +715,7 @@ async fn session_server_to_mcp_server_config(
                 headers: Some(headers.clone()),
                 deferred,
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
         SessionMcpTransport::StreamableHttp { url, headers } => {
@@ -725,6 +731,7 @@ async fn session_server_to_mcp_server_config(
                 headers: Some(headers.clone()),
                 deferred,
                 startup_timeout_ms: None,
+                sensitive: false,
             })
         }
     }
@@ -740,7 +747,11 @@ async fn merge_session_snapshot_mcp_servers(
     let mut bindings = HashMap::new();
     for server in session_mcp_servers {
         match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
-            Ok(config) => {
+            Ok(mut config) => {
+                config.sensitive = server
+                    .approval_identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("secrets:"));
                 bindings.remove(&server.name);
                 bindings.extend(crate::mcp_approval::trusted_bindings(std::slice::from_ref(server)));
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
@@ -818,6 +829,7 @@ fn team_mcp_to_config(cfg: &TeamMcpStdioConfig) -> HashMap<String, McpServerConf
         headers: None,
         deferred: Some(true),
         startup_timeout_ms: None,
+        sensitive: false,
     };
 
     HashMap::from([(TEAM_MCP_SERVER_NAME.to_owned(), server)])
@@ -2027,6 +2039,7 @@ mod tests {
                 headers: None,
                 deferred: Some(true),
                 startup_timeout_ms: None,
+                sensitive: false,
             },
         )]);
 

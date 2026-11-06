@@ -22,6 +22,8 @@ use aionui_project::{ManagedUploadStore, ProjectService};
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
+    pub secrets: Arc<aionui_secrets::service::SecretsService>,
+    pub secret_history: Arc<aionui_secrets::history::SecretHistoryService>,
     pub background_process_service: Arc<aionui_shell::BackgroundProcessService>,
     pub router_service: Arc<aionui_ai_agent::routing::RouterService>,
     pub generation_service: Arc<aionui_ai_agent::generation::GenerationService>,
@@ -306,7 +308,16 @@ impl AppServices {
         })
         .with_router_service(router.clone());
 
+        let secrets_repository =
+            Arc::new(aionui_db::SqliteSecretsRepository::open(&data_dir.join("secrets-vault.sqlite")).await?);
+        let secrets = Arc::new(aionui_secrets::service::SecretsService::new(secrets_repository.clone()));
+        let conversation_service = conversation_service.with_secrets_repository(secrets_repository);
+        let secret_history = Arc::new(aionui_secrets::history::SecretHistoryService::new(Arc::new(
+            aionui_db::SqliteSecretHistoryRepository::new(database.pool().clone()),
+        )));
         Ok(Self {
+            secrets,
+            secret_history,
             background_process_service: Arc::new(aionui_shell::BackgroundProcessService::new(
                 conversation_repo.clone(),
             )),

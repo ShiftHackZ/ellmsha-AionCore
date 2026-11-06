@@ -127,6 +127,7 @@ impl std::error::Error for RouterBuildError {
 /// Reduces parameter bloat on router constructors and makes it easy for
 /// tests to override individual modules.
 pub struct ModuleStates {
+    pub secrets: aionui_secrets::state::SecretsRouterState,
     pub system: SystemRouterState,
     pub conversation: ConversationRouterState,
     pub remote_agent: RemoteAgentRouterState,
@@ -314,7 +315,23 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    ext_state
+        .registry
+        .set_disable_observer(Arc::new(crate::secrets::SecretsDisableObserver(
+            services.secrets.clone(),
+            services.runtime_token_service.clone(),
+        )));
     let states = ModuleStates {
+        secrets: aionui_secrets::state::SecretsRouterState {
+            service: services.secrets.clone(),
+            history: services.secret_history.clone(),
+            access: Arc::new(crate::secrets::SecretsAccessAdapter {
+                vault: services.secrets.clone(),
+                registry: Arc::new(ext_state.registry.clone()),
+                conversations: services.conversation_repo.clone(),
+                projects: Arc::new(aionui_db::SqliteProjectStore::new(services.database.pool().clone())),
+            }),
+        },
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(

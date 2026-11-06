@@ -991,6 +991,9 @@ async fn startup_adopts_unopened_legacy_upload_before_temp_removal() {
         missing_path.display()
     );
     let message = MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: "legacy-upload-message".to_owned(),
         conversation_id: conversation_id.clone(),
         msg_id: Some("legacy-upload-message".to_owned()),
@@ -1095,6 +1098,9 @@ async fn legacy_general_requires_persisted_profile_history_before_adoption() {
 
     let content = format!("attachment\n\n{AIONUI_FILES_MARKER}\n{}", legacy_path.display());
     let message = MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: "legacy-general-message".to_owned(),
         conversation_id: conversation_id.clone(),
         msg_id: Some("legacy-general-message".to_owned()),

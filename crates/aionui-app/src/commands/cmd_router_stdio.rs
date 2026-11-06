@@ -30,7 +30,7 @@ pub async fn run_router_stdio() -> ExitCode {
     }
 }
 #[derive(Clone)]
-struct RouterStdio {
+pub(crate) struct RouterStdio {
     client: reqwest::Client,
     url: String,
     user: String,
@@ -38,7 +38,7 @@ struct RouterStdio {
     token: String,
 }
 impl RouterStdio {
-    fn from_env() -> Result<Self, ()> {
+    pub(crate) fn from_env() -> Result<Self, ()> {
         let get = |key| {
             std::env::var(key)
                 .ok()
@@ -68,9 +68,60 @@ impl RouterStdio {
         })
     }
     async fn forward(&self, request: RouterChildCall) -> CallToolResult {
-        let result = self
-            .client
-            .post(&self.url)
+        self.forward_json(
+            &self.url,
+            &serde_json::json!(request),
+            MAX_RESPONSE_BYTES,
+            Duration::from_secs(55),
+            None,
+        )
+        .await
+    }
+    pub(crate) async fn forward_secret(
+        &self,
+        tool: &str,
+        request: &serde_json::Value,
+        request_id: Option<&str>,
+    ) -> CallToolResult {
+        let Some(base) = self.url.strip_suffix("/api/runtime/router-tools/call") else {
+            return CallToolResult::error(vec![Content::text("CONTEXT_REQUIRED")]);
+        };
+        self.forward_json(
+            &format!("{base}/api/runtime/secrets/tools/{tool}"),
+            request,
+            16 * 1024 * 1024,
+            Duration::from_secs(620),
+            request_id,
+        )
+        .await
+    }
+    pub(crate) async fn cancel_secret_question(&self, id: &str) {
+        let Some(base) = self.url.strip_suffix("/api/runtime/router-tools/call") else {
+            return;
+        };
+        let _ = self
+            .forward_json(
+                &format!("{base}/api/runtime/secrets/questions/{id}/cancel"),
+                &serde_json::json!({}),
+                4096,
+                Duration::from_secs(5),
+                None,
+            )
+            .await;
+    }
+    async fn forward_json(
+        &self,
+        url: &str,
+        request: &serde_json::Value,
+        limit: usize,
+        timeout: Duration,
+        request_id: Option<&str>,
+    ) -> CallToolResult {
+        let mut builder = self.client.post(url).timeout(timeout);
+        if let Some(id) = request_id {
+            builder = builder.header("x-aionui-secrets-request-id", id);
+        }
+        let result = builder
             .header("x-aionui-user-id", &self.user)
             .header("x-aionui-conversation-id", &self.conversation)
             .header("x-aionui-runtime-token", &self.token)
@@ -87,7 +138,7 @@ impl RouterStdio {
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
-                    if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                    if bytes.len() + chunk.len() > limit {
                         return CallToolResult::error(vec![Content::text("Router result exceeds output limit")]);
                     }
                     bytes.extend_from_slice(&chunk);
@@ -217,6 +268,40 @@ mod tests {
             serde_json::to_value(actual).unwrap(),
             serde_json::to_value(expected).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn secrets_stdio_has_its_own_larger_response_and_human_deadline() {
+        let server = MockServer::start().await;
+        let expected = serde_json::json!({"candidates":[{"value":"x".repeat(1024*1024)}]});
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(40))
+                    .set_body_json(&expected),
+            )
+            .mount(&server)
+            .await;
+        let mut host = client(format!("{}/api/runtime/router-tools/call", server.uri()));
+        host.client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(5))
+            .build()
+            .unwrap();
+        let result = host
+            .forward_secret(
+                "ellmsha_secret_history_search",
+                &serde_json::json!({}),
+                Some("synthetic-request"),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content[0].as_text().unwrap().text).unwrap(),
+            expected
+        );
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received[0].headers["x-aionui-secrets-request-id"], "synthetic-request");
     }
 
     #[tokio::test]

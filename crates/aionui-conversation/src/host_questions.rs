@@ -86,6 +86,9 @@ impl ConversationService {
         }
         let id = Self::mint_msg_id();
         let message = aionui_db::models::MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: id.clone(),
             conversation_id: chat.into(),
             msg_id: Some(id.clone()),
@@ -164,7 +167,34 @@ impl ConversationService {
             }
             Ok(())
         };
+        self.ask_user_authorized(&cap.user, chat, questions, valid).await
+    }
+
+    /// Neutral human-input boundary. The caller revalidates its dedicated runtime capability
+    /// throughout the wait; no memory capability or second approval system is involved.
+    pub async fn ask_user_authorized<F, Fut>(
+        &self,
+        owner: &str,
+        chat: &str,
+        questions: Vec<UserQuestion>,
+        valid: F,
+    ) -> Result<Value, ConversationError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(), ConversationError>>,
+    {
+        let turn = self
+            .runtime_state()
+            .active_turn_id_for(chat)
+            .ok_or_else(|| ConversationError::Busy {
+                reason: "The originating turn is no longer active".into(),
+            })?;
         valid().await?;
+        if self.runtime_state().active_turn_id_for(chat).as_ref() != Some(&turn) {
+            return Err(ConversationError::Forbidden {
+                reason: "The originating turn changed".into(),
+            });
+        }
         if !UserQuestion::valid_form(&questions) {
             return Err(ConversationError::bad_request("Invalid question form"));
         }
@@ -190,7 +220,7 @@ impl ConversationService {
             pending.insert(
                 id.clone(),
                 Pending {
-                    owner: cap.user.clone(),
+                    owner: owner.to_owned(),
                     chat: chat.to_owned(),
                     form: form.clone(),
                     reply: Some(reply),
@@ -200,14 +230,14 @@ impl ConversationService {
         let _form = OpenForm {
             registry: &self.host_questions,
             bus: self.broadcaster.as_ref(),
-            owner: &cap.user,
+            owner,
             chat,
             id: id.clone(),
         };
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.stream",
             json!({
-                "user_id": cap.user,
+                "user_id": owner,
                 "conversation_id": chat,
                 "turn_id": turn,
                 "msg_id": id,
@@ -216,18 +246,22 @@ impl ConversationService {
                 "position": "left"
             }),
         ));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
         loop {
             tokio::select! {
-                result = &mut rx => {
-                    let (answer, accepted) = result.map_err(|_| ConversationError::Busy { reason: "Question closed".into() })?;
-                    valid().await?;
-                    accepted.send(()).map_err(|_| ConversationError::Busy { reason: "Question response was cancelled".into() })?;
-                    return Ok(answer);
+                    _=tokio::time::sleep_until(deadline)=>return Err(ConversationError::Busy{reason:"Question timed out".into()}),
+                    result = &mut rx => {
+                        let (answer, accepted) = result.map_err(|_| ConversationError::Busy { reason: "Question closed".into() })?;
+                        valid().await?;
+            if self.runtime_state().active_turn_id_for(chat).as_ref()!=Some(&turn){return Err(ConversationError::Forbidden{reason:"The originating turn changed".into()});}
+                        accepted.send(()).map_err(|_| ConversationError::Busy { reason: "Question response was cancelled".into() })?;
+                        return Ok(answer);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                        valid().await?;
+            if self.runtime_state().active_turn_id_for(chat).as_ref()!=Some(&turn){return Err(ConversationError::Forbidden{reason:"The originating turn changed".into()});}
+                    }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                    valid().await?;
-                }
-            }
         }
     }
 

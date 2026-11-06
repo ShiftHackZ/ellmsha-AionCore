@@ -3025,6 +3025,9 @@ async fn list_artifacts_includes_legacy_cron_trigger_messages() {
     repo.insert_message(
         "user_1",
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "legacy-msg-1".into(),
             conversation_id: conv.id.clone(),
             msg_id: Some("legacy-trigger-1".into()),
@@ -5763,6 +5766,9 @@ async fn latest_conversation_error_message_prefers_error_detail() {
     repo.insert_message(
         "user_1",
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "msg_error".into(),
             conversation_id: conv.id.clone(),
             msg_id: None,
@@ -6095,6 +6101,9 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     repo.insert_message(
         "user_1",
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "visible-stale".into(),
             conversation_id: conv.id.clone(),
             msg_id: Some("visible-stale".into()),
@@ -6112,6 +6121,9 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     repo.insert_message(
         "user_1",
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: "empty-stale".into(),
             conversation_id: conv.id.clone(),
             msg_id: Some("empty-stale".into()),
@@ -8814,6 +8826,9 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
     let _ = broadcaster.take_events();
 
     let row = MessageRow {
+        revision: 0,
+        redacted: false,
+
         id: "msg-mirror-1".into(),
         conversation_id: conv.id.clone(),
         msg_id: Some("msg-mirror-1".into()),

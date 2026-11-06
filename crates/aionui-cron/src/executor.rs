@@ -311,6 +311,9 @@ impl JobExecutor {
         // ConversationService entirely; for now we reuse the mint function to
         // keep the id format consistent without reshuffling ownership.
         let row = MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: ConversationService::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
             msg_id: None,

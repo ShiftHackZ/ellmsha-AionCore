@@ -309,3 +309,189 @@ async fn unresolved_registered_project_cannot_fall_back_to_workspace_rules() {
             .contains("project service is not ready; task not started")
     );
 }
+
+#[tokio::test]
+async fn fresh_builds_keep_separate_secrets_and_helper_tokens_until_binding_changes() {
+    use aionui_ai_agent::{RuntimeTokenError, RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+    use aionui_db::{ISecretsRepository, SqliteSecretsRepository};
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins/secrets");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(
+        plugins.join("aion-extension.json"),
+        json!({"name":"secrets", "version":"1.0.0", "apiVersion":"1.0.0", "contributes":{}}).to_string(),
+    )
+    .unwrap();
+    let (svc, events, _, _) = make_service();
+    let registry = ExtensionRegistry::new(
+        ExtensionStateStore::new(tmp.path().join("states.json")),
+        events,
+        "1.0.0".into(),
+    );
+    registry
+        .initialize_with_scan_paths(vec![ScanPath {
+            path: tmp.path().join("plugins"),
+            source: ExtensionSource::Builtin,
+        }])
+        .await
+        .unwrap();
+    registry.enable_extension_for_user("user_1", "secrets").await.unwrap();
+    let vault = Arc::new(
+        SqliteSecretsRepository::open(&tmp.path().join("vault.sqlite"))
+            .await
+            .unwrap(),
+    );
+    let tokens = Arc::new(RuntimeTokenService::new());
+    let svc = svc
+        .with_secrets_repository(vault.clone())
+        .with_runtime_token_service(tokens.clone())
+        .with_runtime_helper_context("/synthetic/aioncore".into(), "http://127.0.0.1:9".into());
+    svc.with_plugin_registry(registry.clone());
+    let mut request = isolated_request(tmp.path());
+    request.tool_scope = ConversationToolScope::Default;
+    let chat = svc.create("user_1", request).await.unwrap();
+    let manager = Arc::new(RebuildingScriptedTaskManager::new(
+        (0..6).map(|_| fixture_agent(&chat.id, tmp.path())).collect(),
+    ));
+    let tasks: Arc<dyn IWorkerTaskManager> = manager.clone();
+    let token = |options: &BuildTaskOptions| {
+        options
+            .context
+            .runtime_env
+            .iter()
+            .find(|(k, _)| k == AIONUI_RUNTIME_TOKEN_ENV)
+            .unwrap()
+            .1
+            .clone()
+    };
+    let validate = |raw: &str, scope| {
+        tokens.validate(
+            Some(raw),
+            "user_1",
+            &chat.id,
+            scope,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        )
+    };
+    svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
+    let initial = token(&manager.captured_options()[0]);
+    assert_eq!(
+        validate(&initial, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::ScopeMissing
+    );
+    // Vault initialized in an existing chat. The repository fixture supplies only the
+    // public envelope ID consumed by composition; encryption is covered in vault tests.
+    vault
+        .replace("user_1", None, br#"{"id":"vault-one","incarnation":"incarnation-one"}"#)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
+    }
+    let options = manager.captured_options();
+    let first = token(&options[1]);
+    let second = token(&options[2]);
+    assert_eq!(
+        first, second,
+        "same-scope fresh builds must not revoke and reissue tokens"
+    );
+    assert_eq!(
+        validate(&first, RuntimeTokenScope::ConversationHelper)
+            .unwrap()
+            .conversation_id,
+        chat.id
+    );
+    assert_eq!(
+        validate(&first, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::ScopeMissing
+    );
+    let secret_token = |options: &BuildTaskOptions| {
+        let AgentSessionKind::Aionrs(context) = &options.context.kind else {
+            panic!("native fixture")
+        };
+        let server = context
+            .config
+            .session_mcp_servers
+            .iter()
+            .find(|s| s.id == "ellmsha-secrets")
+            .unwrap();
+        let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &server.transport else {
+            panic!("stdio fixture")
+        };
+        env.get(AIONUI_RUNTIME_TOKEN_ENV).unwrap().clone()
+    };
+    let secret = secret_token(&options[1]);
+    assert_eq!(secret, secret_token(&options[2]));
+    assert_ne!(secret, first);
+    assert_eq!(
+        validate(&secret, RuntimeTokenScope::SecretsCall)
+            .unwrap()
+            .conversation_id,
+        chat.id
+    );
+    assert_eq!(
+        validate(&secret, RuntimeTokenScope::ConversationHelper).unwrap_err(),
+        RuntimeTokenError::ScopeMissing
+    );
+    assert!(!options[1].context.runtime_env.iter().any(|(_, value)| value == &secret));
+
+    vault
+        .replace(
+            "user_1",
+            Some(1),
+            br#"{"id":"vault-two","incarnation":"incarnation-two"}"#,
+        )
+        .await
+        .unwrap();
+    svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
+    let rebound = token(&manager.captured_options()[3]);
+    assert_eq!(
+        first, rebound,
+        "vault rotation must not revoke general helper authority"
+    );
+    assert_eq!(
+        validate(&secret, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::Unknown
+    );
+    let rebound_secret = secret_token(&manager.captured_options()[3]);
+    assert_ne!(secret, rebound_secret);
+    vault
+        .replace(
+            "user_1",
+            Some(2),
+            br#"{"id":"vault-one","incarnation":"incarnation-one"}"#,
+        )
+        .await
+        .unwrap();
+    svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
+    let back_to_a = secret_token(&manager.captured_options()[4]);
+    assert_ne!(back_to_a, secret);
+    assert_eq!(
+        validate(&secret, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::Unknown
+    );
+    assert_eq!(
+        validate(&rebound_secret, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::Unknown
+    );
+    registry
+        .disable_extension_for_user("user_1", "secrets", None)
+        .await
+        .unwrap();
+    svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
+    let disabled = token(&manager.captured_options()[5]);
+    assert_eq!(
+        validate(&rebound_secret, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::Unknown
+    );
+    assert_eq!(
+        validate(&disabled, RuntimeTokenScope::SecretsCall).unwrap_err(),
+        RuntimeTokenError::ScopeMissing
+    );
+    assert_eq!(
+        validate(&disabled, RuntimeTokenScope::ConversationHelper)
+            .unwrap()
+            .conversation_id,
+        chat.id
+    );
+}

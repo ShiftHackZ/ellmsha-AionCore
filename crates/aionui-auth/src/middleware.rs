@@ -38,6 +38,10 @@ pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
 }
 
+/// Present only after verifying a real user session, never local/helper impersonation.
+#[derive(Clone)]
+pub struct VerifiedHumanSession;
+
 /// Authenticated user injected into request extensions by the auth middleware.
 ///
 /// Route handlers extract this from `request.extensions()` to identify
@@ -135,6 +139,7 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
+    request.extensions_mut().insert(VerifiedHumanSession);
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),

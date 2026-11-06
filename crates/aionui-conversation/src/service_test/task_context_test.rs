@@ -74,6 +74,9 @@ async fn insert(
     repo.insert_message(
         "task-user",
         &MessageRow {
+            revision: 0,
+            redacted: false,
+
             id: id.into(),
             conversation_id: chat.into(),
             msg_id: Some(id.into()),

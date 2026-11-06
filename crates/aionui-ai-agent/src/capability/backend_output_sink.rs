@@ -1,4 +1,5 @@
 use aion_agent::output::OutputSink;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use crate::protocol::events::{
@@ -7,12 +8,14 @@ use crate::protocol::events::{
 };
 
 pub struct BackendOutputSink {
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    event_tx: crate::capability::sensitive::EventSender,
 }
 
 impl BackendOutputSink {
-    pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+    pub(crate) fn new(event_tx: impl Into<crate::capability::sensitive::EventSender>) -> Self {
+        Self {
+            event_tx: event_tx.into(),
+        }
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
