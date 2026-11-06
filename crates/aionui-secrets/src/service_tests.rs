@@ -12,8 +12,12 @@ async fn idle_keys_expire_without_a_later_api_call_and_metadata_poll_does_not_re
         .initialize("owner", Zeroizing::new("synthetic test passphrase".into()))
         .await
         .unwrap();
-    let earlier = Instant::now() - Duration::from_secs(120);
-    service.unlocked.lock().await.get_mut("owner").unwrap().last_used = earlier;
+    let earlier = service.unlocked.lock().await["owner"].last_used;
+    // Advance the runtime clock instead of subtracting from a young Windows clock.
+    // Resume before SQLite awaits so its worker cannot auto-advance idle time.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    tokio::time::resume();
     service.status("owner").await.unwrap();
     service
         .list(
@@ -31,7 +35,9 @@ async fn idle_keys_expire_without_a_later_api_call_and_metadata_poll_does_not_re
         .await
         .unwrap();
     assert_eq!(service.unlocked.lock().await["owner"].last_used, earlier);
-    service.unlocked.lock().await.get_mut("owner").unwrap().last_used = Instant::now() - Duration::from_secs(901);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(781)).await;
+    tokio::time::resume();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     // Inspect key ownership directly: no status/key request is allowed to trigger cleanup.
     assert!(service.unlocked.lock().await.is_empty());

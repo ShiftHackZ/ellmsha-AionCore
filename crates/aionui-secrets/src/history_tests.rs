@@ -5,7 +5,10 @@ async fn expired_handles_are_rejected_without_database_access() {
     let service = SecretHistoryService::new(Arc::new(aionui_db::SqliteSecretHistoryRepository::new(
         db.pool().clone(),
     )));
-    let created = Instant::now() - Duration::from_secs(601);
+    let created = Instant::now();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::time::resume();
     service.candidates.lock().await.insert(
         "expired".into(),
         Candidate {
@@ -96,9 +99,9 @@ async fn completed_mask_retries_normalize_uuid_even_after_candidate_expiry() {
         candidate_ids: found.candidates.into_iter().map(|c| c.candidate_id).collect(),
     };
     let first = service.mask(owner, "chat", None, request.clone()).await.unwrap();
-    for candidate in service.candidates.lock().await.values_mut() {
-        candidate.created = Instant::now() - Duration::from_secs(601);
-    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::time::resume();
     for spelling in [
         operation.to_string().to_uppercase(),
         operation.simple().to_string(),

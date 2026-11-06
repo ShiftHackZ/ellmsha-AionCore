@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
 
 #[derive(Clone)]

@@ -7,12 +7,8 @@ use aionui_db::{DbError, ISecretsRepository};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tokio::sync::Mutex;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
