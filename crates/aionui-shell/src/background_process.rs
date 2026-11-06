@@ -203,17 +203,23 @@ impl BackgroundProcessService {
         let buffer = output.clone();
         tokio::task::spawn_blocking(move || {
             let mut chunk = [0u8; 8192];
+            let mut idle_delay_ms = 1;
             loop {
                 let count = match reader.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(count) => count,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(25));
+                        // Small macOS PTY buffers can empty between every write.
+                        // A fixed 25 ms pause throttles active output; back off
+                        // only while idle, then reset as soon as bytes arrive.
+                        std::thread::sleep(Duration::from_millis(idle_delay_ms));
+                        idle_delay_ms = (idle_delay_ms * 2).min(25);
                         continue;
                     }
                     Err(_) => break,
                 };
+                idle_delay_ms = 1;
                 let mut output = buffer.lock().unwrap();
                 output.parser.process(&chunk[..count]);
                 output.offset += count as u64;
