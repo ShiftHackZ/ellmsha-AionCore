@@ -66,6 +66,17 @@ impl IProjectStore for SqliteProjectStore {
         .await?)
     }
 
+    async fn list_standard_projects_with_conversations(&self, user_id: &str) -> Result<Vec<ProjectRow>, DbError> {
+        Ok(sqlx::query_as::<_, ProjectRow>(&format!(
+            "SELECT {PROJECT_COLS} FROM projects WHERE user_id = ? AND kind = 'standard' \
+             AND EXISTS (SELECT 1 FROM conversations c WHERE c.project_id = projects.project_id AND c.user_id = projects.user_id) \
+             ORDER BY name COLLATE NOCASE, project_id"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     async fn get_project(&self, user_id: &str, project_id: &str) -> Result<Option<ProjectRow>, DbError> {
         let row = sqlx::query_as::<_, ProjectRow>(&format!(
             "SELECT {PROJECT_COLS} FROM projects WHERE project_id = ? AND user_id = ?"

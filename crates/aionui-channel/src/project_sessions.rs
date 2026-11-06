@@ -29,16 +29,13 @@ fn button(label: String, action: &str, key: &str, value: String) -> ActionButton
     }
 }
 
-/// Re-resolve the owner's current standard-project workspace on every selection.
+/// Resolve a project from the owner-filtered, conversation-backed selection list.
 pub(crate) async fn workspace(
     store: &dyn IProjectStore,
     owner: &str,
-    id: &str,
+    project: ProjectRow,
 ) -> Result<Option<(ProjectRow, String)>, ChannelError> {
-    let Some(project) = store.get_project(owner, id).await?.filter(|p| p.kind == "standard") else {
-        return Ok(None);
-    };
-    let entries = store.list_entries(owner, id).await?;
+    let entries = store.list_entries(owner, &project.project_id).await?;
     let Some((_, folder)) = entries.into_iter().find(|(e, _)| e.role == Role::Workspace.as_str()) else {
         return Ok(None);
     };
@@ -64,7 +61,7 @@ impl ActionExecutor {
             .project_store
             .as_ref()
             .ok_or_else(|| ChannelError::InvalidConfig("Project selection unavailable".into()))?;
-        let projects = store.list_standard_projects(owner).await?;
+        let projects = store.list_standard_projects_with_conversations(owner).await?;
         let page = action
             .params
             .as_ref()
@@ -131,7 +128,16 @@ impl ActionExecutor {
                     .project_store
                     .as_ref()
                     .ok_or_else(|| ChannelError::InvalidConfig("Project selection unavailable".into()))?;
-                let Some((project, path)) = workspace(store.as_ref(), owner, id).await? else {
+                let project = store
+                    .list_standard_projects_with_conversations(owner)
+                    .await?
+                    .into_iter()
+                    .find(|project| project.project_id == id);
+                let selected = match project {
+                    Some(project) => workspace(store.as_ref(), owner, project).await?,
+                    None => None,
+                };
+                let Some((project, path)) = selected else {
                     return Ok(response("This project is unavailable. Your current session was not changed. Use /new to choose an available project.".into(), Vec::new()));
                 };
                 (project.name, Some(path))

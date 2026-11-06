@@ -487,6 +487,7 @@ async fn project_setup() -> (
 }
 
 async fn add_project(
+    db: &aionui_db::Database,
     store: &dyn aionui_db::IProjectStore,
     owner: &str,
     path: &std::path::Path,
@@ -495,12 +496,23 @@ async fn add_project(
 ) -> String {
     let uri = url::Url::from_file_path(path).unwrap().to_string();
     let folder = store.upsert_folder(&uri, &uri).await.unwrap();
-    store
+    let project = store
         .create_project_with_workspace_entry(owner, &folder.folder_id, name, kind)
         .await
         .unwrap()
-        .0
-        .project_id
+        .0;
+    use aionui_db::IConversationRepository;
+    let chat = serde_json::from_value(serde_json::json!({
+        "id":format!("chat-{}", project.project_id), "user_id":owner,
+        "name":"Desktop chat", "type":"aionrs", "extra":"{}", "pinned":false, "status":"finished",
+        "created_at":1, "updated_at":1, "project_id":project.project_id,
+    }))
+    .unwrap();
+    aionui_db::SqliteConversationRepository::new(db.pool().clone())
+        .create(&chat)
+        .await
+        .unwrap();
+    project.project_id
 }
 
 fn select_project(user: &str, chat: &str, project: &str) -> UnifiedIncomingMessage {
@@ -511,11 +523,12 @@ fn select_project(user: &str, chat: &str, project: &str) -> UnifiedIncomingMessa
 
 #[tokio::test]
 async fn project_picker_is_non_destructive_and_selection_is_isolated_and_persisted() {
-    let (executor, projects, repo, _db) = project_setup().await;
+    let (executor, projects, repo, db) = project_setup().await;
     let uid = create_user(&repo, "p-project", "telegram").await;
     let dir = std::env::temp_dir().join(format!("channel-project-{}", generate_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let project = add_project(
+        &db,
         projects.as_ref(),
         OWNER_ID,
         &dir,
@@ -580,6 +593,7 @@ async fn project_picker_rejects_foreign_missing_and_unavailable_projects_without
     let dir = std::env::temp_dir().join(format!("channel-foreign-{}", generate_id()));
     std::fs::create_dir_all(&dir).unwrap();
     let foreign_id = add_project(
+        &db,
         projects.as_ref(),
         &foreign.id,
         &dir,
@@ -589,6 +603,7 @@ async fn project_picker_rejects_foreign_missing_and_unavailable_projects_without
     .await;
     let missing_path = dir.join("missing");
     let unavailable = add_project(
+        &db,
         projects.as_ref(),
         OWNER_ID,
         &missing_path,
@@ -632,12 +647,13 @@ async fn project_picker_rejects_foreign_missing_and_unavailable_projects_without
 
 #[tokio::test]
 async fn project_picker_paginates_owned_standard_projects_and_bounds_callback_size() {
-    let (executor, projects, repo, _db) = project_setup().await;
+    let (executor, projects, repo, db) = project_setup().await;
     create_user(&repo, "p-pages", "telegram").await;
     let dir = std::env::temp_dir().join(format!("channel-pages-{}", generate_id()));
     std::fs::create_dir_all(&dir).unwrap();
     for i in 0..10 {
         add_project(
+            &db,
             projects.as_ref(),
             OWNER_ID,
             &dir.join(i.to_string()),
@@ -647,6 +663,7 @@ async fn project_picker_paginates_owned_standard_projects_and_bounds_callback_si
         .await;
     }
     add_project(
+        &db,
         projects.as_ref(),
         OWNER_ID,
         &dir.join("temp"),
@@ -681,5 +698,109 @@ async fn project_picker_paginates_owned_standard_projects_and_bounds_callback_si
     };
     assert!(page.text.unwrap().contains("page 2 of 2"));
     assert!(page.buttons.unwrap().iter().flatten().any(|b| b.label == "Project 09"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn project_picker_refreshes_after_history_deletion_and_rejects_old_buttons() {
+    use aionui_db::IConversationRepository;
+    let (executor, projects, repo, db) = project_setup().await;
+    create_user(&repo, "deleted-projects", "telegram").await;
+    let dir = std::env::temp_dir().join(format!("channel-deleted-{}", generate_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut ids = Vec::new();
+    for i in 0..9 {
+        let path = dir.join(i.to_string());
+        std::fs::create_dir_all(&path).unwrap();
+        ids.push(
+            add_project(
+                &db,
+                projects.as_ref(),
+                OWNER_ID,
+                &path,
+                &format!("Project {i:02}"),
+                aionui_db::ProjectKind::Standard,
+            )
+            .await,
+        );
+    }
+    executor
+        .handle_incoming_message(&make_text_message("deleted-projects", "chat", "hello"))
+        .await
+        .unwrap();
+    let sessions = SessionManager::new(repo);
+    let before = sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id.clone();
+    let MessageResult::Action(menu) = executor
+        .handle_incoming_message(&make_text_message("deleted-projects", "chat", "/new"))
+        .await
+        .unwrap()
+    else {
+        panic!("expected menu")
+    };
+    assert!(menu.text.unwrap().contains("page 1 of 2"));
+    let next = menu
+        .buttons
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .find(|b| b.label == "More projects")
+        .unwrap();
+    let mut page = make_action_message("deleted-projects", "chat", &next.action, ActionCategory::System);
+    page.action.as_mut().unwrap().params = next.params;
+    let conversations = aionui_db::SqliteConversationRepository::new(db.pool().clone());
+    // Deleting only one chat must keep a project that still has another chat.
+    let mut second = conversations
+        .get(OWNER_ID, &format!("chat-{}", ids[0]))
+        .await
+        .unwrap()
+        .unwrap();
+    second.id = "second-chat".into();
+    conversations.create(&second).await.unwrap();
+    conversations
+        .delete(OWNER_ID, &format!("chat-{}", ids[0]))
+        .await
+        .unwrap();
+    // This is the repository deletion used by the desktop Remove project flow.
+    conversations
+        .delete(OWNER_ID, &format!("chat-{}", ids[8]))
+        .await
+        .unwrap();
+    assert!(
+        projects.get_project(OWNER_ID, &ids[8]).await.unwrap().is_some(),
+        "registry survives history deletion"
+    );
+    for request in [make_text_message("deleted-projects", "chat", "/new"), page.clone()] {
+        let MessageResult::Action(menu) = executor.handle_incoming_message(&request).await.unwrap() else {
+            panic!("expected menu")
+        };
+        assert!(menu.text.unwrap().contains("page 1 of 1"));
+        let buttons = menu.buttons.unwrap();
+        let labels: Vec<_> = buttons.iter().flatten().map(|b| b.label.as_str()).collect();
+        assert!(labels.contains(&"Project 00"));
+        assert!(!labels.contains(&"Project 08"));
+        assert!(!labels.contains(&"More projects"));
+        assert!(!labels.contains(&"Previous projects"));
+    }
+    let MessageResult::Action(reply) = executor
+        .handle_incoming_message(&select_project("deleted-projects", "chat", &ids[8]))
+        .await
+        .unwrap()
+    else {
+        panic!("expected refusal")
+    };
+    assert!(reply.text.unwrap().contains("unavailable"));
+    assert_eq!(sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id, before);
+    conversations.delete(OWNER_ID, "second-chat").await.unwrap();
+    for id in &ids[1..8] {
+        conversations.delete(OWNER_ID, &format!("chat-{id}")).await.unwrap();
+    }
+    let MessageResult::Action(empty) = executor.handle_incoming_message(&page).await.unwrap() else {
+        panic!("expected empty menu")
+    };
+    assert!(empty.text.unwrap().contains("page 1 of 1"));
+    let buttons = empty.buttons.unwrap();
+    assert_eq!(buttons.len(), 1);
+    assert_eq!(buttons[0][0].label, "Temporary chat (no project)");
+    assert_eq!(sessions.get_active_sessions(OWNER_ID).await.unwrap()[0].id, before);
     std::fs::remove_dir_all(dir).unwrap();
 }

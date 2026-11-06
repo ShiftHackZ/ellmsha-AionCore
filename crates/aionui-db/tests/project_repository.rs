@@ -267,3 +267,62 @@ async fn get_missing_project_and_entry_return_none() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn conversation_project_listing_excludes_orphans_temp_and_foreign_history() {
+    use aionui_db::{IConversationRepository, IUserRepository, SqliteConversationRepository, SqliteUserRepository};
+    let (store, db) = store().await;
+    let owner = "system_default_user";
+    let foreign = SqliteUserRepository::new(db.pool().clone())
+        .create_user("project-list-foreign", "test-only-hash")
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for (name, user, kind) in [
+        ("Orphan", owner, ProjectKind::Standard),
+        ("Live", owner, ProjectKind::Standard),
+        ("Foreign", foreign.id.as_str(), ProjectKind::Standard),
+        ("Temp", owner, ProjectKind::Temp),
+    ] {
+        let uri = format!("file:///project-list/{name}");
+        let folder = store.upsert_folder(&uri, &uri).await.unwrap();
+        let project = store
+            .create_project_with_workspace_entry(user, &folder.folder_id, name, kind)
+            .await
+            .unwrap()
+            .0;
+        ids.push(project.project_id.clone());
+        // Even a foreign conversation referencing an owner's orphan project
+        // must not make it a selectable project for that owner.
+        let chat_owner = if name == "Orphan" { foreign.id.as_str() } else { user };
+        sqlx::query("INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at, project_id) VALUES (?, ?, 'Chat', 'aionrs', '{}', 1, 1, ?)")
+            .bind(format!("chat-{name}")).bind(chat_owner).bind(&project.project_id).execute(db.pool()).await.unwrap();
+    }
+    let visible = store.list_standard_projects_with_conversations(owner).await.unwrap();
+    assert_eq!(visible.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Live"]);
+    assert_eq!(
+        store
+            .list_standard_projects_with_conversations(&foreign.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store.list_standard_projects(owner).await.unwrap().len(),
+        2,
+        "registry lookup keeps its existing contract"
+    );
+    SqliteConversationRepository::new(db.pool().clone())
+        .delete(owner, "chat-Live")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_standard_projects_with_conversations(owner)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.get_project(owner, &ids[1]).await.unwrap().is_some());
+}

@@ -30,6 +30,15 @@ pub trait IProjectStore: Send + Sync {
         Err(DbError::Init("project listing is unsupported by this store".into()))
     }
 
+    /// Standard projects represented in this owner's current conversation history.
+    /// Removed sidebar projects retain their registry entries for workspace reuse,
+    /// but must not be offered as new channel-session choices.
+    async fn list_standard_projects_with_conversations(&self, _user_id: &str) -> Result<Vec<ProjectRow>, DbError> {
+        Err(DbError::Init(
+            "conversation project listing is unsupported by this store".into(),
+        ))
+    }
+
     /// The workspace entry (if any) of `user_id` whose folder is `folder_id`.
     /// At most one exists per owner (enforced by
     /// `UNIQUE(owner_user_id, folder_id) WHERE role = 'workspace'`).

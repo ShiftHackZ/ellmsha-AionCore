@@ -165,10 +165,9 @@ impl ChannelMessageService {
                 .project_store
                 .as_ref()
                 .ok_or_else(|| ChannelError::InvalidConfig("Project selection unavailable".into()))?;
-            for project in store.list_standard_projects(owner_user_id).await? {
+            for project in store.list_standard_projects_with_conversations(owner_user_id).await? {
                 if let Some((project, path)) =
-                    crate::action::project_sessions::workspace(store.as_ref(), owner_user_id, &project.project_id)
-                        .await?
+                    crate::action::project_sessions::workspace(store.as_ref(), owner_user_id, project).await?
                     && path == selected_workspace
                 {
                     selected_project_id = Some(project.project_id);

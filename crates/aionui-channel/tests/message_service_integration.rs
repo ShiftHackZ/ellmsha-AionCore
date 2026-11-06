@@ -582,6 +582,17 @@ async fn selected_project_reaches_conversation_runtime_and_memory_on_every_chann
         .await
         .unwrap()
         .0;
+    let desktop = serde_json::from_value(serde_json::json!({
+        "id":"desktop-project-chat", "user_id":TEST_OWNER_USER_ID,
+        "name":"Desktop chat", "type":"aionrs", "extra":"{}", "pinned":false, "status":"finished",
+        "created_at":1, "updated_at":1, "project_id":project.project_id,
+    }))
+    .unwrap();
+    SqliteConversationRepository::new(pool.clone())
+        .create(&desktop)
+        .await
+        .unwrap();
+    let mut owned = vec!["desktop-project-chat".to_owned()];
     let manager = Arc::new(RecordingTaskManager::new());
     let tasks: Arc<dyn IWorkerTaskManager> = manager.clone();
     let conversations = Arc::new(SqliteConversationRepository::new(pool.clone()));
@@ -622,6 +633,7 @@ async fn selected_project_reaches_conversation_runtime_and_memory_on_every_chann
             .send_to_agent(TEST_OWNER_USER_ID, &session, "project-scoped test", platform)
             .await
             .unwrap();
+        owned.push(result.conversation_id.clone());
         let saved = conversations
             .get(TEST_OWNER_USER_ID, &result.conversation_id)
             .await
@@ -640,6 +652,19 @@ async fn selected_project_reaches_conversation_runtime_and_memory_on_every_chann
         );
         assert_eq!(built.memory_recall.project_name.as_deref(), Some("SequelCare"));
     }
+    // A selected-but-not-yet-started session must not resurrect a removed project.
+    for id in owned {
+        conversations.delete(TEST_OWNER_USER_ID, &id).await.unwrap();
+    }
+    let count = manager.builds.lock().unwrap().len();
+    let error = channel
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "removed project", PluginType::Telegram)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ChannelError::InvalidConfig(ref message) if message.contains("Selected project is unavailable"))
+    );
+    assert_eq!(manager.builds.lock().unwrap().len(), count);
     session.workspace = Some(workspace.join("not-registered").to_string_lossy().into_owned());
     let count = manager.builds.lock().unwrap().len();
     assert!(
