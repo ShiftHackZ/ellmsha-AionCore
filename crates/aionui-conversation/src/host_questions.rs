@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::IWorkerTaskManager;
 use aionui_api_types::WebSocketMessage;
-use aionui_common::{Confirmation, UserQuestion, generate_id};
+use aionui_common::{Confirmation, QuestionAnswer, UserQuestion, generate_id};
 use aionui_realtime::EventBroadcaster;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
+use crate::runtime_persistence::RuntimeWriteKind;
 use crate::{ConversationError, ConversationService};
 
 pub(crate) struct Pending {
@@ -45,6 +46,78 @@ impl Drop for OpenForm<'_> {
 }
 
 impl ConversationService {
+    /// Retain accepted answers that resume an existing turn instead of sending a
+    /// new chat message. The transcript is display/history only, never a second
+    /// provider send. Secret fields are not retained in this projection.
+    pub(crate) async fn persist_question_reply(
+        &self,
+        owner: &str,
+        chat: &str,
+        form: &Confirmation,
+        data: &Value,
+        created_at: i64,
+    ) -> Result<(), ConversationError> {
+        if form.questions.is_empty() || data.get("answers").is_none() {
+            return Ok(());
+        }
+        let answers: Vec<QuestionAnswer> = serde_json::from_value(data["answers"].clone())
+            .map_err(|_| ConversationError::bad_request("Invalid answer set"))?;
+        QuestionAnswer::validate(&form.questions, &answers).map_err(ConversationError::bad_request)?;
+        let replies: Vec<_> = form
+            .questions
+            .iter()
+            .map(|question| {
+                let answer = answers.iter().find(|a| a.question == question.id);
+                json!({
+                    "questionItemId": question.id,
+                    "question": question.question,
+                    "answer": if question.is_secret { "••••••".into() } else {
+                        answer.map(|a| a.labels.join(", ")).unwrap_or_default()
+                    }
+                })
+            })
+            .collect();
+        let content = format!(
+            "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+            json!(replies)
+        );
+        if !self.runtime_persistence().allows(chat, RuntimeWriteKind::UserMessage) {
+            return Ok(());
+        }
+        let id = Self::mint_msg_id();
+        let message = aionui_db::models::MessageRow {
+            id: id.clone(),
+            conversation_id: chat.into(),
+            msg_id: Some(id.clone()),
+            r#type: "text".into(),
+            content: json!({"content":content}).to_string(),
+            position: Some("right".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at,
+            backend_turn_id: None,
+        };
+        self.conversation_repo
+            .insert_message(owner, &message)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    conversation_id = chat,
+                    call_id = form.call_id,
+                    "Accepted question reply could not be stored"
+                );
+                ConversationError::from(error)
+            })?;
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "message.userCreated",
+            json!({
+                "user_id":owner,"conversation_id":chat,"msg_id":id,"content":content,
+                "position":"right","status":"finish","hidden":false,"created_at":created_at
+            }),
+        ));
+        Ok(())
+    }
+
     /// Questions are live only while the originating worker owns the same chat turn.
     pub async fn ask_user(
         &self,

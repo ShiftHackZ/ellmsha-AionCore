@@ -3817,6 +3817,7 @@ impl ConversationService {
         req: ConfirmRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
+        let submitted_at = now_ms();
         let conversation = self
             .conversation_repo
             .get(user_id, conversation_id)
@@ -3826,9 +3827,17 @@ impl ConversationService {
             })?;
 
         if call_id.starts_with("host-question:") {
-            return self
-                .answer_host_question(user_id, conversation_id, call_id, &req.data)
-                .await;
+            let form = self
+                .host_forms(user_id, conversation_id)
+                .into_iter()
+                .find(|c| c.call_id == call_id);
+            self.answer_host_question(user_id, conversation_id, call_id, &req.data)
+                .await?;
+            if let Some(form) = form {
+                self.persist_question_reply(user_id, conversation_id, &form, &req.data, submitted_at)
+                    .await?;
+            }
+            return Ok(());
         }
 
         let agent = task_manager
@@ -3838,12 +3847,9 @@ impl ConversationService {
             })?;
 
         let confirmations = agent.get_confirmations();
-        let conf_id = confirmations
-            .iter()
-            .find(|c| c.call_id == call_id)
-            .map(|c| c.id.clone());
+        let confirmation = confirmations.iter().find(|c| c.call_id == call_id);
 
-        if call_id.starts_with("async-question:")
+        let already_recorded = if call_id.starts_with("async-question:")
             && let AgentInstance::Session(session) = &agent
         {
             session
@@ -3877,16 +3883,23 @@ impl ConversationService {
                     .await
                     .map(|_| ())
                 })
-                .await?;
+                .await?
         } else {
-            agent.confirm(&req.msg_id, call_id, req.data, req.always_allow).await?;
-        }
+            agent
+                .confirm(&req.msg_id, call_id, req.data.clone(), req.always_allow)
+                .await?;
+            false
+        };
 
-        if let Some(conf_id) = conf_id {
+        if let Some(confirmation) = confirmation {
+            if !already_recorded {
+                self.persist_question_reply(user_id, conversation_id, confirmation, &req.data, submitted_at)
+                    .await?;
+            }
             let payload = serde_json::json!({
                 "user_id": user_id,
                 "conversation_id": conversation_id,
-                "id": conf_id,
+                "id": confirmation.id,
             });
             let msg = WebSocketMessage::new("confirmation.remove", payload);
             self.broadcaster.broadcast(msg);

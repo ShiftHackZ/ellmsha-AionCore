@@ -520,6 +520,25 @@ mod project_tests {
             .await
             .unwrap();
         assert_eq!(ask.await.unwrap().unwrap(), answers);
+        let history = services
+            .conversation_repo
+            .list_messages_page(
+                &row.user_id,
+                &row.id,
+                &aionui_db::MessagePageParams {
+                    limit: 20,
+                    direction: aionui_db::MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.items.len(), 1);
+        assert!(history.items[0].content.contains("Choose a language"));
+        assert!(history.items[0].content.contains("••••••"));
+        assert!(
+            !history.items[0].content.contains("custom"),
+            "Secret answer reaches worker but not chat history"
+        );
         assert!(
             services
                 .conversation_service

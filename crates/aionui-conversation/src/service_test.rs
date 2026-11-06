@@ -4304,6 +4304,187 @@ async fn ensure_runtime_recovers_missing_agent_and_returns_snapshot() {
 }
 
 #[tokio::test]
+async fn question_answers_survive_history_reload_without_duplicate_provider_delivery() {
+    use aionui_ai_agent::session_agent::SessionAgentTask;
+    use aionui_api_types::ConfirmRequest;
+    use aionui_session::{CodexSessionBackend, SessionBackend, SessionEvent, testing::FakeAgentIo};
+    use futures_util::StreamExt;
+
+    for mode in ["steered", "completed", "blocking", "dismissed"] {
+        let owner = "system_default_user";
+        let manager = Arc::new(MockTaskManager::new());
+        let (mut svc, broadcaster, _) = make_service_with_mock_task_manager(manager.clone());
+        let repo = Arc::new(aionui_db::SqliteConversationRepository::new(
+            init_database_memory().await.unwrap().pool().clone(),
+        ));
+        svc.conversation_repo = repo.clone();
+        let row = svc.create(owner, make_create_req_with_backend("codex")).await.unwrap();
+        broadcaster.take_events();
+        // Native shapes also exercised by the real CLI fixture recorded in
+        // .data/acceptance/rules-skills-questions-2026-11-05/question-cli-acceptance.json.
+        let item = json!({"type":"agentMessage","id":"ask","text":"Choose?","phase":"final_answer","delivery":"async",
+            "questions":[{"title":"Choose?","options":["A","B"]}]});
+        let question = if mode == "blocking" {
+            json!({"id":"wire-question","method":"item/tool/requestUserInput","params":{
+                "threadId":"root","turnId":"turn","itemId":"ask","questions":[{
+                    "id":"choice","header":"Choose","question":"Choose?","isOther":true,"isSecret":false,"options":[{"label":"A"},{"label":"B"}]
+                }]
+            }})
+        } else {
+            json!({"method":"item/completed","params":{"threadId":"root","turnId":"turn","item":item}})
+        };
+        let mut frames = vec![
+            json!({"method":"thread/started","params":{"thread":{"id":"root"}}}),
+            json!({"method":"turn/started","params":{"threadId":"root","turn":{"id":"turn"}}}),
+            question,
+        ];
+        if mode == "completed" {
+            frames.push(json!({"method":"turn/completed","params":{"threadId":"root","turn":{"id":"turn","status":"completed"}}}));
+        }
+        let frames = frames.into_iter().map(|v| v.to_string() + "\n").collect::<String>();
+        let ack = json!({"id":1,"jsonrpc":"2.0","result":{"turnId":"turn"}}).to_string() + "\n";
+        let fake = FakeAgentIo::never_exits(vec![]).with_gated_segments(vec![
+            frames.into_bytes(),
+            ack.into_bytes(),
+            b"{}\n".to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io(&row.id, Box::new(fake)).await);
+        let mut events = backend.events();
+        manager.insert_agent(
+            &row.id,
+            AgentInstance::Session(SessionAgentTask::new(
+                AgentType::Acp,
+                row.id.clone(),
+                owner.into(),
+                "/tmp".into(),
+                backend,
+                None,
+            )),
+        );
+        release();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(e) = events.next().await {
+                if (mode == "completed" && matches!(e.event, SessionEvent::TurnResult { .. }))
+                    || (mode != "completed"
+                        && matches!(
+                            e.event,
+                            SessionEvent::Permission { .. } | SessionEvent::AdapterSpecific { .. }
+                        ))
+                {
+                    return;
+                }
+            }
+            panic!("missing question fixture event");
+        })
+        .await
+        .unwrap();
+        let workers: Arc<dyn IWorkerTaskManager> = manager;
+        let form = svc
+            .list_confirmations(owner, &row.id, &workers)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let request = |data| ConfirmRequest {
+            msg_id: form.id.clone(),
+            data,
+            always_allow: false,
+        };
+        let answer = json!({"answers":[{"question":form.questions[0].id,"labels":["B"]}]});
+        assert!(
+            svc.confirm(
+                "another-user",
+                &row.id,
+                &form.call_id,
+                request(answer.clone()),
+                &workers
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            svc.confirm(owner, &row.id, &form.call_id, request(json!({"answers":[]})), &workers)
+                .await
+                .is_err()
+        );
+        let data = if mode == "dismissed" {
+            json!({"value":"reject"})
+        } else {
+            // Explicit answers take precedence over a stale generic reject value.
+            json!({"value":"reject", "answers":answer["answers"]})
+        };
+        let submitted_before = aionui_common::now_ms();
+        let responder = svc.confirm(owner, &row.id, &form.call_id, request(data), &workers);
+        let acknowledge = async {
+            if mode == "steered" {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !String::from_utf8_lossy(&captured.lock().await).contains("turn/steer") {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                release();
+            }
+        };
+        let (result, _) = tokio::join!(responder, acknowledge);
+        result.unwrap();
+        let accepted_at = aionui_common::now_ms();
+        assert!(
+            svc.confirm(owner, &row.id, &form.call_id, request(answer), &workers)
+                .await
+                .is_err()
+        );
+        let page = repo
+            .list_messages_page(
+                owner,
+                &row.id,
+                &MessagePageParams {
+                    limit: 20,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await
+            .unwrap();
+        let replies: Vec<_> = page
+            .items
+            .iter()
+            .filter(|m| m.position.as_deref() == Some("right"))
+            .collect();
+        if mode == "dismissed" {
+            assert!(replies.is_empty());
+        } else {
+            assert_eq!(replies.len(), 1, "{mode}: exactly one durable answer");
+            assert!(replies[0].created_at >= submitted_before);
+            if mode == "steered" {
+                assert!(
+                    replies[0].created_at < accepted_at - 10,
+                    "timestamp precedes provider acknowledgment"
+                );
+            }
+            let content: serde_json::Value = serde_json::from_str(&replies[0].content).unwrap();
+            assert!(content["content"].as_str().unwrap().contains(r#""answer":"B""#));
+            let emitted: Vec<_> = broadcaster
+                .take_events()
+                .into_iter()
+                .filter(|e| e.name == "message.userCreated")
+                .collect();
+            assert_eq!(emitted.len(), 1, "{mode}: exactly one live answer");
+            assert_eq!(emitted[0].data["msg_id"], replies[0].id);
+            assert_eq!(emitted[0].data["content"], content["content"]);
+        }
+        if mode == "steered" {
+            let sent = String::from_utf8(captured.lock().await.clone()).unwrap();
+            assert_eq!(sent.matches("turn/steer").count(), 1);
+            assert!(!sent.contains("turn/start"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn confirm_completed_codex_question_routes_via_owned_team_instead_of_standalone_send() {
     use aionui_ai_agent::session_agent::SessionAgentTask;
     use aionui_api_types::ConfirmRequest;

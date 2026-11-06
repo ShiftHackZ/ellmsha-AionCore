@@ -647,24 +647,26 @@ impl SessionAgentTask {
 
     /// A Codex async question can outlive the turn that asked it. Steer a running
     /// turn, or use the normal chat submission path once that turn has finished.
+    /// Returns whether the new-turn callback already recorded the user message.
     pub async fn answer_async_question<E, F, Fut>(
         &self,
         call_id: &str,
         data: &serde_json::Value,
         new_turn: F,
-    ) -> Result<(), E>
+    ) -> Result<bool, E>
     where
         E: From<AgentError>,
         F: FnOnce(String) -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
         let _guard = self.async_question_reply.lock().await;
+        let mut new_turn_started = false;
         let request = self
             .get_confirmations()
             .into_iter()
             .find(|q| q.call_id == call_id && !q.questions.is_empty())
             .ok_or_else(|| AgentError::conflict("Question is no longer pending"))?;
-        if confirm_option_id(data).as_deref() != Some("reject") {
+        if confirm_option_id(data).as_deref() != Some("reject") || data.get("answers").is_some() {
             let answers: Vec<aionui_session::QuestionAnswer> = serde_json::from_value(data["answers"].clone())
                 .map_err(|_| AgentError::bad_request("Invalid question answers"))?;
             aionui_session::QuestionAnswer::validate(&request.questions, &answers).map_err(AgentError::bad_request)?;
@@ -694,10 +696,11 @@ impl SessionAgentTask {
                 .map_err(|e| AgentError::internal(e.to_string()))?
             {
                 new_turn(text).await?;
+                new_turn_started = true;
             }
         }
         self.backend.finish_async_question(call_id);
-        Ok(())
+        Ok(new_turn_started)
     }
 
     pub async fn confirm(
