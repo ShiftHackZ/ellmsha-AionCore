@@ -62,6 +62,23 @@ struct SubagentTranscriptState {
     adapter: StreamPersistenceAdapter,
     active_text: Option<TextSegmentState>,
     active_thinking: Option<ThinkingSegmentState>,
+    last_segment_at: i64,
+}
+
+// Message pagination uses (created_at, random id). Preserve arrival order when
+// multiple child segments begin within one clock tick, including clock rollback.
+fn next_child_segment_time(last: &mut i64, now: i64) -> i64 {
+    *last = now.max(last.saturating_add(1));
+    *last
+}
+
+#[test]
+fn child_segment_times_preserve_order_with_tied_or_reversed_clock() {
+    let mut last = 0;
+    assert_eq!(next_child_segment_time(&mut last, 100), 100);
+    assert_eq!(next_child_segment_time(&mut last, 100), 101);
+    assert_eq!(next_child_segment_time(&mut last, 90), 102);
+    assert_eq!(next_child_segment_time(&mut last, 200), 200);
 }
 
 /// Stores attributed child-thread output under a read-only conversation. The
@@ -254,6 +271,7 @@ impl SubagentTranscriptStore {
                 ),
                 active_text: None,
                 active_thinking: None,
+                last_segment_at: 0,
             });
         let conversation_id = state.conversation_id.clone();
         match event {
@@ -265,7 +283,7 @@ impl SubagentTranscriptStore {
                 let segment = state.active_text.get_or_insert_with(|| TextSegmentState {
                     id: ConversationService::mint_msg_id(),
                     buffer: String::new(),
-                    created_at: now_ms(),
+                    created_at: next_child_segment_time(&mut state.last_segment_at, now_ms()),
                     record_created: false,
                     flush_counter: 0,
                 });
