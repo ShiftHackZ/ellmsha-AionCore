@@ -68,46 +68,52 @@ pub fn discover_roots(roots: &[PathBuf]) -> io::Result<Vec<ProjectSourceRoot>> {
         }
     }
     let mut found = BTreeMap::new();
-    let mut visited = 0;
+    // The budget limits optional discovery only. Explicitly attached roots and
+    // complete shallower levels remain usable even in very wide repositories.
+    let mut remaining = 4096_usize;
     for root in &registered {
-        let mut pending = vec![(root.clone(), 0)];
-        while let Some((dir, depth)) = pending.pop() {
-            visited += 1;
-            if visited > 4096 {
-                return Err(io::Error::other(
-                    "Project repository discovery limit exceeded; attach repositories directly",
-                ));
-            }
-            let repository =
-                fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| !is_link(&m) && (m.is_file() || m.is_dir()));
-            if depth == 0 || repository {
-                found.insert(
-                    dir.clone(),
-                    ProjectSourceRoot {
-                        root: root.clone(),
-                        directory: dir.clone(),
-                    },
-                );
-            }
-            // A registered repository can itself contain independent repos or submodules.
-            // Once a nested repo is found it can be attached separately for deeper discovery.
-            if depth == 3 || (depth != 0 && repository) {
-                continue;
-            }
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                if !ignored_directory(&entry.file_name().to_string_lossy()) && entry.file_type()?.is_dir() {
-                    let child = entry.path();
-                    if !registered.contains(&child) && !is_link(&fs::symlink_metadata(&child)?) {
-                        if visited + pending.len() >= 4096 {
-                            return Err(io::Error::other(
-                                "Project repository discovery limit exceeded; attach repositories directly",
-                            ));
-                        }
-                        pending.push((child, depth + 1));
+        let mut level = vec![root.clone()];
+        for depth in 0..=3 {
+            let mut next = Vec::new();
+            let mut full = false;
+            for dir in level {
+                let repository =
+                    fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| !is_link(&m) && (m.is_file() || m.is_dir()));
+                if depth == 0 || repository {
+                    found.insert(
+                        dir.clone(),
+                        ProjectSourceRoot {
+                            root: root.clone(),
+                            directory: dir.clone(),
+                        },
+                    );
+                }
+                if full || remaining == 0 || depth == 3 || (depth != 0 && repository) {
+                    continue;
+                }
+                for entry in fs::read_dir(&dir)? {
+                    let entry = entry?;
+                    if ignored_directory(&entry.file_name().to_string_lossy()) || !entry.file_type()?.is_dir() {
+                        continue;
                     }
+                    let child = entry.path();
+                    if registered.contains(&child) || is_link(&fs::symlink_metadata(&child)?) {
+                        continue;
+                    }
+                    if next.len() == remaining {
+                        // Discard this entire optional level instead of selecting a
+                        // filesystem-order-dependent subset or failing chat startup.
+                        full = true;
+                        break;
+                    }
+                    next.push(child);
                 }
             }
+            if full || next.is_empty() {
+                break;
+            }
+            remaining -= next.len();
+            level = next;
         }
     }
     Ok(found.into_values().collect())

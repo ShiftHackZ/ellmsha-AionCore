@@ -12,6 +12,27 @@ fn context(root: &Path) -> MemoryRecallScope {
 }
 
 #[tokio::test]
+async fn wide_metadata_tree_keeps_project_chat_rules_and_attached_repositories_available() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join("AGENTS.md"), "Required root guidance").unwrap();
+    let repo = root.join("client");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join("CLAUDE.md"), "Client guidance").unwrap();
+    let metadata = root.join("metadata");
+    fs::create_dir(&metadata).unwrap();
+    for n in 0..4097 {
+        fs::create_dir(metadata.join(n.to_string())).unwrap();
+    }
+    let scope = context(&root);
+    assert_eq!(list(&scope).await.unwrap().files.len(), 2);
+    let rows = prompt(&scope, repo.to_str().unwrap()).await.unwrap();
+    assert!(rows.iter().any(|r| r["content"] == "Required root guidance"));
+    assert!(rows.iter().any(|r| r["content"] == "Client guidance"));
+}
+
+#[tokio::test]
 async fn nested_repositories_conditional_sources_and_native_precedence_share_one_inventory() {
     let root = tempdir().unwrap();
     let root = root.path().canonicalize().unwrap();
