@@ -5376,10 +5376,18 @@ impl ConversationService {
             && let (Some(command), Some(base)) = (&self.runtime_helper_bin, &self.runtime_base_url)
         {
             let prepared = async {
-                let snapshot = self.secrets_repository.as_ref()?.load(&row.user_id).await.ok()??;
-                let vault: serde_json::Value = serde_json::from_slice(&snapshot.ciphertext).ok()?;
-                let vault_id = vault.get("id")?.as_str()?;
-                let incarnation = vault.get("incarnation")?.as_str()?;
+                let snapshot = self.secrets_repository.as_ref()?.load(&row.user_id).await.ok()?;
+                let (vault_id, incarnation) = if let Some(snapshot) = snapshot {
+                    let vault: serde_json::Value = serde_json::from_slice(&snapshot.ciphertext).ok()?;
+                    (
+                        Some(vault.get("id")?.as_str()?.to_owned()),
+                        Some(vault.get("incarnation")?.as_str()?.to_owned()),
+                    )
+                } else {
+                    // Advertise the catalog before setup; execution still requires an
+                    // initialized, unlocked vault at the authenticated runtime boundary.
+                    (None, None)
+                };
                 let binding = serde_json::to_string(
                     &serde_json::json!({"project":row.project_id,"vault":vault_id,"incarnation":incarnation}),
                 )
@@ -5440,14 +5448,23 @@ impl ConversationService {
                 servers.push(server);
             }
         }
-        let has_secrets = match &build_opts.context.kind {
+        let servers = match &build_opts.context.kind {
             AgentSessionKind::Acp(c) => &c.config.session_mcp_servers,
             AgentSessionKind::Antigravity(c) => &c.config.session_mcp_servers,
             AgentSessionKind::Aionrs(c) => &c.config.session_mcp_servers,
-        }
-        .iter()
-        .any(|s| s.id == "ellmsha-secrets");
-        if !has_secrets && let Some(tokens) = &self.runtime_token_service {
+        };
+        build_opts.runtime_capabilities.secrets_binding = servers.iter().find_map(|s| {
+            if s.id != "ellmsha-secrets" {
+                return None;
+            }
+            let aionui_api_types::SessionMcpTransport::Stdio { env, .. } = &s.transport else {
+                return None;
+            };
+            env.get("AIONUI_SECRETS_BINDING").cloned()
+        });
+        if build_opts.runtime_capabilities.secrets_binding.is_none()
+            && let Some(tokens) = &self.runtime_token_service
+        {
             tokens.invalidate_secrets(&row.user_id, &row.id);
         }
         build_opts.runtime_capabilities.plugin_generation = Some(snapshot.generation);

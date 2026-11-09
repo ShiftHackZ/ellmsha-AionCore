@@ -963,6 +963,21 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn cached_worker_rebuilds_when_vault_is_created_rotated_or_removed() {
+        let manager = make_manager();
+        let mut options = make_options("vault-chat");
+        let mut current = manager.get_or_build_task("vault-chat", options.clone()).await.unwrap();
+        for binding in [Some("vault-one"), Some("vault-two"), None] {
+            options.runtime_capabilities.secrets_binding = binding.map(str::to_owned);
+            let next = manager.get_or_build_task("vault-chat", options.clone()).await.unwrap();
+            assert!(!same_mock(&current, &next));
+            let reused = manager.get_or_build_task("vault-chat", options.clone()).await.unwrap();
+            assert!(same_mock(&next, &reused));
+            current = next;
+        }
+    }
+
     #[test]
     fn refreshing_managed_secrets_never_inherits_the_general_helper_capability() {
         let tokens = Arc::new(RuntimeTokenService::new());

@@ -241,6 +241,11 @@ async fn actual_routes_enforce_current_owner_project_vault_and_human_capability(
             StatusCode::OK
         );
     }
+    let (_, visible_groups) = response(&app, human("records/groups", json!({}))).await;
+    let visible = visible_groups["data"].as_array().unwrap();
+    assert_eq!(visible.len(), 2);
+    assert!(visible.iter().any(|g| g["scope"]["project_id"].is_null()));
+    assert!(visible.iter().any(|g| g["scope"]["project_id"] == "q"));
     let (_, retained) = response(
         &app,
         runtime("ellmsha_project_secret_write", &fresh_project, "project", record()),
@@ -260,7 +265,7 @@ async fn actual_routes_enforce_current_owner_project_vault_and_human_capability(
             .as_array()
             .unwrap()
             .iter()
-            .any(|g| g["scope"]["project_id"] == "q" && g["retained"] == true)
+            .all(|g| g["scope"]["project_id"] != "q" && g["retained"] == false)
     );
     assert_eq!(
         response(

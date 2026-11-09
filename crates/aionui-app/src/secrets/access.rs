@@ -137,30 +137,14 @@ impl SecretsAccess for SecretsAccessAdapter {
                 });
             }
         } else {
-            let visible = self.projects.list_standard_projects_with_conversations(owner).await?;
-            for project in self.projects.list_standard_projects(owner).await? {
-                let retained = !visible.iter().any(|p| p.project_id == project.project_id);
+            for project in self.projects.list_standard_projects_with_conversations(owner).await? {
                 groups.push(SecretGroup {
                     scope: SecretScope {
                         project_id: Some(project.project_id),
                     },
                     name: project.name,
-                    retained,
+                    retained: false,
                 });
-            }
-            for id in self.vault.retained_project_ids(owner).await? {
-                if !groups
-                    .iter()
-                    .any(|group| group.scope.project_id.as_deref() == Some(&id))
-                {
-                    groups.push(SecretGroup {
-                        scope: SecretScope {
-                            project_id: Some(id.clone()),
-                        },
-                        name: id,
-                        retained: true,
-                    });
-                }
             }
         }
         Ok(groups)

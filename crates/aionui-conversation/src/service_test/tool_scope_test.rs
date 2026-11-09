@@ -389,6 +389,26 @@ async fn fresh_builds_keep_separate_secrets_and_helper_tokens_until_binding_chan
         svc.warmup("user_1", &chat.id, &tasks).await.unwrap();
     }
     let options = manager.captured_options();
+    for (index, expected) in [
+        (0, json!({"project":null,"vault":null,"incarnation":null})),
+        (
+            1,
+            json!({"project":null,"vault":"vault-one","incarnation":"incarnation-one"}),
+        ),
+    ] {
+        let binding = options[index].runtime_capabilities.secrets_binding.as_ref().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(binding).unwrap(), expected);
+        let AgentSessionKind::Aionrs(context) = &options[index].context.kind else {
+            panic!("native fixture");
+        };
+        assert!(
+            context
+                .config
+                .session_mcp_servers
+                .iter()
+                .any(|server| server.id == "ellmsha-secrets")
+        );
+    }
     let first = token(&options[1]);
     let second = token(&options[2]);
     assert_eq!(

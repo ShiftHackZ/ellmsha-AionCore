@@ -134,6 +134,8 @@ pub struct RuntimeCapabilities {
     /// Linear connection revision captured with the plugin snapshot. Account
     /// reconnect, disconnect, and project rebind changes must rebuild an idle session.
     pub linear_connection_revision: Option<u64>,
+    /// Exact vault incarnation and chat scope attached to the worker catalog.
+    pub secrets_binding: Option<String>,
 }
 
 impl RuntimeCapabilities {
@@ -152,7 +154,10 @@ impl RuntimeCapabilities {
             Some(revision) => self.linear_connection_revision == Some(revision),
             None => true,
         };
-        runtime_context_satisfied && plugins_satisfied && linear_satisfied
+        runtime_context_satisfied
+            && plugins_satisfied
+            && linear_satisfied
+            && self.secrets_binding == requested.secrets_binding
     }
 }
 
